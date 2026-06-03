@@ -1,0 +1,35 @@
+[package]
+name = "fiber-ffi"
+version = "0.9.0-rc2"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "staticlib"]
+
+[features]
+default = ["rocksdb", "watchtower"]
+metrics = ["fnn/metrics"]
+portable = ["fnn/portable"]
+rocksdb = ["fnn/rocksdb"]
+sqlite = ["fnn/sqlite"]
+watchtower = ["fnn/watchtower"]
+
+[dependencies]
+ckb-chain-spec = "1"
+ckb-resource = "1"
+fnn = { git = "https://github.com/nervosnetwork/fiber.git", branch = "develop" }
+hex = "0.4"
+clap-serde-derive = "0.2.1"
+openssl = { version = "0.10", features = ["vendored"] }
+ractor = { version = "0.15", features = ["async-trait"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9.32"
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }
+tokio-util = "0.7"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
