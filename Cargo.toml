@@ -4,7 +4,7 @@ version = "0.9.0-rc2"
 edition = "2021"
 
 [lib]
-crate-type = ["cdylib", "staticlib"]
+crate-type = ["cdylib"]
 
 [features]
 default = ["rocksdb", "watchtower"]
@@ -17,7 +17,7 @@ watchtower = ["fnn/watchtower"]
 [dependencies]
 ckb-chain-spec = "1"
 ckb-resource = "1"
-fnn = { git = "https://github.com/nervosnetwork/fiber.git", branch = "develop" }
+fnn = { git = "https://github.com/nervosnetwork/fiber.git", tag = "v0.9.0-rc2" }
 hex = "0.4"
 clap-serde-derive = "0.2.1"
 openssl = { version = "0.10", features = ["vendored"] }
