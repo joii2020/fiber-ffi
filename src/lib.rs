@@ -1,4 +1,5 @@
 use std::{
+    cell::RefCell,
     ffi::{CStr, CString},
     fs::File,
     io::BufReader,
@@ -49,12 +50,6 @@ pub enum FiberFfiStatus {
     Panic = 5,
 }
 
-#[repr(C)]
-pub struct FiberFfiResult {
-    pub status: FiberFfiStatus,
-    pub error_message: *mut c_char,
-}
-
 pub type FiberEventCallback = unsafe extern "C" fn(*const c_char, *mut c_void);
 
 #[repr(C)]
@@ -87,6 +82,10 @@ enum StartupMessage {
 
 static INIT_LOGGING: Once = Once::new();
 
+thread_local! {
+    static LAST_ERROR: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
 #[no_mangle]
 pub extern "C" fn fiber_version() -> *const c_char {
     concat!(env!("CARGO_PKG_VERSION"), "\0").as_ptr() as *const c_char
@@ -96,10 +95,10 @@ pub extern "C" fn fiber_version() -> *const c_char {
 pub unsafe extern "C" fn fiber_start(
     options: *const FiberStartOptions,
     out_handle: *mut *mut FiberHandle,
-) -> FiberFfiResult {
+) -> FiberFfiStatus {
     ffi_boundary(|| {
         if options.is_null() || out_handle.is_null() {
-            return Ok(result(
+            return Err(ffi_error(
                 FiberFfiStatus::NullPointer,
                 "options and out_handle must be non-null",
             ));
@@ -157,15 +156,15 @@ pub unsafe extern "C" fn fiber_start(
                     thread: Mutex::new(Some(thread)),
                 });
                 *out_handle = Box::into_raw(handle);
-                Ok(ok())
+                Ok(FiberFfiStatus::Ok)
             }
             Ok(StartupMessage::Failed(err)) => {
                 let _ = thread.join();
-                Ok(result(FiberFfiStatus::StartupFailed, err))
+                Err(ffi_error(FiberFfiStatus::StartupFailed, err))
             }
             Err(err) => {
                 let _ = thread.join();
-                Ok(result(
+                Err(ffi_error(
                     FiberFfiStatus::StartupFailed,
                     format!("runtime thread exited before reporting startup status: {err}"),
                 ))
@@ -175,10 +174,10 @@ pub unsafe extern "C" fn fiber_start(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn fiber_stop(handle: *mut FiberHandle) -> FiberFfiResult {
+pub unsafe extern "C" fn fiber_stop(handle: *mut FiberHandle) -> FiberFfiStatus {
     ffi_boundary(|| {
         if handle.is_null() {
-            return Ok(result(
+            return Err(ffi_error(
                 FiberFfiStatus::NullPointer,
                 "handle must be non-null",
             ));
@@ -197,7 +196,7 @@ pub unsafe extern "C" fn fiber_stop(handle: *mut FiberHandle) -> FiberFfiResult 
             .take();
 
         let Some(stop_tx) = stop_tx else {
-            return Ok(result(
+            return Err(ffi_error(
                 FiberFfiStatus::AlreadyStopped,
                 "fiber node is already stopped",
             ));
@@ -210,15 +209,31 @@ pub unsafe extern "C" fn fiber_stop(handle: *mut FiberHandle) -> FiberFfiResult 
                 .map_err(|_| ffi_error(FiberFfiStatus::Panic, "runtime thread panicked"))?;
         }
 
-        Ok(ok())
+        Ok(FiberFfiStatus::Ok)
     })
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn fiber_free_string(value: *mut c_char) {
-    if !value.is_null() {
-        let _ = CString::from_raw(value);
-    }
+pub unsafe extern "C" fn fiber_last_error_message(buffer: *mut c_char, buffer_len: usize) -> usize {
+    LAST_ERROR.with(|last_error| {
+        let last_error = last_error.borrow();
+        let Some(message) = last_error.as_deref() else {
+            if !buffer.is_null() && buffer_len > 0 {
+                *buffer = 0;
+            }
+            return 0;
+        };
+
+        let bytes = message.as_bytes();
+        if buffer.is_null() || buffer_len == 0 {
+            return bytes.len();
+        }
+
+        let copy_len = bytes.len().min(buffer_len.saturating_sub(1));
+        ptr::copy_nonoverlapping(bytes.as_ptr(), buffer.cast::<u8>(), copy_len);
+        *buffer.add(copy_len) = 0;
+        bytes.len()
+    })
 }
 
 struct RunningNode {
@@ -678,7 +693,7 @@ fn forward_event_to_actor(
     }
 }
 
-fn required_string(ptr: *const c_char, name: &str) -> Result<String, FiberFfiResult> {
+fn required_string(ptr: *const c_char, name: &str) -> FfiCallResult<String> {
     if ptr.is_null() {
         return Err(ffi_error(
             FiberFfiStatus::NullPointer,
@@ -693,7 +708,7 @@ fn required_string(ptr: *const c_char, name: &str) -> Result<String, FiberFfiRes
     }
 }
 
-fn optional_string(ptr: *const c_char) -> Result<Option<String>, FiberFfiResult> {
+fn optional_string(ptr: *const c_char) -> FfiCallResult<Option<String>> {
     if ptr.is_null() {
         return Ok(None);
     }
@@ -713,35 +728,50 @@ fn init_logging(log_level: &str) {
     });
 }
 
-fn ffi_boundary(f: impl FnOnce() -> Result<FiberFfiResult, FiberFfiResult>) -> FiberFfiResult {
+struct FfiError {
+    status: FiberFfiStatus,
+    message: String,
+}
+
+type FfiCallResult<T> = Result<T, FfiError>;
+
+fn ffi_boundary(f: impl FnOnce() -> FfiCallResult<FiberFfiStatus>) -> FiberFfiStatus {
     match catch_unwind(AssertUnwindSafe(f)) {
-        Ok(Ok(result)) => result,
-        Ok(Err(result)) => result,
-        Err(_) => result(FiberFfiStatus::Panic, "fiber ffi call panicked"),
+        Ok(Ok(status)) => {
+            clear_last_error();
+            status
+        }
+        Ok(Err(err)) => {
+            set_last_error(err.message);
+            err.status
+        }
+        Err(_) => {
+            set_last_error("fiber ffi call panicked");
+            FiberFfiStatus::Panic
+        }
     }
 }
 
-fn ok() -> FiberFfiResult {
-    FiberFfiResult {
-        status: FiberFfiStatus::Ok,
-        error_message: ptr::null_mut(),
-    }
-}
-
-fn result(status: FiberFfiStatus, message: impl Into<String>) -> FiberFfiResult {
-    FiberFfiResult {
+fn ffi_error(status: FiberFfiStatus, message: impl Into<String>) -> FfiError {
+    FfiError {
         status,
-        error_message: string_to_c(message.into()),
+        message: sanitize_error_message(message.into()),
     }
 }
 
-fn ffi_error(status: FiberFfiStatus, message: impl Into<String>) -> FiberFfiResult {
-    result(status, message)
+fn set_last_error(message: impl Into<String>) {
+    let message = sanitize_error_message(message.into());
+    LAST_ERROR.with(|last_error| {
+        *last_error.borrow_mut() = Some(message);
+    });
 }
 
-fn string_to_c(message: String) -> *mut c_char {
-    let sanitized = message.replace('\0', "\\0");
-    CString::new(sanitized)
-        .expect("sanitized string contains no interior nul")
-        .into_raw()
+fn clear_last_error() {
+    LAST_ERROR.with(|last_error| {
+        *last_error.borrow_mut() = None;
+    });
+}
+
+fn sanitize_error_message(message: String) -> String {
+    message.replace('\0', "\\0")
 }
