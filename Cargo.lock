@@ -1946,6 +1946,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "tentacle",
  "tokio",
  "tokio-util",
  "tracing",

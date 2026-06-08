@@ -22,11 +22,14 @@ use fnn::{
         CkbChainActor, CkbConfig,
     },
     fiber::{graph::NetworkGraph, network::init_chain_hash},
+    fiber::{NetworkActorCommand, NetworkActorMessage},
     start_network, Config, FiberConfig, NetworkServiceEvent,
 };
 use ractor::{Actor, ActorRef};
 use serde::Deserialize;
 use serde_json::json;
+use tentacle::utils::TransportType;
+use tokio::runtime::Handle as TokioHandle;
 use tokio::sync::{mpsc, oneshot, RwLock};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tracing::{debug, info, trace};
@@ -61,6 +64,14 @@ pub struct FiberStartOptions {
     pub event_callback_user_data: *mut c_void,
 }
 
+#[repr(C)]
+pub struct FiberConnectPeerOptions {
+    pub address: *const c_char,
+    pub pubkey: *const c_char,
+    pub addr_type: *const c_char,
+    pub save: i32,
+}
+
 #[derive(Copy, Clone)]
 struct EventCallback {
     callback: FiberEventCallback,
@@ -73,10 +84,15 @@ unsafe impl Sync for EventCallback {}
 pub struct FiberHandle {
     stop_tx: Mutex<Option<oneshot::Sender<()>>>,
     thread: Mutex<Option<JoinHandle<()>>>,
+    runtime_handle: TokioHandle,
+    network_actor: ActorRef<NetworkActorMessage>,
 }
 
 enum StartupMessage {
-    Started,
+    Started {
+        runtime_handle: TokioHandle,
+        network_actor: ActorRef<NetworkActorMessage>,
+    },
     Failed(String),
 }
 
@@ -135,10 +151,15 @@ pub unsafe extern "C" fn fiber_start(
                     }
                 };
 
+                let runtime_handle = runtime.handle().clone();
                 runtime.block_on(async move {
                     match start_node(config_path, database_prefix, callback).await {
                         Ok(node) => {
-                            let _ = startup_tx.send(StartupMessage::Started);
+                            let network_actor = node.network_actor.clone();
+                            let _ = startup_tx.send(StartupMessage::Started {
+                                runtime_handle,
+                                network_actor,
+                            });
                             stop_node_on_signal(node, stop_rx).await;
                         }
                         Err(err) => {
@@ -150,10 +171,15 @@ pub unsafe extern "C" fn fiber_start(
             .map_err(|err| ffi_error(FiberFfiStatus::StartupFailed, err.to_string()))?;
 
         match startup_rx.recv() {
-            Ok(StartupMessage::Started) => {
+            Ok(StartupMessage::Started {
+                runtime_handle,
+                network_actor,
+            }) => {
                 let handle = Box::new(FiberHandle {
                     stop_tx: Mutex::new(Some(stop_tx)),
                     thread: Mutex::new(Some(thread)),
+                    runtime_handle,
+                    network_actor,
                 });
                 *out_handle = Box::into_raw(handle);
                 Ok(FiberFfiStatus::Ok)
@@ -214,6 +240,130 @@ pub unsafe extern "C" fn fiber_stop(handle: *mut FiberHandle) -> FiberFfiStatus 
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn fiber_node_info(
+    handle: *mut FiberHandle,
+    out_json: *mut *mut c_char,
+) -> FiberFfiStatus {
+    ffi_boundary(|| {
+        let handle = checked_handle(handle)?;
+        prepare_out_string(out_json)?;
+
+        let response = handle
+            .runtime_handle
+            .block_on(call_node_info(handle.network_actor.clone()))
+            .map_err(|err| ffi_error(FiberFfiStatus::InvalidArgument, err))?;
+        write_json_out(out_json, node_info_to_json(response))?;
+
+        Ok(FiberFfiStatus::Ok)
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn fiber_list_peers(
+    handle: *mut FiberHandle,
+    out_json: *mut *mut c_char,
+) -> FiberFfiStatus {
+    ffi_boundary(|| {
+        let handle = checked_handle(handle)?;
+        prepare_out_string(out_json)?;
+
+        let response = handle
+            .runtime_handle
+            .block_on(call_list_peers(handle.network_actor.clone()))
+            .map_err(|err| ffi_error(FiberFfiStatus::InvalidArgument, err))?;
+        write_json_out(out_json, peers_to_json(response))?;
+
+        Ok(FiberFfiStatus::Ok)
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn fiber_connect_peer(
+    handle: *mut FiberHandle,
+    options: *const FiberConnectPeerOptions,
+) -> FiberFfiStatus {
+    ffi_boundary(|| {
+        let handle = checked_handle(handle)?;
+        if options.is_null() {
+            return Err(ffi_error(
+                FiberFfiStatus::NullPointer,
+                "options must be non-null",
+            ));
+        }
+
+        let options = &*options;
+        let address = optional_string(options.address)?;
+        let pubkey = optional_string(options.pubkey)?;
+        let addr_type = optional_string(options.addr_type)?;
+        if address.as_deref().is_some_and(str::is_empty) {
+            return Err(ffi_error(
+                FiberFfiStatus::InvalidArgument,
+                "address must not be empty",
+            ));
+        }
+        if pubkey.as_deref().is_some_and(str::is_empty) {
+            return Err(ffi_error(
+                FiberFfiStatus::InvalidArgument,
+                "pubkey must not be empty",
+            ));
+        }
+        if address.is_some() == pubkey.is_some() {
+            return Err(ffi_error(
+                FiberFfiStatus::InvalidArgument,
+                "exactly one of address or pubkey must be set",
+            ));
+        }
+
+        let command = if let Some(address) = address {
+            let address = address
+                .parse::<fnn::fiber_types::Multiaddr>()
+                .map_err(|err| ffi_error(FiberFfiStatus::InvalidArgument, err.to_string()))?;
+            ConnectPeerCommand::Address {
+                address,
+                save: options.save != 0,
+            }
+        } else {
+            ConnectPeerCommand::Pubkey {
+                pubkey: parse_pubkey(pubkey.as_deref().expect("checked above"))?,
+                addr_type: parse_addr_type(addr_type.as_deref())?,
+            }
+        };
+
+        handle
+            .runtime_handle
+            .block_on(call_connect_peer(handle.network_actor.clone(), command))
+            .map_err(|err| ffi_error(FiberFfiStatus::InvalidArgument, err))?;
+
+        Ok(FiberFfiStatus::Ok)
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn fiber_disconnect_peer(
+    handle: *mut FiberHandle,
+    pubkey: *const c_char,
+) -> FiberFfiStatus {
+    ffi_boundary(|| {
+        let handle = checked_handle(handle)?;
+        let pubkey = parse_pubkey(&required_string(pubkey, "pubkey")?)?;
+
+        handle
+            .runtime_handle
+            .block_on(call_disconnect_peer(handle.network_actor.clone(), pubkey))
+            .map_err(|err| ffi_error(FiberFfiStatus::InvalidArgument, err))?;
+
+        Ok(FiberFfiStatus::Ok)
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn fiber_string_free(string: *mut c_char) {
+    if !string.is_null() {
+        let _ = CString::from_raw(string);
+    }
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn fiber_last_error_message(buffer: *mut c_char, buffer_len: usize) -> usize {
     LAST_ERROR.with(|last_error| {
         let last_error = last_error.borrow();
@@ -240,6 +390,7 @@ struct RunningNode {
     root_actor: ActorRef<String>,
     root_token: CancellationToken,
     root_tracker: TaskTracker,
+    network_actor: ActorRef<NetworkActorMessage>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -420,7 +571,7 @@ async fn start_node(
         .map_err(|err| format!("failed to get default funding lock script: {err}"))?;
 
     let chain_client = CkbRpcClient::new(&ckb_config);
-    let _network_actor = start_network(
+    let network_actor = start_network(
         fiber_config.clone(),
         chain_client,
         ckb_chain_actor,
@@ -472,6 +623,7 @@ async fn start_node(
         root_actor,
         root_token,
         root_tracker,
+        network_actor,
     })
 }
 
@@ -483,6 +635,123 @@ async fn stop_node_on_signal(node: RunningNode, stop_rx: oneshot::Receiver<()>) 
     node.root_tracker.close();
     node.root_tracker.wait().await;
     debug!("fiber ffi runtime stopped");
+}
+
+enum ConnectPeerCommand {
+    Address {
+        address: fnn::fiber_types::Multiaddr,
+        save: bool,
+    },
+    Pubkey {
+        pubkey: fnn::fiber_types::Pubkey,
+        addr_type: Option<TransportType>,
+    },
+}
+
+async fn call_node_info(
+    actor: ActorRef<NetworkActorMessage>,
+) -> std::result::Result<fnn::fiber::network::NodeInfoResponse, String> {
+    let message = |reply| NetworkActorMessage::Command(NetworkActorCommand::NodeInfo((), reply));
+    match ractor::call!(actor, message) {
+        Ok(result) => result,
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+async fn call_list_peers(
+    actor: ActorRef<NetworkActorMessage>,
+) -> std::result::Result<Vec<fnn::fiber::network::PeerInfo>, String> {
+    let message = |reply| NetworkActorMessage::Command(NetworkActorCommand::ListPeers((), reply));
+    match ractor::call!(actor, message) {
+        Ok(result) => result,
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+async fn call_connect_peer(
+    actor: ActorRef<NetworkActorMessage>,
+    command: ConnectPeerCommand,
+) -> std::result::Result<(), String> {
+    match command {
+        ConnectPeerCommand::Address { address, save } => {
+            let message = |reply| {
+                NetworkActorMessage::Command(NetworkActorCommand::ConnectPeer(
+                    address,
+                    save,
+                    fnn::fiber::network::PeerConnectSource::Manual,
+                    Some(reply),
+                ))
+            };
+            match ractor::call!(actor, message) {
+                Ok(result) => result,
+                Err(err) => Err(err.to_string()),
+            }
+        }
+        ConnectPeerCommand::Pubkey { pubkey, addr_type } => {
+            let message = |reply| {
+                NetworkActorMessage::Command(NetworkActorCommand::ConnectPeerWithPubkey(
+                    pubkey,
+                    addr_type,
+                    fnn::fiber::network::PeerConnectSource::Manual,
+                    reply,
+                ))
+            };
+            match ractor::call!(actor, message) {
+                Ok(result) => result,
+                Err(err) => Err(err.to_string()),
+            }
+        }
+    }
+}
+
+async fn call_disconnect_peer(
+    actor: ActorRef<NetworkActorMessage>,
+    pubkey: fnn::fiber_types::Pubkey,
+) -> std::result::Result<(), String> {
+    let message = |reply| {
+        NetworkActorMessage::Command(NetworkActorCommand::DisconnectPeer(
+            pubkey,
+            fnn::fiber::network::PeerDisconnectReason::Requested,
+            Some(reply),
+        ))
+    };
+    match ractor::call!(actor, message) {
+        Ok(result) => result,
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+fn node_info_to_json(response: fnn::fiber::network::NodeInfoResponse) -> serde_json::Value {
+    json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "commit_hash": fnn::get_git_commit_info(),
+        "pubkey": pubkey_to_hex(&response.node_id),
+        "features": response.features.enabled_features_names(),
+        "node_name": response.node_name.map(|name| name.to_string()),
+        "addresses": response.addresses.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        "chain_hash": hash_to_hex(&response.chain_hash),
+        "open_channel_auto_accept_min_ckb_funding_amount": response.open_channel_auto_accept_min_ckb_funding_amount,
+        "auto_accept_channel_ckb_funding_amount": response.auto_accept_channel_ckb_funding_amount,
+        "tlc_expiry_delta": response.tlc_expiry_delta,
+        "tlc_min_value": response.tlc_min_value,
+        "tlc_fee_proportional_millionths": response.tlc_fee_proportional_millionths,
+        "channel_count": response.channel_count,
+        "pending_channel_count": response.pending_channel_count,
+        "peers_count": response.peers_count,
+        "udt_cfg_infos": response.udt_cfg_infos,
+    })
+}
+
+fn peers_to_json(peers: Vec<fnn::fiber::network::PeerInfo>) -> serde_json::Value {
+    json!({
+        "peers": peers
+            .into_iter()
+            .map(|peer| json!({
+                "pubkey": pubkey_to_hex(&peer.pubkey),
+                "address": peer.address.to_string(),
+            }))
+            .collect::<Vec<_>>(),
+    })
 }
 
 fn ffi_confirm(plan: fnn::store::MigrationPlan) -> bool {
@@ -719,6 +988,89 @@ fn optional_string(ptr: *const c_char) -> FfiCallResult<Option<String>> {
             .map(Some)
             .map_err(|err| ffi_error(FiberFfiStatus::InvalidArgument, err.to_string()))
     }
+}
+
+fn parse_pubkey(value: &str) -> FfiCallResult<fnn::fiber_types::Pubkey> {
+    let value = value.strip_prefix("0x").unwrap_or(value);
+    let bytes = hex::decode(value).map_err(|err| {
+        ffi_error(
+            FiberFfiStatus::InvalidArgument,
+            format!("invalid pubkey hex: {err}"),
+        )
+    })?;
+    if bytes.len() != fnn::fiber_types::Pubkey::serialization_len() {
+        return Err(ffi_error(
+            FiberFfiStatus::InvalidArgument,
+            format!(
+                "pubkey must be {} bytes compressed secp256k1 key",
+                fnn::fiber_types::Pubkey::serialization_len()
+            ),
+        ));
+    }
+    fnn::fiber_types::Pubkey::from_slice(&bytes).map_err(|err| {
+        ffi_error(
+            FiberFfiStatus::InvalidArgument,
+            format!("invalid pubkey: {err}"),
+        )
+    })
+}
+
+fn parse_addr_type(value: Option<&str>) -> FfiCallResult<Option<TransportType>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    match value.to_ascii_lowercase().as_str() {
+        "" => Ok(None),
+        "tcp" => Ok(Some(TransportType::Tcp)),
+        "ws" => Ok(Some(TransportType::Ws)),
+        "wss" => Ok(Some(TransportType::Wss)),
+        _ => Err(ffi_error(
+            FiberFfiStatus::InvalidArgument,
+            "addr_type must be tcp, ws, or wss",
+        )),
+    }
+}
+
+unsafe fn checked_handle<'a>(handle: *mut FiberHandle) -> FfiCallResult<&'a FiberHandle> {
+    if handle.is_null() {
+        return Err(ffi_error(
+            FiberFfiStatus::NullPointer,
+            "handle must be non-null",
+        ));
+    }
+    Ok(&*handle)
+}
+
+fn prepare_out_string(out_string: *mut *mut c_char) -> FfiCallResult<()> {
+    if out_string.is_null() {
+        return Err(ffi_error(
+            FiberFfiStatus::NullPointer,
+            "out_json must be non-null",
+        ));
+    }
+    unsafe {
+        *out_string = ptr::null_mut();
+    }
+    Ok(())
+}
+
+fn write_json_out(out_json: *mut *mut c_char, value: serde_json::Value) -> FfiCallResult<()> {
+    let json = serde_json::to_string(&value).map_err(|err| {
+        ffi_error(
+            FiberFfiStatus::InvalidArgument,
+            format!("failed to serialize json: {err}"),
+        )
+    })?;
+    let json = CString::new(json).map_err(|err| {
+        ffi_error(
+            FiberFfiStatus::InvalidArgument,
+            format!("failed to allocate json string: {err}"),
+        )
+    })?;
+    unsafe {
+        *out_json = json.into_raw();
+    }
+    Ok(())
 }
 
 fn init_logging(log_level: &str) {

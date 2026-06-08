@@ -20,6 +20,15 @@ typedef struct FiberStartOptions {
   void *event_callback_user_data;
 } FiberStartOptions;
 
+typedef struct FiberConnectPeerOptions {
+  const char *address;
+  const char *pubkey;
+  /* Optional: tcp, ws, or wss. Used only when pubkey is set. */
+  const char *addr_type;
+  /* Non-zero saves the peer address when address is set. */
+  int save;
+} FiberConnectPeerOptions;
+
 typedef enum FiberFfiStatus {
   FIBER_FFI_STATUS_OK = 0,
   FIBER_FFI_STATUS_NULL_POINTER = 1,
@@ -35,6 +44,17 @@ FiberFfiStatus fiber_start(const FiberStartOptions *options,
                            FiberHandle **out_handle);
 
 FiberFfiStatus fiber_stop(FiberHandle *handle);
+
+FiberFfiStatus fiber_node_info(FiberHandle *handle, char **out_json);
+
+FiberFfiStatus fiber_list_peers(FiberHandle *handle, char **out_json);
+
+FiberFfiStatus fiber_connect_peer(FiberHandle *handle,
+                                  const FiberConnectPeerOptions *options);
+
+FiberFfiStatus fiber_disconnect_peer(FiberHandle *handle, const char *pubkey);
+
+void fiber_string_free(char *string);
 
 size_t fiber_last_error_message(char *buffer, size_t buffer_len);
 

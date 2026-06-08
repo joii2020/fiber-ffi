@@ -1,35 +1,31 @@
-CARGO_TARGET_DIR ?= target
 CARGO ?= cargo
+RUSTUP ?= rustup
 
 ANDROID_API ?= 23
-ANDROID_FEATURES ?= sqlite,watchtower
-ANDROID_NDK_HOME ?= $(NDK_HOME)
-ANDROID_OUT_DIR ?= $(CARGO_TARGET_DIR)/android
+ANDROID_TARGET ?= aarch64-linux-android
+ANDROID_RUSTFLAGS ?= -C link-arg=-Wl,-z,max-page-size=16384
 
-UNAME_S := $(shell uname -s)
-UNAME_M := $(shell uname -m)
-ANDROID_HOST_TAG ?= $(if $(filter Linux,$(UNAME_S)),linux-x86_64,$(if $(filter Darwin,$(UNAME_S)),$(if $(filter arm64,$(UNAME_M)),darwin-arm64,darwin-x86_64),unknown))
+ANDROID_HOST_TAG ?= $(notdir $(firstword $(wildcard $(ANDROID_NDK_HOME)/toolchains/llvm/prebuilt/*)))
+ANDROID_TOOLCHAIN_DIR ?= $(ANDROID_NDK_HOME)/toolchains/llvm/prebuilt/$(ANDROID_HOST_TAG)
 
 .PHONY: build-android
 build-android:
 	@set -e; \
-	ndk_bin="$(ANDROID_NDK_HOME)/toolchains/llvm/prebuilt/$(ANDROID_HOST_TAG)/bin"; \
-	abi="arm64-v8a"; \
-	target="aarch64-linux-android"; \
-	env_target="AARCH64_LINUX_ANDROID"; \
-	linker="$$ndk_bin/aarch64-linux-android$(ANDROID_API)-clang"; \
-	linkerxx="$$ndk_bin/aarch64-linux-android$(ANDROID_API)-clang++"; \
-	echo "Building fiber-ffi for $$abi ($$target)"; \
-	rustup target add "$$target"; \
+	ndk_bin="$(ANDROID_TOOLCHAIN_DIR)/bin"; \
+	linker="$$ndk_bin/$(ANDROID_TARGET)$(ANDROID_API)-clang"; \
+	linkerxx="$$ndk_bin/$(ANDROID_TARGET)$(ANDROID_API)-clang++"; \
+	target_env=$$(printf '%s' "$(ANDROID_TARGET)" | tr '[:lower:]-' '[:upper:]_'); \
+	$(RUSTUP) target add "$(ANDROID_TARGET)"; \
 	env \
 		ANDROID_NDK_HOME="$(ANDROID_NDK_HOME)" \
 		ANDROID_NDK_ROOT="$(ANDROID_NDK_HOME)" \
-		CC_$$(printf '%s' "$$target" | tr '-' '_')="$$linker" \
-		CXX_$$(printf '%s' "$$target" | tr '-' '_')="$$linkerxx" \
-		AR_$$(printf '%s' "$$target" | tr '-' '_')="$$ndk_bin/llvm-ar" \
-		RANLIB_$$(printf '%s' "$$target" | tr '-' '_')="$$ndk_bin/llvm-ranlib" \
+		CC_$$(printf '%s' "$(ANDROID_TARGET)" | tr '-' '_')="$$linker" \
+		CXX_$$(printf '%s' "$(ANDROID_TARGET)" | tr '-' '_')="$$linkerxx" \
+		AR_$$(printf '%s' "$(ANDROID_TARGET)" | tr '-' '_')="$$ndk_bin/llvm-ar" \
+		RANLIB_$$(printf '%s' "$(ANDROID_TARGET)" | tr '-' '_')="$$ndk_bin/llvm-ranlib" \
 		AR="$$ndk_bin/llvm-ar" \
 		RANLIB="$$ndk_bin/llvm-ranlib" \
-		CARGO_TARGET_$${env_target}_LINKER="$$linker" \
-		BINDGEN_EXTRA_CLANG_ARGS="--sysroot=$(ANDROID_NDK_HOME)/toolchains/llvm/prebuilt/$(ANDROID_HOST_TAG)/sysroot --target=$$target -D__ANDROID_API__=$(ANDROID_API)" \
-		$(CARGO) build --release --locked --target "$$target" --no-default-features --features "$(ANDROID_FEATURES)"; \
+		CARGO_TARGET_$${target_env}_LINKER="$$linker" \
+		RUSTFLAGS="$(ANDROID_RUSTFLAGS) $${RUSTFLAGS:-}" \
+		BINDGEN_EXTRA_CLANG_ARGS="--sysroot=$(ANDROID_TOOLCHAIN_DIR)/sysroot --target=$(ANDROID_TARGET) -D__ANDROID_API__=$(ANDROID_API)" \
+		$(CARGO) build --release --locked --target "$(ANDROID_TARGET)" --no-default-features --features sqlite,watchtower; \
