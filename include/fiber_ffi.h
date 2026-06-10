@@ -54,6 +54,76 @@ FiberFfiStatus fiber_connect_peer(FiberHandle *handle,
 
 FiberFfiStatus fiber_disconnect_peer(FiberHandle *handle, const char *pubkey);
 
+/* JSON params/results follow Fiber JSON-RPC request and response shapes. */
+FiberFfiStatus fiber_open_channel(FiberHandle *handle,
+                                  const char *params_json,
+                                  char **out_json);
+
+FiberFfiStatus fiber_accept_channel(FiberHandle *handle,
+                                    const char *params_json,
+                                    char **out_json);
+
+FiberFfiStatus fiber_abandon_channel(FiberHandle *handle,
+                                     const char *params_json);
+
+FiberFfiStatus fiber_list_channels(FiberHandle *handle,
+                                   const char *params_json,
+                                   char **out_json);
+
+FiberFfiStatus fiber_shutdown_channel(FiberHandle *handle,
+                                      const char *params_json);
+
+FiberFfiStatus fiber_update_channel(FiberHandle *handle,
+                                    const char *params_json);
+
+FiberFfiStatus fiber_open_channel_with_external_funding(FiberHandle *handle,
+                                                        const char *params_json,
+                                                        char **out_json);
+
+FiberFfiStatus fiber_submit_signed_funding_tx(FiberHandle *handle,
+                                              const char *params_json,
+                                              char **out_json);
+
+FiberFfiStatus fiber_send_payment(FiberHandle *handle,
+                                  const char *params_json,
+                                  char **out_json);
+
+FiberFfiStatus fiber_get_payment(FiberHandle *handle,
+                                 const char *params_json,
+                                 char **out_json);
+
+FiberFfiStatus fiber_list_payments(FiberHandle *handle,
+                                   const char *params_json,
+                                   char **out_json);
+
+FiberFfiStatus fiber_build_router(FiberHandle *handle,
+                                  const char *params_json,
+                                  char **out_json);
+
+FiberFfiStatus fiber_send_payment_with_router(FiberHandle *handle,
+                                              const char *params_json,
+                                              char **out_json);
+
+FiberFfiStatus fiber_new_invoice(FiberHandle *handle,
+                                 const char *params_json,
+                                 char **out_json);
+
+FiberFfiStatus fiber_parse_invoice(FiberHandle *handle,
+                                   const char *params_json,
+                                   char **out_json);
+
+FiberFfiStatus fiber_get_invoice(FiberHandle *handle,
+                                 const char *params_json,
+                                 char **out_json);
+
+FiberFfiStatus fiber_cancel_invoice(FiberHandle *handle,
+                                    const char *params_json,
+                                    char **out_json);
+
+FiberFfiStatus fiber_settle_invoice(FiberHandle *handle,
+                                    const char *params_json,
+                                    char **out_json);
+
 void fiber_string_free(char *string);
 
 size_t fiber_last_error_message(char *buffer, size_t buffer_len);

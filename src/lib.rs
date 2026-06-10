@@ -26,7 +26,7 @@ use fnn::{
     start_network, Config, FiberConfig, NetworkServiceEvent,
 };
 use ractor::{Actor, ActorRef};
-use serde::Deserialize;
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::json;
 use tentacle::utils::TransportType;
 use tokio::runtime::Handle as TokioHandle;
@@ -86,12 +86,16 @@ pub struct FiberHandle {
     thread: Mutex<Option<JoinHandle<()>>>,
     runtime_handle: TokioHandle,
     network_actor: ActorRef<NetworkActorMessage>,
+    store: fnn::store::Store,
+    fiber_config: FiberConfig,
 }
 
 enum StartupMessage {
     Started {
         runtime_handle: TokioHandle,
         network_actor: ActorRef<NetworkActorMessage>,
+        store: fnn::store::Store,
+        fiber_config: FiberConfig,
     },
     Failed(String),
 }
@@ -156,9 +160,13 @@ pub unsafe extern "C" fn fiber_start(
                     match start_node(config_path, database_prefix, callback).await {
                         Ok(node) => {
                             let network_actor = node.network_actor.clone();
+                            let store = node.store.clone();
+                            let fiber_config = node.fiber_config.clone();
                             let _ = startup_tx.send(StartupMessage::Started {
                                 runtime_handle,
                                 network_actor,
+                                store,
+                                fiber_config,
                             });
                             stop_node_on_signal(node, stop_rx).await;
                         }
@@ -174,12 +182,16 @@ pub unsafe extern "C" fn fiber_start(
             Ok(StartupMessage::Started {
                 runtime_handle,
                 network_actor,
+                store,
+                fiber_config,
             }) => {
                 let handle = Box::new(FiberHandle {
                     stop_tx: Mutex::new(Some(stop_tx)),
                     thread: Mutex::new(Some(thread)),
                     runtime_handle,
                     network_actor,
+                    store,
+                    fiber_config,
                 });
                 *out_handle = Box::into_raw(handle);
                 Ok(FiberFfiStatus::Ok)
@@ -357,6 +369,325 @@ pub unsafe extern "C" fn fiber_disconnect_peer(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn fiber_open_channel(
+    handle: *mut FiberHandle,
+    params_json: *const c_char,
+    out_json: *mut *mut c_char,
+) -> FiberFfiStatus {
+    ffi_boundary(|| {
+        let handle = checked_handle(handle)?;
+        prepare_out_string(out_json)?;
+        let params = parse_json_params::<fnn::rpc::channel::OpenChannelParams>(params_json)?;
+        let response = handle
+            .runtime_handle
+            .block_on(call_open_channel(handle, params))?;
+        write_serializable_out(out_json, &response)?;
+        Ok(FiberFfiStatus::Ok)
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn fiber_accept_channel(
+    handle: *mut FiberHandle,
+    params_json: *const c_char,
+    out_json: *mut *mut c_char,
+) -> FiberFfiStatus {
+    ffi_boundary(|| {
+        let handle = checked_handle(handle)?;
+        prepare_out_string(out_json)?;
+        let params = parse_json_params::<fnn::rpc::channel::AcceptChannelParams>(params_json)?;
+        let response = handle
+            .runtime_handle
+            .block_on(call_accept_channel(handle, params))?;
+        write_serializable_out(out_json, &response)?;
+        Ok(FiberFfiStatus::Ok)
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn fiber_abandon_channel(
+    handle: *mut FiberHandle,
+    params_json: *const c_char,
+) -> FiberFfiStatus {
+    ffi_boundary(|| {
+        let handle = checked_handle(handle)?;
+        let params = parse_json_params::<fnn::rpc::channel::AbandonChannelParams>(params_json)?;
+        handle
+            .runtime_handle
+            .block_on(call_abandon_channel(handle, params))?;
+        Ok(FiberFfiStatus::Ok)
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn fiber_list_channels(
+    handle: *mut FiberHandle,
+    params_json: *const c_char,
+    out_json: *mut *mut c_char,
+) -> FiberFfiStatus {
+    ffi_boundary(|| {
+        let handle = checked_handle(handle)?;
+        prepare_out_string(out_json)?;
+        let params = parse_json_params::<fnn::rpc::channel::ListChannelsParams>(params_json)?;
+        let response = handle
+            .runtime_handle
+            .block_on(call_list_channels(handle, params))?;
+        write_serializable_out(out_json, &response)?;
+        Ok(FiberFfiStatus::Ok)
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn fiber_shutdown_channel(
+    handle: *mut FiberHandle,
+    params_json: *const c_char,
+) -> FiberFfiStatus {
+    ffi_boundary(|| {
+        let handle = checked_handle(handle)?;
+        let params = parse_json_params::<fnn::rpc::channel::ShutdownChannelParams>(params_json)?;
+        handle
+            .runtime_handle
+            .block_on(call_shutdown_channel(handle, params))?;
+        Ok(FiberFfiStatus::Ok)
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn fiber_update_channel(
+    handle: *mut FiberHandle,
+    params_json: *const c_char,
+) -> FiberFfiStatus {
+    ffi_boundary(|| {
+        let handle = checked_handle(handle)?;
+        let params = parse_json_params::<fnn::rpc::channel::UpdateChannelParams>(params_json)?;
+        handle
+            .runtime_handle
+            .block_on(call_update_channel(handle, params))?;
+        Ok(FiberFfiStatus::Ok)
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn fiber_open_channel_with_external_funding(
+    handle: *mut FiberHandle,
+    params_json: *const c_char,
+    out_json: *mut *mut c_char,
+) -> FiberFfiStatus {
+    ffi_boundary(|| {
+        let handle = checked_handle(handle)?;
+        prepare_out_string(out_json)?;
+        let params = parse_json_params::<fnn::rpc::channel::OpenChannelWithExternalFundingParams>(
+            params_json,
+        )?;
+        let response = handle
+            .runtime_handle
+            .block_on(call_open_channel_with_external_funding(handle, params))?;
+        write_serializable_out(out_json, &response)?;
+        Ok(FiberFfiStatus::Ok)
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn fiber_submit_signed_funding_tx(
+    handle: *mut FiberHandle,
+    params_json: *const c_char,
+    out_json: *mut *mut c_char,
+) -> FiberFfiStatus {
+    ffi_boundary(|| {
+        let handle = checked_handle(handle)?;
+        prepare_out_string(out_json)?;
+        let params =
+            parse_json_params::<fnn::rpc::channel::SubmitSignedFundingTxParams>(params_json)?;
+        let response = handle
+            .runtime_handle
+            .block_on(call_submit_signed_funding_tx(handle, params))?;
+        write_serializable_out(out_json, &response)?;
+        Ok(FiberFfiStatus::Ok)
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn fiber_send_payment(
+    handle: *mut FiberHandle,
+    params_json: *const c_char,
+    out_json: *mut *mut c_char,
+) -> FiberFfiStatus {
+    ffi_boundary(|| {
+        let handle = checked_handle(handle)?;
+        prepare_out_string(out_json)?;
+        let params = parse_json_params::<fnn::rpc::payment::SendPaymentCommandParams>(params_json)?;
+        let response = handle
+            .runtime_handle
+            .block_on(call_send_payment(handle, params))?;
+        write_serializable_out(out_json, &response)?;
+        Ok(FiberFfiStatus::Ok)
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn fiber_get_payment(
+    handle: *mut FiberHandle,
+    params_json: *const c_char,
+    out_json: *mut *mut c_char,
+) -> FiberFfiStatus {
+    ffi_boundary(|| {
+        let handle = checked_handle(handle)?;
+        prepare_out_string(out_json)?;
+        let params = parse_json_params::<fnn::rpc::payment::GetPaymentCommandParams>(params_json)?;
+        let response = handle
+            .runtime_handle
+            .block_on(call_get_payment(handle, params))?;
+        write_serializable_out(out_json, &response)?;
+        Ok(FiberFfiStatus::Ok)
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn fiber_list_payments(
+    handle: *mut FiberHandle,
+    params_json: *const c_char,
+    out_json: *mut *mut c_char,
+) -> FiberFfiStatus {
+    ffi_boundary(|| {
+        let handle = checked_handle(handle)?;
+        prepare_out_string(out_json)?;
+        let params = parse_json_params::<fnn::rpc::payment::ListPaymentsParams>(params_json)?;
+        let response = handle
+            .runtime_handle
+            .block_on(call_list_payments(handle, params))?;
+        write_serializable_out(out_json, &response)?;
+        Ok(FiberFfiStatus::Ok)
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn fiber_build_router(
+    handle: *mut FiberHandle,
+    params_json: *const c_char,
+    out_json: *mut *mut c_char,
+) -> FiberFfiStatus {
+    ffi_boundary(|| {
+        let handle = checked_handle(handle)?;
+        prepare_out_string(out_json)?;
+        let params = parse_json_params::<fnn::rpc::payment::BuildRouterParams>(params_json)?;
+        let response = handle
+            .runtime_handle
+            .block_on(call_build_router(handle, params))?;
+        write_serializable_out(out_json, &response)?;
+        Ok(FiberFfiStatus::Ok)
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn fiber_send_payment_with_router(
+    handle: *mut FiberHandle,
+    params_json: *const c_char,
+    out_json: *mut *mut c_char,
+) -> FiberFfiStatus {
+    ffi_boundary(|| {
+        let handle = checked_handle(handle)?;
+        prepare_out_string(out_json)?;
+        let params =
+            parse_json_params::<fnn::rpc::payment::SendPaymentWithRouterParams>(params_json)?;
+        let response = handle
+            .runtime_handle
+            .block_on(call_send_payment_with_router(handle, params))?;
+        write_serializable_out(out_json, &response)?;
+        Ok(FiberFfiStatus::Ok)
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn fiber_new_invoice(
+    handle: *mut FiberHandle,
+    params_json: *const c_char,
+    out_json: *mut *mut c_char,
+) -> FiberFfiStatus {
+    ffi_boundary(|| {
+        let handle = checked_handle(handle)?;
+        prepare_out_string(out_json)?;
+        let params = parse_json_params::<fnn::rpc::invoice::NewInvoiceParams>(params_json)?;
+        let response = handle
+            .runtime_handle
+            .block_on(call_new_invoice(handle, params))?;
+        write_serializable_out(out_json, &response)?;
+        Ok(FiberFfiStatus::Ok)
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn fiber_parse_invoice(
+    handle: *mut FiberHandle,
+    params_json: *const c_char,
+    out_json: *mut *mut c_char,
+) -> FiberFfiStatus {
+    ffi_boundary(|| {
+        let handle = checked_handle(handle)?;
+        prepare_out_string(out_json)?;
+        let params = parse_json_params::<fnn::rpc::invoice::ParseInvoiceParams>(params_json)?;
+        let response = handle
+            .runtime_handle
+            .block_on(call_parse_invoice(handle, params))?;
+        write_serializable_out(out_json, &response)?;
+        Ok(FiberFfiStatus::Ok)
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn fiber_get_invoice(
+    handle: *mut FiberHandle,
+    params_json: *const c_char,
+    out_json: *mut *mut c_char,
+) -> FiberFfiStatus {
+    ffi_boundary(|| {
+        let handle = checked_handle(handle)?;
+        prepare_out_string(out_json)?;
+        let params = parse_json_params::<fnn::rpc::invoice::InvoiceParams>(params_json)?;
+        let response = handle
+            .runtime_handle
+            .block_on(call_get_invoice(handle, params))?;
+        write_serializable_out(out_json, &response)?;
+        Ok(FiberFfiStatus::Ok)
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn fiber_cancel_invoice(
+    handle: *mut FiberHandle,
+    params_json: *const c_char,
+    out_json: *mut *mut c_char,
+) -> FiberFfiStatus {
+    ffi_boundary(|| {
+        let handle = checked_handle(handle)?;
+        prepare_out_string(out_json)?;
+        let params = parse_json_params::<fnn::rpc::invoice::InvoiceParams>(params_json)?;
+        let response = handle
+            .runtime_handle
+            .block_on(call_cancel_invoice(handle, params))?;
+        write_serializable_out(out_json, &response)?;
+        Ok(FiberFfiStatus::Ok)
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn fiber_settle_invoice(
+    handle: *mut FiberHandle,
+    params_json: *const c_char,
+    out_json: *mut *mut c_char,
+) -> FiberFfiStatus {
+    ffi_boundary(|| {
+        let handle = checked_handle(handle)?;
+        prepare_out_string(out_json)?;
+        let params = parse_json_params::<fnn::rpc::invoice::SettleInvoiceParams>(params_json)?;
+        let response = handle
+            .runtime_handle
+            .block_on(call_settle_invoice(handle, params))?;
+        write_serializable_out(out_json, &response)?;
+        Ok(FiberFfiStatus::Ok)
+    })
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn fiber_string_free(string: *mut c_char) {
     if !string.is_null() {
         let _ = CString::from_raw(string);
@@ -391,6 +722,8 @@ struct RunningNode {
     root_token: CancellationToken,
     root_tracker: TaskTracker,
     network_actor: ActorRef<NetworkActorMessage>,
+    store: fnn::store::Store,
+    fiber_config: FiberConfig,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -590,7 +923,7 @@ async fn start_node(
     } else {
         let actor = Actor::spawn_linked(
             Some("watchtower".to_string()),
-            WatchtowerActor::new(store),
+            WatchtowerActor::new(store.clone()),
             ckb_config,
             root_actor.get_cell(),
         )
@@ -624,6 +957,8 @@ async fn start_node(
         root_token,
         root_tracker,
         network_actor,
+        store,
+        fiber_config,
     })
 }
 
@@ -719,6 +1054,206 @@ async fn call_disconnect_peer(
         Ok(result) => result,
         Err(err) => Err(err.to_string()),
     }
+}
+
+async fn call_open_channel(
+    handle: &FiberHandle,
+    params: fnn::rpc::channel::OpenChannelParams,
+) -> FfiCallResult<fnn::rpc::channel::OpenChannelResult> {
+    channel_rpc(handle)
+        .open_channel(params)
+        .await
+        .map_err(rpc_ffi_error)
+}
+
+async fn call_accept_channel(
+    handle: &FiberHandle,
+    params: fnn::rpc::channel::AcceptChannelParams,
+) -> FfiCallResult<fnn::rpc::channel::AcceptChannelResult> {
+    channel_rpc(handle)
+        .accept_channel(params)
+        .await
+        .map_err(rpc_ffi_error)
+}
+
+async fn call_abandon_channel(
+    handle: &FiberHandle,
+    params: fnn::rpc::channel::AbandonChannelParams,
+) -> FfiCallResult<()> {
+    channel_rpc(handle)
+        .abandon_channel(params)
+        .await
+        .map_err(rpc_ffi_error)
+}
+
+async fn call_list_channels(
+    handle: &FiberHandle,
+    params: fnn::rpc::channel::ListChannelsParams,
+) -> FfiCallResult<fnn::rpc::channel::ListChannelsResult> {
+    channel_rpc(handle)
+        .list_channels(params)
+        .await
+        .map_err(rpc_ffi_error)
+}
+
+async fn call_shutdown_channel(
+    handle: &FiberHandle,
+    params: fnn::rpc::channel::ShutdownChannelParams,
+) -> FfiCallResult<()> {
+    channel_rpc(handle)
+        .shutdown_channel(params)
+        .await
+        .map_err(rpc_ffi_error)
+}
+
+async fn call_update_channel(
+    handle: &FiberHandle,
+    params: fnn::rpc::channel::UpdateChannelParams,
+) -> FfiCallResult<()> {
+    channel_rpc(handle)
+        .update_channel(params)
+        .await
+        .map_err(rpc_ffi_error)
+}
+
+async fn call_open_channel_with_external_funding(
+    handle: &FiberHandle,
+    params: fnn::rpc::channel::OpenChannelWithExternalFundingParams,
+) -> FfiCallResult<fnn::rpc::channel::OpenChannelWithExternalFundingResult> {
+    channel_rpc(handle)
+        .open_channel_with_external_funding(params)
+        .await
+        .map_err(rpc_ffi_error)
+}
+
+async fn call_submit_signed_funding_tx(
+    handle: &FiberHandle,
+    params: fnn::rpc::channel::SubmitSignedFundingTxParams,
+) -> FfiCallResult<fnn::rpc::channel::SubmitSignedFundingTxResult> {
+    channel_rpc(handle)
+        .submit_signed_funding_tx(params)
+        .await
+        .map_err(rpc_ffi_error)
+}
+
+async fn call_send_payment(
+    handle: &FiberHandle,
+    params: fnn::rpc::payment::SendPaymentCommandParams,
+) -> FfiCallResult<fnn::rpc::payment::GetPaymentCommandResult> {
+    payment_rpc(handle)
+        .send_payment(params)
+        .await
+        .map_err(rpc_ffi_error)
+}
+
+async fn call_get_payment(
+    handle: &FiberHandle,
+    params: fnn::rpc::payment::GetPaymentCommandParams,
+) -> FfiCallResult<fnn::rpc::payment::GetPaymentCommandResult> {
+    payment_rpc(handle)
+        .get_payment(params)
+        .await
+        .map_err(rpc_ffi_error)
+}
+
+async fn call_list_payments(
+    handle: &FiberHandle,
+    params: fnn::rpc::payment::ListPaymentsParams,
+) -> FfiCallResult<fnn::rpc::payment::ListPaymentsResult> {
+    payment_rpc(handle)
+        .list_payments(params)
+        .await
+        .map_err(rpc_ffi_error)
+}
+
+async fn call_build_router(
+    handle: &FiberHandle,
+    params: fnn::rpc::payment::BuildRouterParams,
+) -> FfiCallResult<fnn::rpc::payment::BuildPaymentRouterResult> {
+    payment_rpc(handle)
+        .build_router(params)
+        .await
+        .map_err(rpc_ffi_error)
+}
+
+async fn call_send_payment_with_router(
+    handle: &FiberHandle,
+    params: fnn::rpc::payment::SendPaymentWithRouterParams,
+) -> FfiCallResult<fnn::rpc::payment::GetPaymentCommandResult> {
+    payment_rpc(handle)
+        .send_payment_with_router(params)
+        .await
+        .map_err(rpc_ffi_error)
+}
+
+async fn call_new_invoice(
+    handle: &FiberHandle,
+    params: fnn::rpc::invoice::NewInvoiceParams,
+) -> FfiCallResult<fnn::rpc::invoice::InvoiceResult> {
+    invoice_rpc(handle)
+        .new_invoice(params)
+        .await
+        .map_err(rpc_ffi_error)
+}
+
+async fn call_parse_invoice(
+    handle: &FiberHandle,
+    params: fnn::rpc::invoice::ParseInvoiceParams,
+) -> FfiCallResult<fnn::rpc::invoice::ParseInvoiceResult> {
+    invoice_rpc(handle)
+        .parse_invoice(params)
+        .await
+        .map_err(rpc_ffi_error)
+}
+
+async fn call_get_invoice(
+    handle: &FiberHandle,
+    params: fnn::rpc::invoice::InvoiceParams,
+) -> FfiCallResult<fnn::rpc::invoice::GetInvoiceResult> {
+    invoice_rpc(handle)
+        .get_invoice(params)
+        .await
+        .map_err(rpc_ffi_error)
+}
+
+async fn call_cancel_invoice(
+    handle: &FiberHandle,
+    params: fnn::rpc::invoice::InvoiceParams,
+) -> FfiCallResult<fnn::rpc::invoice::GetInvoiceResult> {
+    invoice_rpc(handle)
+        .cancel_invoice(params)
+        .await
+        .map_err(rpc_ffi_error)
+}
+
+async fn call_settle_invoice(
+    handle: &FiberHandle,
+    params: fnn::rpc::invoice::SettleInvoiceParams,
+) -> FfiCallResult<fnn::rpc::invoice::SettleInvoiceResult> {
+    invoice_rpc(handle)
+        .settle_invoice(params)
+        .await
+        .map_err(rpc_ffi_error)
+}
+
+fn channel_rpc(handle: &FiberHandle) -> fnn::rpc::channel::ChannelRpcServerImpl<fnn::store::Store> {
+    fnn::rpc::channel::ChannelRpcServerImpl::new(handle.network_actor.clone(), handle.store.clone())
+}
+
+fn payment_rpc(handle: &FiberHandle) -> fnn::rpc::payment::PaymentRpcServerImpl<fnn::store::Store> {
+    fnn::rpc::payment::PaymentRpcServerImpl::new(handle.network_actor.clone(), handle.store.clone())
+}
+
+fn invoice_rpc(handle: &FiberHandle) -> fnn::rpc::invoice::InvoiceRpcServerImpl<fnn::store::Store> {
+    fnn::rpc::invoice::InvoiceRpcServerImpl::new(
+        handle.store.clone(),
+        Some(handle.network_actor.clone()),
+        Some(handle.fiber_config.clone()),
+    )
+}
+
+fn rpc_ffi_error(err: impl std::fmt::Display) -> FfiError {
+    ffi_error(FiberFfiStatus::InvalidArgument, err.to_string())
 }
 
 fn node_info_to_json(response: fnn::fiber::network::NodeInfoResponse) -> serde_json::Value {
@@ -990,6 +1525,16 @@ fn optional_string(ptr: *const c_char) -> FfiCallResult<Option<String>> {
     }
 }
 
+fn parse_json_params<T: DeserializeOwned>(ptr: *const c_char) -> FfiCallResult<T> {
+    let json = required_string(ptr, "params_json")?;
+    serde_json::from_str(&json).map_err(|err| {
+        ffi_error(
+            FiberFfiStatus::InvalidArgument,
+            format!("invalid params_json: {err}"),
+        )
+    })
+}
+
 fn parse_pubkey(value: &str) -> FfiCallResult<fnn::fiber_types::Pubkey> {
     let value = value.strip_prefix("0x").unwrap_or(value);
     let bytes = hex::decode(value).map_err(|err| {
@@ -1071,6 +1616,19 @@ fn write_json_out(out_json: *mut *mut c_char, value: serde_json::Value) -> FfiCa
         *out_json = json.into_raw();
     }
     Ok(())
+}
+
+fn write_serializable_out<T: Serialize>(
+    out_json: *mut *mut c_char,
+    value: &T,
+) -> FfiCallResult<()> {
+    let json = serde_json::to_value(value).map_err(|err| {
+        ffi_error(
+            FiberFfiStatus::InvalidArgument,
+            format!("failed to serialize json: {err}"),
+        )
+    })?;
+    write_json_out(out_json, json)
 }
 
 fn init_logging(log_level: &str) {
