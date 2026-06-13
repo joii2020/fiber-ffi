@@ -101,6 +101,7 @@ enum StartupMessage {
 }
 
 static INIT_LOGGING: Once = Once::new();
+static CHAIN_HASH_STATE: Mutex<Option<String>> = Mutex::new(None);
 
 thread_local! {
     static LAST_ERROR: RefCell<Option<String>> = const { RefCell::new(None) };
@@ -156,25 +157,40 @@ pub unsafe extern "C" fn fiber_start(
                 };
 
                 let runtime_handle = runtime.handle().clone();
-                runtime.block_on(async move {
-                    match start_node(config_path, database_prefix, callback).await {
-                        Ok(node) => {
-                            let network_actor = node.network_actor.clone();
-                            let store = node.store.clone();
-                            let fiber_config = node.fiber_config.clone();
-                            let _ = startup_tx.send(StartupMessage::Started {
-                                runtime_handle,
-                                network_actor,
-                                store,
-                                fiber_config,
-                            });
-                            stop_node_on_signal(node, stop_rx).await;
+                let startup_tx_for_panic = startup_tx.clone();
+                let startup_result = catch_unwind(AssertUnwindSafe(|| {
+                    runtime.block_on(async move {
+                        match start_node(config_path, database_prefix, callback).await {
+                            Ok(node) => {
+                                let network_actor = node.network_actor.clone();
+                                let store = node.store.clone();
+                                let fiber_config = node.fiber_config.clone();
+                                let _ = startup_tx.send(StartupMessage::Started {
+                                    runtime_handle,
+                                    network_actor,
+                                    store,
+                                    fiber_config,
+                                });
+                                stop_node_on_signal(node, stop_rx).await;
+                            }
+                            Err(err) => {
+                                let _ = startup_tx.send(StartupMessage::Failed(err));
+                            }
                         }
-                        Err(err) => {
-                            let _ = startup_tx.send(StartupMessage::Failed(err));
-                        }
-                    }
-                });
+                    });
+                }));
+                if let Err(err) = startup_result {
+                    let message = if let Some(message) = err.downcast_ref::<&str>() {
+                        (*message).to_string()
+                    } else if let Some(message) = err.downcast_ref::<String>() {
+                        message.clone()
+                    } else {
+                        "unknown panic".to_string()
+                    };
+                    let _ = startup_tx_for_panic.send(StartupMessage::Failed(format!(
+                        "runtime thread panicked during startup: {message}"
+                    )));
+                }
             })
             .map_err(|err| ffi_error(FiberFfiStatus::StartupFailed, err.to_string()))?;
 
@@ -870,7 +886,26 @@ async fn start_node(
         .build_genesis()
         .map_err(|err| format!("failed to build ckb genesis block: {err}"))?;
 
-    init_chain_hash(genesis_block.hash().into());
+    let chain_hash = genesis_block.hash().into();
+    let chain_hash_label = format!("{chain_hash:?}");
+    {
+        let mut initialized_chain_hash = CHAIN_HASH_STATE
+            .lock()
+            .map_err(|_| "chain hash state mutex poisoned".to_string())?;
+        match initialized_chain_hash.as_ref() {
+            Some(existing_chain_hash) if existing_chain_hash != &chain_hash_label => {
+                return Err(
+                    "cannot restart fiber with a different chain hash in the same process"
+                        .to_string(),
+                );
+            }
+            Some(_) => {}
+            None => {
+                init_chain_hash(chain_hash);
+                *initialized_chain_hash = Some(chain_hash_label);
+            }
+        }
+    }
     let type_id_resolver = TypeIDResolver::new(ckb_config.rpc_url.clone());
     try_init_contracts_context(
         genesis_block,
