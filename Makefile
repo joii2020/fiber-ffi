@@ -28,4 +28,4 @@ build-android:
 		CARGO_TARGET_$${target_env}_LINKER="$$linker" \
 		RUSTFLAGS="$(ANDROID_RUSTFLAGS) $${RUSTFLAGS:-}" \
 		BINDGEN_EXTRA_CLANG_ARGS="--sysroot=$(ANDROID_TOOLCHAIN_DIR)/sysroot --target=$(ANDROID_TARGET) -D__ANDROID_API__=$(ANDROID_API)" \
-		$(CARGO) build --release --locked --target "$(ANDROID_TARGET)" --no-default-features --features sqlite,watchtower; \
+		$(CARGO) build --release --locked --target "$(ANDROID_TARGET)" --no-default-features --features sqlite; \
