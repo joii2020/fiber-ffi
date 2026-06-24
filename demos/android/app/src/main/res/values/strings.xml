@@ -1,0 +1,9 @@
+<resources>
+    <string name="app_name">Fiber Demo</string>
+    <string name="fiber_start">Start</string>
+    <string name="fiber_stop">Stop</string>
+    <string name="fiber_status_stopped">Fiber stopped</string>
+    <string name="fiber_service_channel">Fiber node</string>
+    <string name="fiber_service_title">Fiber node running</string>
+    <string name="fiber_service_text">Keeping the Fiber node active in the background</string>
+</resources>
