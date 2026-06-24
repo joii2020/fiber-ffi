@@ -49,6 +49,45 @@ If the FFI implementation needs APIs that only exist in a fork or local branch, 
 
 ## Build
 
+The crate emits a `cdylib`. Mobile builds disable default features to avoid the
+RocksDB/libclang toolchain requirement.
+
+### iOS
+
+Prerequisites:
+
+- macOS with full Xcode installed. Command Line Tools alone are not enough
+  because the iPhoneOS and iPhoneSimulator SDKs are required.
+- Select Xcode as the active developer directory if needed:
+
+  ```sh
+  sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+  ```
+
+Build the raw dynamic library for device:
+
+```sh
+make build-ios
+```
+
+Build the raw dynamic library for Apple Silicon simulator:
+
+```sh
+make build-ios-sim
+```
+
+The outputs are:
+
+```text
+target/aarch64-apple-ios/release/libfiber_ffi.dylib
+target/aarch64-apple-ios-sim/release/libfiber_ffi.dylib
+```
+
+Copy or package these outputs from the app/demo repository as needed. The C ABI
+header is `include/fiber_ffi.h`.
+
+### Android
+
 Android uses the `cdylib` output. The crate enables vendored OpenSSL so local
 builds do not depend on a system OpenSSL installation.
 
@@ -72,6 +111,3 @@ WSL, Linux, macOS, or Git Bash:
 ```sh
 make build-android
 ```
-
-The build uses `--no-default-features --features sqlite,watchtower` to avoid the
-RocksDB/libclang toolchain requirement.
