@@ -2,6 +2,7 @@ CARGO ?= cargo
 RUSTUP ?= rustup
 
 IOS_RUSTFLAGS ?= -C link-arg=-Wl,-install_name,@rpath/libfiber_ffi.dylib
+IOS_DEPLOYMENT_TARGET ?= 15.0
 
 ANDROID_API ?= 23
 ANDROID_TARGET ?= aarch64-linux-android
@@ -21,7 +22,7 @@ build-ios:
 	target_key=$$(printf '%s' "$$target" | tr '-' '_'); \
 	target_env=$$(printf '%s' "$$target" | tr '[:lower:]-' '[:upper:]_'); \
 	sdkroot=$$(xcrun --sdk "$$sdk" --show-sdk-path); \
-	deployment_target=$$(xcrun --sdk "$$sdk" --show-sdk-platform-version); \
+	deployment_target="$(IOS_DEPLOYMENT_TARGET)"; \
 	min_flag="-miphoneos-version-min=$$deployment_target"; \
 	clang=$$(xcrun --sdk "$$sdk" --find clang); \
 	clangxx=$$(xcrun --sdk "$$sdk" --find clang++); \
@@ -51,7 +52,7 @@ build-ios-sim:
 	target_key=$$(printf '%s' "$$target" | tr '-' '_'); \
 	target_env=$$(printf '%s' "$$target" | tr '[:lower:]-' '[:upper:]_'); \
 	sdkroot=$$(xcrun --sdk "$$sdk" --show-sdk-path); \
-	deployment_target=$$(xcrun --sdk "$$sdk" --show-sdk-platform-version); \
+	deployment_target="$(IOS_DEPLOYMENT_TARGET)"; \
 	min_flag="-mios-simulator-version-min=$$deployment_target"; \
 	clang=$$(xcrun --sdk "$$sdk" --find clang); \
 	clangxx=$$(xcrun --sdk "$$sdk" --find clang++); \
