@@ -1,0 +1,6 @@
+.DS_Store
+build/
+FiberDemo/Libs/iphoneos/
+FiberDemo/Libs/iphonesimulator/
+xcuserdata/
+*.xcuserstate
