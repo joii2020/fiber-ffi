@@ -12,6 +12,7 @@
 		1A0000000000000000000022 /* MainViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000032 /* MainViewController.swift */; };
 		1A0000000000000000000023 /* FiberRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000033 /* FiberRuntime.swift */; };
 		1A0000000000000000000024 /* fiber_config.yml in Resources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000036 /* fiber_config.yml */; };
+		1A0000000000000000000025 /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000038 /* LaunchScreen.storyboard */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -24,6 +25,7 @@
 		1A0000000000000000000035 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		1A0000000000000000000036 /* fiber_config.yml */ = {isa = PBXFileReference; lastKnownFileType = text; path = fiber_config.yml; sourceTree = "<group>"; };
 		1A0000000000000000000037 /* README.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = README.md; sourceTree = "<group>"; };
+		1A0000000000000000000038 /* LaunchScreen.storyboard */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; path = LaunchScreen.storyboard; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -63,6 +65,7 @@
 				1A0000000000000000000033 /* FiberRuntime.swift */,
 				1A0000000000000000000034 /* FiberDemo-Bridging-Header.h */,
 				1A0000000000000000000035 /* Info.plist */,
+				1A0000000000000000000038 /* LaunchScreen.storyboard */,
 				1A0000000000000000000007 /* Resources */,
 			);
 			path = FiberDemo;
@@ -136,6 +139,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				1A0000000000000000000024 /* fiber_config.yml in Resources */,
+				1A0000000000000000000025 /* LaunchScreen.storyboard in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

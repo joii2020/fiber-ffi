@@ -86,8 +86,7 @@ final class MainViewController: UIViewController {
             contentStack.bottomAnchor.constraint(equalTo: contentScrollView.contentLayoutGuide.bottomAnchor),
             contentStack.widthAnchor.constraint(equalTo: contentScrollView.frameLayoutGuide.widthAnchor),
 
-            contentScrollView.heightAnchor.constraint(equalTo: rootStack.heightAnchor, multiplier: 0.58),
-            logView.heightAnchor.constraint(equalTo: rootStack.heightAnchor, multiplier: 0.38)
+            contentScrollView.heightAnchor.constraint(equalTo: logView.heightAnchor, multiplier: 1.5)
         ])
     }
 

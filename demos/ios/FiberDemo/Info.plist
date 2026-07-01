@@ -22,6 +22,8 @@
 	<string>1</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
+	<key>UILaunchStoryboardName</key>
+	<string>LaunchScreen</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Fiber uses peer-to-peer networking for local and remote node connections.</string>
 	<key>UIApplicationSceneManifest</key>
