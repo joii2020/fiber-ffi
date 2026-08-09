@@ -35,6 +35,9 @@ use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tracing::{debug, info, trace};
 use tracing_subscriber::EnvFilter;
 
+#[cfg(feature = "ckb-light-client")]
+mod ckb_light_client;
+
 #[cfg(feature = "watchtower")]
 use fnn::watchtower::{
     WatchtowerActor, WatchtowerMessage, DEFAULT_WATCHTOWER_CHECK_INTERVAL_SECONDS,
@@ -1020,6 +1023,12 @@ struct RunningNode {
     fiber_config: FiberConfig,
 }
 
+struct ParsedFfiConfig {
+    fiber: Config,
+    #[cfg(feature = "ckb-light-client")]
+    light_client: ckb_light_client::config::LocalLightClientConfig,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 enum FfiService {
     #[serde(alias = "fiber", alias = "FIBER")]
@@ -1037,12 +1046,14 @@ struct FfiSerializedConfig {
     services: Option<Vec<FfiService>>,
     fiber: Option<<FiberConfig as ClapSerde>::Opt>,
     ckb: Option<<CkbConfig as ClapSerde>::Opt>,
+    #[cfg(feature = "ckb-light-client")]
+    ckb_light_client: Option<ckb_light_client::config::SerializedLightClientConfig>,
 }
 
 fn parse_config_from_path(
     config_path: &str,
     database_prefix: Option<String>,
-) -> std::result::Result<Config, String> {
+) -> std::result::Result<ParsedFfiConfig, String> {
     let config_path = PathBuf::from(config_path);
     let base_dir = database_prefix
         .map(PathBuf::from)
@@ -1084,6 +1095,8 @@ fn parse_config_from_path(
         .fiber
         .map(FiberConfig::from)
         .ok_or_else(|| "fiber config must be set".to_string())?;
+    #[cfg(feature = "ckb-light-client")]
+    let fiber_chain = fiber_config.chain.clone();
     let (fiber, disabled_fiber) = if services.contains(&FfiService::Fiber) {
         (Some(fiber_config), None)
     } else {
@@ -1095,7 +1108,7 @@ fn parse_config_from_path(
         None
     };
 
-    Ok(Config {
+    let fiber = Config {
         fiber,
         disabled_fiber,
         cch: None,
@@ -1103,6 +1116,24 @@ fn parse_config_from_path(
         ckb,
         base_dir,
         check_validate: false,
+    };
+
+    #[cfg(feature = "ckb-light-client")]
+    let light_client = ckb_light_client::config::LocalLightClientConfig::build(
+        fiber.base_dir.clone(),
+        &fiber_chain,
+        fiber
+            .ckb
+            .as_ref()
+            .map(|config| config.rpc_url.clone())
+            .unwrap_or_default(),
+        config_from_file.ckb_light_client.unwrap_or_default(),
+    )?;
+
+    Ok(ParsedFfiConfig {
+        fiber,
+        #[cfg(feature = "ckb-light-client")]
+        light_client,
     })
 }
 
@@ -1133,7 +1164,22 @@ async fn start_node(
         fnn::get_git_commit_info()
     );
 
-    let config = parse_config_from_path(&config_path, database_prefix)?;
+    let parsed_config = parse_config_from_path(&config_path, database_prefix)?;
+    #[cfg(feature = "ckb-light-client")]
+    debug!(
+        mode = ?parsed_config.light_client.mode,
+        chain = %parsed_config.light_client.chain_label(),
+        store_path = %parsed_config.light_client.store_path.display(),
+        network_path = %parsed_config.light_client.network_path.display(),
+        history_start_block = parsed_config.light_client.history_start_block,
+        bootnodes = parsed_config.light_client.bootnodes.len(),
+        local_rpc_listen_address = %ckb_light_client::config::LocalLightClientConfig::local_rpc_listen_address(),
+        max_outbound_peers = ckb_light_client::config::MAX_OUTBOUND_PEERS,
+        header_ready_timeout_seconds = ckb_light_client::config::HEADER_READY_TIMEOUT.as_secs(),
+        remote_data_timeout_seconds = ckb_light_client::config::REMOTE_DATA_TIMEOUT.as_secs(),
+        "validated embedded CKB Light Client configuration"
+    );
+    let config = parsed_config.fiber;
     let fiber_config = config
         .fiber
         .clone()

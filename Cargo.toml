@@ -8,6 +8,25 @@ crate-type = ["cdylib"]
 
 [features]
 default = ["rocksdb", "watchtower"]
+ckb-light-client = [
+    "dep:ckb-app-config",
+    "dep:ckb-async-runtime",
+    "dep:ckb-light-client-lib",
+    "dep:ckb-network",
+    "dep:ckb-stop-handler",
+    "dep:jsonrpc-core",
+    "dep:jsonrpc-http-server",
+    "ckb-light-client-lib/rocksdb",
+]
+# v0.5.5-rc1 does not forward ckb-rocksdb's portable feature. This feature
+# unifies it explicitly for binaries that must run on a different CPU than the
+# build host, including the E2E harness and CI artifacts.
+ckb-light-client-portable = [
+    "ckb-light-client",
+    "fnn/portable",
+    "dep:ckb-rocksdb",
+]
+disable-ckb-rpc = ["ckb-light-client"]
 metrics = ["fnn/metrics"]
 portable = ["fnn/portable"]
 rocksdb = ["fnn/rocksdb"]
@@ -15,11 +34,19 @@ sqlite = ["fnn/sqlite"]
 watchtower = ["fnn/watchtower"]
 
 [dependencies]
+ckb-app-config = { version = "=1.1.0", optional = true }
+ckb-async-runtime = { version = "=1.1.0", optional = true }
 ckb-chain-spec = "1"
+ckb-light-client-lib = { git = "https://github.com/nervosnetwork/ckb-light-client.git", tag = "v0.5.5-rc1", default-features = false, optional = true }
+ckb-network = { version = "=1.1.0", optional = true }
 ckb-resource = "1"
+ckb-rocksdb = { version = "=0.21.1", default-features = false, features = ["portable"], optional = true }
+ckb-stop-handler = { version = "=1.1.0", optional = true }
 fnn = { git = "https://github.com/nervosnetwork/fiber.git", tag = "v0.9.0-rc2" }
 hex = "0.4"
 clap-serde-derive = "0.2.1"
+jsonrpc-core = { version = "18", optional = true }
+jsonrpc-http-server = { version = "18", optional = true }
 openssl = { version = "0.10", features = ["vendored"] }
 ractor = { version = "0.15", features = ["async-trait"] }
 serde = { version = "1", features = ["derive"] }
