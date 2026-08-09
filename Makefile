@@ -11,7 +11,15 @@ ANDROID_RUSTFLAGS ?= -C link-arg=-Wl,-z,max-page-size=16384
 ANDROID_HOST_TAG ?= $(notdir $(firstword $(wildcard $(ANDROID_NDK_HOME)/toolchains/llvm/prebuilt/*)))
 ANDROID_TOOLCHAIN_DIR ?= $(ANDROID_NDK_HOME)/toolchains/llvm/prebuilt/$(ANDROID_HOST_TAG)
 
-.PHONY: build-ios build-ios-sim build-android
+FIBER_SOURCE_DIR ?= ../fiber
+
+.PHONY: build-ios build-ios-sim build-android e2e-light-client e2e-light-client-check
+
+e2e-light-client:
+	FIBER_SOURCE_DIR="$(abspath $(FIBER_SOURCE_DIR))" CARGO="$(CARGO)" tests/e2e/light-client/run.sh
+
+e2e-light-client-check:
+	FIBER_SOURCE_DIR="$(abspath $(FIBER_SOURCE_DIR))" CARGO="$(CARGO)" tests/e2e/light-client/run.sh --check
 
 build-ios:
 	@set -e; \

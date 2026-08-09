@@ -188,3 +188,142 @@ fn copy_bootnodes(bootnodes: &[&str]) -> Vec<String> {
         .map(|address| (*address).to_string())
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn deserialize(yaml: &str) -> Result<SerializedLightClientConfig, serde_yaml::Error> {
+        serde_yaml::from_str(yaml)
+    }
+
+    #[test]
+    fn mainnet_uses_fixed_defaults() {
+        let config = LocalLightClientConfig::build(
+            PathBuf::from("/tmp/fiber"),
+            "mainnet",
+            "http://127.0.0.1:8114".to_string(),
+            deserialize("{}").unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(config.chain, LocalChain::Mainnet);
+        assert_eq!(
+            config.store_path,
+            PathBuf::from("/tmp/fiber/ckb-light-client/store")
+        );
+        assert_eq!(
+            config.network_path,
+            PathBuf::from("/tmp/fiber/ckb-light-client/network")
+        );
+        assert_eq!(config.history_start_block, 0);
+        assert_eq!(config.bootnodes.len(), MAINNET_BOOTNODES.len());
+        assert_eq!(
+            LocalLightClientConfig::local_rpc_listen_address().to_string(),
+            LOCAL_RPC_LISTEN_ADDRESS
+        );
+        assert_eq!(MAX_OUTBOUND_PEERS, 8);
+        assert!(REMOTE_DATA_TIMEOUT < Duration::from_secs(10));
+        assert_eq!(HEADER_READY_TIMEOUT, Duration::from_secs(120));
+    }
+
+    #[test]
+    fn parses_history_start_block() {
+        let config = LocalLightClientConfig::build(
+            PathBuf::from("data"),
+            "testnet",
+            "http://127.0.0.1:8114".to_string(),
+            deserialize("history_start_block: '0x2a'").unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(config.history_start_block, 42);
+    }
+
+    #[test]
+    fn custom_chain_requires_bootnodes_and_resolves_chain_path() {
+        let error = LocalLightClientConfig::build(
+            PathBuf::from("/tmp/fiber"),
+            "specs/dev.toml",
+            String::new(),
+            deserialize("{}").unwrap(),
+        )
+        .unwrap_err();
+        assert!(error.contains("must be set"));
+
+        let config = LocalLightClientConfig::build(
+            PathBuf::from("/tmp/fiber"),
+            "specs/dev.toml",
+            String::new(),
+            deserialize(&format!("bootnodes: ['{}']", MAINNET_BOOTNODES[0])).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            config.chain,
+            LocalChain::Custom(PathBuf::from("/tmp/fiber/specs/dev.toml"))
+        );
+    }
+
+    #[test]
+    fn rejects_unsafe_or_unsupported_yaml_fields() {
+        let error = deserialize("listen_address: '0.0.0.0:9000'").unwrap_err();
+        assert!(error.to_string().contains("unknown field"));
+
+        let error = LocalLightClientConfig::build(
+            PathBuf::from("data"),
+            "mainnet",
+            String::new(),
+            deserialize("bootnodes: ['/ip4/127.0.0.1/tcp/8114']").unwrap(),
+        )
+        .unwrap_err();
+        assert!(error.contains("cannot override"));
+    }
+
+    #[test]
+    fn rejects_invalid_history_start_block() {
+        for value in ["42", "0x", "0xnope"] {
+            let serialized = deserialize(&format!("history_start_block: '{value}'")).unwrap();
+            let error = LocalLightClientConfig::build(
+                PathBuf::from("data"),
+                "mainnet",
+                String::new(),
+                serialized,
+            )
+            .unwrap_err();
+            assert!(error.contains("history_start_block"));
+        }
+    }
+
+    #[cfg(not(feature = "disable-ckb-rpc"))]
+    #[test]
+    fn hybrid_mode_keeps_only_the_fixed_upstream() {
+        let config = LocalLightClientConfig::build(
+            PathBuf::from("data"),
+            "mainnet",
+            "http://127.0.0.1:8114".to_string(),
+            deserialize("{}").unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.mode,
+            CkbDataMode::Hybrid {
+                upstream_rpc_url: "http://127.0.0.1:8114".to_string()
+            }
+        );
+    }
+
+    #[cfg(feature = "disable-ckb-rpc")]
+    #[test]
+    fn light_client_only_mode_discards_the_upstream() {
+        let config = LocalLightClientConfig::build(
+            PathBuf::from("data"),
+            "mainnet",
+            "http://should-not-be-retained.invalid".to_string(),
+            deserialize("{}").unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(config.mode, CkbDataMode::LightClientOnly);
+    }
+}
