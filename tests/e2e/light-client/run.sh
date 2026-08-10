@@ -71,15 +71,17 @@ fi
 work_dir="$(mktemp -d "${TMPDIR:-/tmp}/fiber-ffi-e2e.XXXXXX")"
 fixture_dir="$work_dir/fiber-fixture"
 ckb_log="$work_dir/ckb.log"
-ckb_pid=""
+ckb_pids=()
 
 cleanup() {
     exit_status=$?
     trap - EXIT INT TERM
-    if [ -n "$ckb_pid" ] && kill -0 "$ckb_pid" >/dev/null 2>&1; then
-        kill "$ckb_pid" >/dev/null 2>&1 || true
-        wait "$ckb_pid" >/dev/null 2>&1 || true
-    fi
+    for ckb_pid in "${ckb_pids[@]}"; do
+        if kill -0 "$ckb_pid" >/dev/null 2>&1; then
+            kill "$ckb_pid" >/dev/null 2>&1 || true
+            wait "$ckb_pid" >/dev/null 2>&1 || true
+        fi
+    done
     if [ -n "$keep_workdir" ]; then
         echo "E2E work directory kept at $work_dir"
     else
@@ -101,48 +103,76 @@ cp -R "$fiber_source_dir/tests/deploy" "$fixture_dir/tests/deploy"
 cp -R "$fiber_source_dir/tests/nodes" "$fixture_dir/tests/nodes"
 
 echo "Initializing a temporary dev chain from Fiber's E2E fixtures ..."
-"$fixture_dir/tests/deploy/init-dev-chain.sh"
+CARGO_TARGET_DIR="$repo_dir/target" "$fixture_dir/tests/deploy/init-dev-chain.sh"
 
-echo "Starting CKB dev node ..."
-ckb run -C "$fixture_dir/tests/deploy/node-data" --indexer >"$ckb_log" 2>&1 &
-ckb_pid=$!
-
-rpc_ready=false
-for _ in {1..60}; do
-    if ! kill -0 "$ckb_pid" >/dev/null 2>&1; then
-        echo "error: CKB exited before RPC became ready" >&2
-        tail -100 "$ckb_log" >&2 || true
-        exit 1
-    fi
-    if curl --fail --silent --show-error \
-        --header "Content-Type: application/json" \
-        --data '{"id":1,"jsonrpc":"2.0","method":"get_tip_block_number","params":[]}' \
-        "$ckb_rpc_url" >/dev/null 2>&1; then
-        rpc_ready=true
-        break
-    fi
-    sleep 1
+peer_rpc_urls=("$ckb_rpc_url")
+peer_logs=("$ckb_log")
+for peer_number in 1 2 3; do
+    peer_dir="$fixture_dir/tests/deploy/ckb-peer-$peer_number"
+    peer_rpc_port=$((8114 + peer_number * 100))
+    peer_p2p_port=$((8115 + peer_number * 100))
+    cp -R "$fixture_dir/tests/deploy/node-data" "$peer_dir"
+    rm -rf -- "$peer_dir/data/network"
+    sed -i.bak \
+        -e "s/8114/$peer_rpc_port/g" \
+        -e "s/8115/$peer_p2p_port/g" \
+        "$peer_dir/ckb.toml"
+    peer_rpc_urls+=("http://127.0.0.1:$peer_rpc_port")
+    peer_logs+=("$work_dir/ckb-peer-$peer_number.log")
 done
 
-if ! "$rpc_ready"; then
-    echo "error: CKB RPC did not become ready at $ckb_rpc_url" >&2
-    tail -100 "$ckb_log" >&2 || true
-    exit 1
-fi
+echo "Starting four CKB dev peers ..."
+ckb run -C "$fixture_dir/tests/deploy/node-data" --indexer >"$ckb_log" 2>&1 &
+ckb_pids+=("$!")
+for peer_number in 1 2 3; do
+    ckb run -C "$fixture_dir/tests/deploy/ckb-peer-$peer_number" \
+        --skip-spec-check --indexer \
+        >"${peer_logs[$peer_number]}" 2>&1 &
+    ckb_pids+=("$!")
+done
 
-bootnode="$("$script_dir/discover_bootnode.py" "$ckb_rpc_url")"
+for peer_number in 0 1 2 3; do
+    rpc_ready=false
+    for _ in {1..60}; do
+        if ! kill -0 "${ckb_pids[$peer_number]}" >/dev/null 2>&1; then
+            echo "error: CKB peer $peer_number exited before RPC became ready" >&2
+            tail -100 "${peer_logs[$peer_number]}" >&2 || true
+            exit 1
+        fi
+        if curl --fail --silent --show-error \
+            --header "Content-Type: application/json" \
+            --data '{"id":1,"jsonrpc":"2.0","method":"get_tip_block_number","params":[]}' \
+            "${peer_rpc_urls[$peer_number]}" >/dev/null 2>&1; then
+            rpc_ready=true
+            break
+        fi
+        sleep 1
+    done
+
+    if ! "$rpc_ready"; then
+        echo "error: CKB RPC did not become ready at ${peer_rpc_urls[$peer_number]}" >&2
+        tail -100 "${peer_logs[$peer_number]}" >&2 || true
+        exit 1
+    fi
+done
+
+bootnodes=()
+for peer_rpc_url in "${peer_rpc_urls[@]}"; do
+    bootnodes+=("$("$script_dir/discover_bootnode.py" "$peer_rpc_url")")
+done
 source_config="$fixture_dir/tests/nodes/1/config.yml"
 light_client_config="$fixture_dir/tests/nodes/1/config-light-client.yml"
 require_file "$source_config"
 cp "$source_config" "$light_client_config"
-cat >>"$light_client_config" <<EOF
-
-# Added by fiber-ffi/tests/e2e/light-client/run.sh.
-ckb_light_client:
-  history_start_block: "0x0"
-  bootnodes:
-    - "$bootnode"
-EOF
+{
+    printf '\n# Added by fiber-ffi/tests/e2e/light-client/run.sh.\n'
+    printf 'ckb_light_client:\n'
+    printf '  history_start_block: "0x0"\n'
+    printf '  bootnodes:\n'
+    for bootnode in "${bootnodes[@]}"; do
+        printf '    - "%s"\n' "$bootnode"
+    done
+} >>"$light_client_config"
 
 echo "Building fiber-ffi with the portable CKB Light Client feature ..."
 (
@@ -162,4 +192,9 @@ library_dir="$repo_dir/target/debug"
     -o "$runner"
 
 echo "Starting fiber-ffi through its C ABI ..."
-FIBER_SECRET_KEY_PASSWORD=password1 "$runner" "$light_client_config"
+ffi_log="$work_dir/fiber-ffi.log"
+FIBER_SECRET_KEY_PASSWORD=password1 "$runner" "$light_client_config" 2>&1 | tee "$ffi_log"
+
+grep -q "embedded CKB Light Client is ready" "$ffi_log"
+grep -q "embedded CKB Light Client RPC gateway started" "$ffi_log"
+grep -q "redirected Fiber CKB RPC to the embedded Light Client gateway" "$ffi_log"

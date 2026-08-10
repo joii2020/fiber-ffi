@@ -1,10 +1,10 @@
 # CKB Light Client E2E smoke harness
 
 This temporary harness follows Fiber's existing `tests/deploy` and `tests/nodes`
-E2E layout. It copies those fixtures into a temporary directory, initializes and
-starts the same CKB dev chain, discovers the node's real P2P peer ID, adds a
-custom-chain `ckb_light_client.bootnodes` entry, and exercises the shared library
-through the public C ABI:
+E2E layout. It copies those fixtures into a temporary directory, initializes the
+same CKB dev chain, starts four isolated CKB peers, discovers their real P2P peer
+IDs, adds the custom-chain `ckb_light_client.bootnodes` entries, and exercises the
+shared library through the public C ABI:
 
 ```text
 fiber_start -> fiber_node_info -> fiber_stop
@@ -46,12 +46,11 @@ FIBER_SOURCE_DIR=/path/to/fiber KEEP_E2E_WORKDIR=1 make e2e-light-client
 
 ## Current boundary
 
-At the moment the embedded Light Client runtime and local RPC gateway have not
-been wired into `start_node`. This harness therefore validates the feature build,
-custom-chain configuration, real bootnode discovery, the Fiber dev-chain fixture,
-and the FFI lifecycle. It does **not** yet prove that Fiber's CKB reads go through
-the Light Client.
+The harness now asserts that the embedded Light Client obtains data from four
+peers, scans every startup-required script to its verified tip, starts the local
+loopback RPC gateway, and rewrites Fiber's in-memory CKB RPC URL before Fiber
+starts. It also checks the complete public C ABI start/info/stop lifecycle.
 
-Once the runtime is connected, extend this harness to start four CKB peers and
-add assertions for header readiness, script scanning, RPC routing, reorgs, and
-zero Full Node HTTP access in `disable-ckb-rpc` mode.
+This remains a startup smoke test. Follow-up E2E coverage is still needed for
+per-method RPC result comparisons, reorgs, channel funding/closing, and zero Full
+Node HTTP access in `disable-ckb-rpc` mode.

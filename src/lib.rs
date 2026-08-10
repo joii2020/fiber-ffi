@@ -1021,6 +1021,8 @@ struct RunningNode {
     network_actor: ActorRef<NetworkActorMessage>,
     store: fnn::store::Store,
     fiber_config: FiberConfig,
+    #[cfg(feature = "ckb-light-client")]
+    local_ckb: Option<ckb_light_client::LocalCkbNodeHandle>,
 }
 
 struct ParsedFfiConfig {
@@ -1179,6 +1181,8 @@ async fn start_node(
         remote_data_timeout_seconds = ckb_light_client::config::REMOTE_DATA_TIMEOUT.as_secs(),
         "validated embedded CKB Light Client configuration"
     );
+    #[cfg(feature = "ckb-light-client")]
+    let light_client_config = parsed_config.light_client.clone();
     let config = parsed_config.fiber;
     let fiber_config = config
         .fiber
@@ -1188,6 +1192,36 @@ async fn start_node(
         .ckb
         .clone()
         .ok_or_else(|| "service fiber requires service ckb to be enabled".to_string())?;
+
+    let chain_spec = ChainSpec::load_from(&match fiber_config.chain.as_str() {
+        "mainnet" => Resource::bundled("specs/mainnet.toml".to_string()),
+        "testnet" => Resource::bundled("specs/testnet.toml".to_string()),
+        path => Resource::file_system(Path::new(&config.base_dir).join(path)),
+    })
+    .map_err(|err| format!("failed to load chain spec: {err}"))?;
+    let genesis_block = chain_spec
+        .build_genesis()
+        .map_err(|err| format!("failed to build ckb genesis block: {err}"))?;
+
+    #[cfg(feature = "ckb-light-client")]
+    let (ckb_config, local_ckb) = {
+        let mut ckb_config = ckb_config;
+        let required_scripts = required_light_client_scripts(
+            &fiber_config,
+            &ckb_config,
+            &genesis_block,
+            light_client_config.history_start_block,
+        )?;
+        let local_ckb =
+            ckb_light_client::LocalCkbNodeHandle::start(light_client_config, required_scripts)
+                .await?;
+        ckb_config.rpc_url = local_ckb.rpc_url().to_string();
+        info!(
+            rpc_url = %ckb_config.rpc_url,
+            "redirected Fiber CKB RPC to the embedded Light Client gateway"
+        );
+        (ckb_config, Some(local_ckb))
+    };
 
     let store = fnn::store::open_store_with_migration(
         fiber_config.store_path(),
@@ -1199,16 +1233,6 @@ async fn start_node(
     let root_tracker = TaskTracker::new();
     let root_token = CancellationToken::new();
     let root_actor = RootActor::start(root_tracker.clone(), root_token.clone()).await;
-
-    let chain_spec = ChainSpec::load_from(&match fiber_config.chain.as_str() {
-        "mainnet" => Resource::bundled("specs/mainnet.toml".to_string()),
-        "testnet" => Resource::bundled("specs/testnet.toml".to_string()),
-        path => Resource::file_system(Path::new(&config.base_dir).join(path)),
-    })
-    .map_err(|err| format!("failed to load chain spec: {err}"))?;
-    let genesis_block = chain_spec
-        .build_genesis()
-        .map_err(|err| format!("failed to build ckb genesis block: {err}"))?;
 
     let chain_hash = genesis_block.hash().into();
     let chain_hash_label = format!("{chain_hash:?}");
@@ -1318,6 +1342,8 @@ async fn start_node(
         network_actor,
         store,
         fiber_config,
+        #[cfg(feature = "ckb-light-client")]
+        local_ckb,
     })
 }
 
@@ -1328,7 +1354,68 @@ async fn stop_node_on_signal(node: RunningNode, stop_rx: oneshot::Receiver<()>) 
         .stop(Some("fiber_stop requested".to_string()));
     node.root_tracker.close();
     node.root_tracker.wait().await;
+    #[cfg(feature = "ckb-light-client")]
+    if let Some(local_ckb) = node.local_ckb {
+        local_ckb.shutdown().await;
+    }
     debug!("fiber ffi runtime stopped");
+}
+
+#[cfg(feature = "ckb-light-client")]
+fn required_light_client_scripts(
+    fiber_config: &FiberConfig,
+    ckb_config: &CkbConfig,
+    genesis_block: &ckb_types::core::BlockView,
+    history_start_block: u64,
+) -> std::result::Result<Vec<ckb_light_client::runtime::RequiredScript>, String> {
+    use ckb_light_client::runtime::RequiredScript;
+    use ckb_types::{core::ScriptHashType, packed, prelude::*};
+
+    let mut scripts = Vec::new();
+    let secp256k1_type_script = genesis_block
+        .transaction(0)
+        .and_then(|transaction| transaction.output(1))
+        .and_then(|output| output.type_().to_opt())
+        .ok_or_else(|| {
+            "failed to derive the Light Client funding lock script from the genesis block"
+                .to_string()
+        })?;
+    let secret_key = ckb_config
+        .read_secret_key()
+        .map_err(|err| format!("failed to read the CKB funding key for the Light Client: {err}"))?;
+    let pubkey_hash =
+        ckb_hash::blake2b_256(secret_key.public_key(secp256k1::SECP256K1).serialize());
+    let funding_lock = packed::Script::new_builder()
+        .code_hash(secp256k1_type_script.calc_script_hash())
+        .hash_type(ScriptHashType::Type)
+        .args(pubkey_hash[..20].pack())
+        .build();
+    scripts.push(RequiredScript::lock(
+        funding_lock.into(),
+        history_start_block,
+    ));
+
+    for type_id in fiber_config
+        .scripts
+        .iter()
+        .flat_map(|script| script.cell_deps.iter())
+        .filter_map(|cell_dep| cell_dep.type_id.clone())
+    {
+        scripts.push(RequiredScript::type_(type_id, history_start_block));
+    }
+
+    for type_id in ckb_config
+        .udt_whitelist
+        .as_ref()
+        .into_iter()
+        .flat_map(|whitelist| whitelist.0.iter())
+        .flat_map(|udt| udt.cell_deps.iter())
+        .filter_map(|cell_dep| cell_dep.type_id.clone())
+    {
+        scripts.push(RequiredScript::type_(type_id, history_start_block));
+    }
+
+    Ok(scripts)
 }
 
 enum ConnectPeerCommand {

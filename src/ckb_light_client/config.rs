@@ -1,5 +1,6 @@
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
+use ckb_app_config::{NetworkConfig, SupportProtocol};
 use serde::Deserialize;
 use tentacle::multiaddr::Multiaddr;
 
@@ -126,6 +127,43 @@ impl LocalLightClientConfig {
             LocalChain::Testnet => "testnet".to_string(),
             LocalChain::Custom(path) => path.display().to_string(),
         }
+    }
+
+    pub(crate) fn network_config(&self) -> Result<NetworkConfig, String> {
+        let bootnodes = self
+            .bootnodes
+            .iter()
+            .map(|address| {
+                address.parse().map_err(|err| {
+                    format!("invalid CKB Light Client bootnode address {address:?}: {err}")
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(NetworkConfig {
+            path: self.network_path.clone(),
+            listen_addresses: Vec::new(),
+            public_addresses: Vec::new(),
+            bootnodes,
+            max_peers: MAX_OUTBOUND_PEERS,
+            max_outbound_peers: MAX_OUTBOUND_PEERS,
+            ping_interval_secs: 120,
+            ping_timeout_secs: 1_200,
+            connect_outbound_interval_secs: 15,
+            upnp: false,
+            discovery_local_address: false,
+            bootnode_mode: false,
+            reuse_port_on_linux: false,
+            reuse_tcp_with_ws: false,
+            support_protocols: vec![
+                SupportProtocol::Identify,
+                SupportProtocol::Ping,
+                SupportProtocol::Discovery,
+                SupportProtocol::Feeler,
+                SupportProtocol::DisconnectMessage,
+            ],
+            ..Default::default()
+        })
     }
 }
 
