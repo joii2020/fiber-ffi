@@ -31,7 +31,6 @@ ckb-light-client-portable = [
     "fnn/portable",
     "dep:ckb-rocksdb",
 ]
-disable-ckb-rpc = ["ckb-light-client"]
 metrics = ["fnn/metrics"]
 portable = ["fnn/portable"]
 rocksdb = ["fnn/rocksdb"]

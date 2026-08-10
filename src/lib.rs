@@ -1169,7 +1169,6 @@ async fn start_node(
     let parsed_config = parse_config_from_path(&config_path, database_prefix)?;
     #[cfg(feature = "ckb-light-client")]
     debug!(
-        mode = ?parsed_config.light_client.mode,
         chain = %parsed_config.light_client.chain_label(),
         store_path = %parsed_config.light_client.store_path.display(),
         network_path = %parsed_config.light_client.network_path.display(),

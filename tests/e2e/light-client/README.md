@@ -52,5 +52,4 @@ loopback RPC gateway, and rewrites Fiber's in-memory CKB RPC URL before Fiber
 starts. It also checks the complete public C ABI start/info/stop lifecycle.
 
 This remains a startup smoke test. Follow-up E2E coverage is still needed for
-per-method RPC result comparisons, reorgs, channel funding/closing, and zero Full
-Node HTTP access in `disable-ckb-rpc` mode.
+per-method RPC result comparisons, reorgs, and channel funding/closing.

@@ -4,8 +4,6 @@ use ckb_app_config::{NetworkConfig, SupportProtocol};
 use serde::Deserialize;
 use tentacle::multiaddr::Multiaddr;
 
-use super::CkbDataMode;
-
 pub(crate) const LOCAL_RPC_LISTEN_ADDRESS: &str = "127.0.0.1:0";
 pub(crate) const MAX_OUTBOUND_PEERS: u32 = 8;
 pub(crate) const HEADER_READY_TIMEOUT: Duration = Duration::from_secs(120);
@@ -57,7 +55,7 @@ pub(crate) enum LocalChain {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct LocalLightClientConfig {
-    pub(crate) mode: CkbDataMode,
+    pub(crate) upstream_rpc_url: String,
     pub(crate) chain: LocalChain,
     pub(crate) store_path: PathBuf,
     pub(crate) network_path: PathBuf,
@@ -106,7 +104,7 @@ impl LocalLightClientConfig {
 
         let light_client_dir = base_dir.join("ckb-light-client");
         Ok(Self {
-            mode: data_mode(upstream_rpc_url),
+            upstream_rpc_url,
             chain,
             store_path: light_client_dir.join("store"),
             network_path: light_client_dir.join("network"),
@@ -165,16 +163,6 @@ impl LocalLightClientConfig {
             ..Default::default()
         })
     }
-}
-
-#[cfg(not(feature = "disable-ckb-rpc"))]
-fn data_mode(upstream_rpc_url: String) -> CkbDataMode {
-    CkbDataMode::Hybrid { upstream_rpc_url }
-}
-
-#[cfg(feature = "disable-ckb-rpc")]
-fn data_mode(_upstream_rpc_url: String) -> CkbDataMode {
-    CkbDataMode::LightClientOnly
 }
 
 fn parse_hex_block_number(value: &str) -> Result<u64, String> {
@@ -332,9 +320,8 @@ mod tests {
         }
     }
 
-    #[cfg(not(feature = "disable-ckb-rpc"))]
     #[test]
-    fn hybrid_mode_keeps_only_the_fixed_upstream() {
+    fn keeps_the_fixed_upstream() {
         let config = LocalLightClientConfig::build(
             PathBuf::from("data"),
             "mainnet",
@@ -343,25 +330,6 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            config.mode,
-            CkbDataMode::Hybrid {
-                upstream_rpc_url: "http://127.0.0.1:8114".to_string()
-            }
-        );
-    }
-
-    #[cfg(feature = "disable-ckb-rpc")]
-    #[test]
-    fn light_client_only_mode_discards_the_upstream() {
-        let config = LocalLightClientConfig::build(
-            PathBuf::from("data"),
-            "mainnet",
-            "http://should-not-be-retained.invalid".to_string(),
-            deserialize("{}").unwrap(),
-        )
-        .unwrap();
-
-        assert_eq!(config.mode, CkbDataMode::LightClientOnly);
+        assert_eq!(config.upstream_rpc_url, "http://127.0.0.1:8114");
     }
 }

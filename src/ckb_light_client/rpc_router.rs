@@ -26,7 +26,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 use tracing::{debug, warn};
 
-use super::{config::REMOTE_DATA_TIMEOUT, CkbDataMode};
+use super::config::REMOTE_DATA_TIMEOUT;
 
 const NOT_READY_ERROR: i64 = -32010;
 const UNSUPPORTED_ERROR: i64 = -32011;
@@ -58,7 +58,7 @@ enum Route {
 
 #[derive(Clone)]
 pub(crate) struct RpcRouter {
-    mode: CkbDataMode,
+    upstream_rpc_url: String,
     storage: Arc<Storage>,
     chain_service: LightClientChainService,
     consensus: Arc<Consensus>,
@@ -69,7 +69,7 @@ pub(crate) struct RpcRouter {
 
 impl RpcRouter {
     pub(crate) fn new(
-        mode: CkbDataMode,
+        upstream_rpc_url: String,
         storage: Storage,
         chain_data: StorageWithChainData,
         consensus: Arc<Consensus>,
@@ -84,7 +84,7 @@ impl RpcRouter {
             LightClientChainService::new(chain_data.clone(), Arc::clone(&consensus));
 
         Ok(Self {
-            mode,
+            upstream_rpc_url,
             storage: Arc::new(storage),
             chain_service,
             consensus,
@@ -120,12 +120,12 @@ impl RpcRouter {
 
     pub(crate) fn handle(&self, method: &'static str, params: Params) -> Result<Value> {
         let started = Instant::now();
-        let route = route_method(method, self.mode.upstream_rpc_url().is_some());
+        let route = route_method(method);
         let result = match route {
             Route::Local => self.handle_local(method, params),
             Route::Upstream => self.forward_upstream(method, params),
             Route::Unsupported => Err(unsupported(format!(
-                "{method} is not available without a full CKB node RPC"
+                "{method} is not supported by the embedded CKB RPC gateway"
             ))),
         };
         debug!(
@@ -545,10 +545,6 @@ impl RpcRouter {
     }
 
     fn forward_upstream(&self, method: &str, params: Params) -> Result<Value> {
-        let upstream_rpc_url = self
-            .mode
-            .upstream_rpc_url()
-            .ok_or_else(|| unsupported(format!("{method} requires a full CKB node RPC")))?;
         let submitted_transaction = if method == "send_transaction" {
             match &params {
                 Params::Array(values) => values
@@ -568,7 +564,7 @@ impl RpcRouter {
             .runtime_handle
             .block_on(
                 self.upstream_client
-                    .post(upstream_rpc_url)
+                    .post(&self.upstream_rpc_url)
                     .json(&json!({
                         "jsonrpc": "2.0",
                         "id": 1,
@@ -636,15 +632,11 @@ fn search_mode(search_key: &Value) -> SearchMode {
     }
 }
 
-fn route_method(method: &str, has_upstream: bool) -> Route {
+fn route_method(method: &str) -> Route {
     if LOCAL_METHODS.contains(&method) {
         Route::Local
     } else if UPSTREAM_METHODS.contains(&method) {
-        if has_upstream {
-            Route::Upstream
-        } else {
-            Route::Unsupported
-        }
+        Route::Upstream
     } else {
         Route::Unsupported
     }
@@ -929,14 +921,9 @@ mod tests {
 
     #[test]
     fn routing_is_fixed_before_execution() {
-        assert_eq!(route_method("get_cells", true), Route::Local);
-        assert_eq!(route_method("get_cells", false), Route::Local);
-        assert_eq!(route_method("get_epoch_by_number", true), Route::Upstream);
-        assert_eq!(
-            route_method("get_epoch_by_number", false),
-            Route::Unsupported
-        );
-        assert_eq!(route_method("send_transaction", true), Route::Upstream);
-        assert_eq!(route_method("set_scripts", true), Route::Unsupported);
+        assert_eq!(route_method("get_cells"), Route::Local);
+        assert_eq!(route_method("get_epoch_by_number"), Route::Upstream);
+        assert_eq!(route_method("send_transaction"), Route::Upstream);
+        assert_eq!(route_method("set_scripts"), Route::Unsupported);
     }
 }
