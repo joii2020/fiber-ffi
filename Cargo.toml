@@ -8,7 +8,7 @@ crate-type = ["cdylib"]
 
 [features]
 default = ["rocksdb", "watchtower"]
-ckb-light-client = [
+disbale-ckb-rpc = [
     "dep:ckb-app-config",
     "dep:ckb-async-runtime",
     "dep:ckb-hash",
@@ -19,7 +19,6 @@ ckb-light-client = [
     "dep:ckb-types",
     "dep:jsonrpc-core",
     "dep:jsonrpc-http-server",
-    "dep:reqwest",
     "dep:secp256k1",
     "ckb-light-client-lib/rocksdb",
 ]
@@ -27,7 +26,7 @@ ckb-light-client = [
 # unifies it explicitly for binaries that must run on a different CPU than the
 # build host, including the E2E harness and CI artifacts.
 ckb-light-client-portable = [
-    "ckb-light-client",
+    "disbale-ckb-rpc",
     "fnn/portable",
     "dep:ckb-rocksdb",
 ]
@@ -55,7 +54,6 @@ clap-serde-derive = "0.2.1"
 jsonrpc-core = { version = "18", optional = true }
 jsonrpc-http-server = { version = "18", optional = true }
 openssl = { version = "0.10", features = ["vendored"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"], optional = true }
 secp256k1 = { version = "0.30", features = ["global-context"], optional = true }
 ractor = { version = "0.15", features = ["async-trait"] }
 serde = { version = "1", features = ["derive"] }

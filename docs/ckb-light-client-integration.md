@@ -1,6 +1,6 @@
 # Fiber FFI 内置 CKB Light Client 方案
 
-> 状态：设计草案
+> 状态：实现中
 >
 > 目标仓库：`fiber-ffi`
 >
@@ -8,26 +8,24 @@
 
 ## 1. 方案概述
 
-先说结论：**CKB Light Client 自带的 RPC 不能原样覆盖 Fiber 现在使用的全部 CKB RPC。**大部分请求可以由 Light Client 和本地转换服务完成，但在“不修改 Fiber”的前提下，下列请求需要特别处理：
+先说结论：**CKB Light Client 自带的 RPC 不能原样覆盖 Fiber 现在使用的全部 CKB RPC，但 Fiber 当前使用的请求可以由 Light Client 和本地转换服务完成。**在“不修改 Fiber”的前提下，下列请求需要特别处理：
 
-- `get_epoch_by_number`：Fiber 使用的 CKB SDK 会在计算 cellbase 成熟高度时间接调用。Light Client 不一定保存目标 epoch 的区块头，第一版无法稳定返回与全节点完全一致的结果。
-- `get_live_cell`：Light Client 只能在相关完整脚本已经从 Cell 产生高度扫描到链头时，确定 Cell 是否已花费。对方临时加入的旧 Cell 可能无法在 Fiber 的 10 秒 RPC 超时内完成扫描。
-- `send_transaction`：Light Client 返回成功只表示本地验证通过并放入待广播队列，不表示某个完整节点已经接收进交易池。
+- `get_epoch_by_number`：Fiber 使用的 CKB SDK 会在计算 cellbase 成熟高度时间接调用。目标 epoch 有本地已证明区块头时返回精确 epoch；否则只为 SDK 当前查询的成熟 epoch 返回一个保守的、本地可证明的成熟高度。
+- `get_live_cell`：先取得并验证产生 Cell 的交易，再把其完整 lock/type script 从 Cell 产生高度扫描到链头，最后以 Light Client 的 UTXO 索引判断 live/dead。旧脚本在 8 秒内扫描不完时返回 `not-ready`，不能猜测或回退。
+- `send_transaction`：由 Light Client 在本地准备依赖、确认输入仍为 live、完成交易验证并放入待广播队列。返回成功不表示某个完整节点已经接收进交易池，也不表示交易已上链。
 
-第一版只保留一种内置 Light Client 行为：大部分请求由 Light Client 处理；`get_epoch_by_number`、`get_live_cell` 和 `send_transaction` 按固定规则发给完整 CKB 节点。
-
-这个方案只能减少完整节点 RPC 的使用，不能去掉对完整节点的信任。转发请求的结果没有经过 Light Client 验证，这一点必须在使用说明中明确写出。
+开启内置 Light Client 后，所有 Fiber CKB RPC 都在本地处理，不再保留完整节点 HTTP RPC 地址或错误回退。无法由本地已验证数据可靠回答的请求返回明确的 `not-ready` 或 `unsupported` 错误。
 
 在 `fiber-ffi` 中增加 Cargo 功能开关，用它决定从哪里读取 CKB 链上数据：
 
 - 未开启 Light Client 功能：保持现有行为。Fiber 通过 `CkbConfig.rpc_url` 访问外部 CKB 全节点 RPC。
-- 开启 `ckb-light-client`：启动内置 Light Client 和本地 RPC 转换服务。
+- 开启 `disbale-ckb-rpc`：启动内置 Light Client 和本地 RPC 转换服务。
 
-开启 `ckb-light-client` 时，`fiber-ffi` 将：
+开启 `disbale-ckb-rpc` 时，`fiber-ffi` 将：
 
 1. 在当前进程中启动 `ckb-light-client-lib`。
 2. 在 `127.0.0.1` 的随机端口启动一个本地 CKB JSON-RPC 转换服务。
-3. 转换服务优先调用 Light Client 的内部服务和本地存储接口。只有明确列入允许表的请求可以发给完整节点。
+3. 转换服务只调用 Light Client 的内部服务和本地存储接口，不发送完整节点 HTTP RPC 请求。
 4. 在内存中把 `CkbConfig.rpc_url` 改为本地转换服务的地址。
 5. 按现有流程启动 Fiber，Fiber 本身无需修改。
 
@@ -38,7 +36,7 @@ flowchart LR
     L -->|"CKB P2P 网络"| P["CKB 节点"]
 ```
 
-这个转换服务不会伪造数据。它只把 Light Client 已经验证过的链上数据，或者完整节点返回的允许数据，转换成 Fiber 现在使用的 CKB 全节点 RPC 格式。不允许为了让 CKB SDK 继续运行而伪造 `Consensus`、epoch 或脚本扫描进度。
+这个转换服务不会把未验证数据伪装成链上事实。它只把 Light Client 已经验证过的链上数据转换成 Fiber 现在使用的 CKB 全节点 RPC 格式。`get_epoch_by_number` 的保守结果只用于 CKB SDK 的成熟高度计算，并且不会让未被本地证明为成熟的 Cell 进入候选集；不得伪造 `Consensus` 或脚本扫描进度。
 
 内置 Light Client 的核心目的只有一个：为当前进程中的 Fiber 提供必需的 CKB 链上数据、交易验证和交易广播。它不是一个通用的 CKB Light Client，也不向其他程序提供服务。
 
@@ -58,14 +56,14 @@ flowchart LR
 
 - 不修改 Fiber 源码，实现 Fiber 目前会用到的 CKB RPC 方法。
 - 保持现有 `fiber-ffi` C API 不变。用 Cargo 功能开关选择数据来源。普通的主网和测试网运行不要求用户填写 Light Client 配置。
-- 不传 `ckb-light-client` 时，编译结果和现有的外部 RPC 行为保持不变。
-- Light Client 遇到无法处理的请求时，不得因为失败而临时改用外部 RPC。只有预先写明的方法可以转发。
+- 不传 `disbale-ckb-rpc` 时，编译结果和现有的外部 RPC 行为保持不变。
+- Light Client 遇到无法处理的请求时，不得因为失败而临时改用外部 RPC。
 - 只启动 Fiber 所需的 Light Client 服务。所有无关功能默认关闭，而且不提供运行时开关重新开启。
 
 ### 2.2 不启用的功能
 
 - 不实现全部 CKB 全节点 RPC，只实现 Fiber 用到的方法。
-- 不做“Light Client 查不到就转发”的错误回退。转发规则必须是固定的，并且可以通过测试逐项核对。
+- 不做“Light Client 查不到就转发”的错误回退。开启该功能时不访问完整节点 HTTP RPC。
 - 不把本地 RPC 转换服务的地址和端口作为对外接口。该服务只供当前进程中的 Fiber 使用。
 - 不在第一版支持同一进程中多个 Light Client 实例。
 - 不启动 `light-client-bin`，不提供 Light Client 命令行入口，也不启动它自带的公开 RPC 服务。
@@ -90,7 +88,7 @@ Cargo 功能开关在编译时决定是否包含 Light Client。已经编译好�
 ```toml
 [features]
 default = ["rocksdb", "watchtower"]
-ckb-light-client = [
+disbale-ckb-rpc = [
     "dep:ckb-light-client-lib",
     "dep:ckb-async-runtime",
     "dep:ckb-network",
@@ -108,10 +106,10 @@ jsonrpc-core = { version = "...", optional = true }
 jsonrpc-http-server = { version = "...", optional = true }
 ```
 
-`ckb-light-client` 不加入 `default`。编译方式如下：
+`disbale-ckb-rpc` 不加入 `default`。编译方式如下：
 
 - 不传功能开关：保持现有的外部 CKB 全节点 RPC 模式。
-- `--features ckb-light-client`：编译 Light Client 依赖并启动内置 Light Client。
+- `--features disbale-ckb-rpc`：编译 Light Client 依赖并启动内置 Light Client。
 
 `ckb-light-client-lib` 应固定到已发布的版本或某个确定的 Git 提交，正式编译时不要指向会继续变化的分支。本地开发时可以临时使用 `path` 依赖。
 
@@ -148,7 +146,7 @@ ckb_light_client:
 配置规则：
 
 - 未开启 Light Client 功能：继续使用 `ckb.rpc_url`，不启动 Light Client，也不读取 `ckb_light_client` 配置。
-- 开启 `ckb-light-client`：先保留 YAML 中的 `ckb.rpc_url` 作为完整节点地址，再在内存中把传给 Fiber 的 `rpc_url` 改为本地转换服务地址。完整节点地址只能由固定允许表中的请求使用。
+- 开启 `disbale-ckb-rpc`：YAML 中的 `ckb.rpc_url` 只为兼容 Fiber 现有配置格式而解析；不会保存为上游地址。在内存中把传给 Fiber 的 `rpc_url` 改为本地转换服务地址。
 - YAML 不允许覆盖本机 RPC 地址、P2P 监听地址、连接数量和服务列表。这样可以防止内置 Light Client 被配置成对外服务。
 
 ## 4. `fiber-ffi` 内部模块
@@ -160,17 +158,13 @@ src/
     config.rs           # 生成 LocalLightClientConfig 并检查可选配置
     runtime.rs          # 组装 Fiber 所需的最小 Light Client 运行环境
     rpc_server.rs       # 只允许本机访问的 JSON-RPC 服务
-    rpc_router.rs       # 按方法决定本地处理或转发
-    rpc_compat.rs       # 转换 RPC 的方法、参数和返回值
-    script_registry.rs  # 注册脚本并记录同步状态
-    readiness.rs        # 检查区块头和过滤数据是否同步完成
+    rpc_router.rs       # 本地实现 RPC、转换参数和返回值、注册动态脚本
 ```
 
-内部只提供一个 `LocalCkbNodeHandle`，用来启动、访问和停止本地 Light Client。完整节点地址保存在 FFI 内部，不交给 Fiber：
+内部只提供一个 `LocalCkbNodeHandle`，用来启动、访问和停止本地 Light Client。配置中不保存完整节点 HTTP RPC 地址：
 
 ```rust
 struct LocalLightClientConfig {
-    upstream_rpc_url: String,
     // Light Client 链、数据目录和网络配置
 }
 
@@ -288,7 +282,7 @@ struct ParsedFfiConfig {
 `RunningNode` 增加：
 
 ```rust
-#[cfg(feature = "ckb-light-client")]
+#[cfg(feature = "disbale-ckb-rpc")]
 local_ckb: Option<LocalCkbNodeHandle>,
 ```
 
@@ -312,14 +306,14 @@ RPC 方法列表以 Fiber 源码和端到端测试为准。Light Client 已经�
 | `get_tip_block_number` | 读取最新区块头的 `number` | 本地处理 |
 | `get_indexer_tip` | 返回所有当前必需脚本中最慢的已处理高度，以及该高度的区块哈希 | 必须本地处理，不能使用完整节点 indexer 的进度 |
 | `get_consensus` | 把启动 Light Client 时使用的 `Consensus` 转成 CKB JSON | 本地处理，不得改动共识参数 |
-| `get_epoch_by_number` | Light Client 无法保证回答 `DefaultCellCollector` 请求的任意旧 epoch | 固定发给完整节点 |
+| `get_epoch_by_number` | 有目标 epoch 的已证明区块头时返回精确结果；否则只为 `DefaultCellCollector` 的成熟 epoch 查询返回本地可证明的保守成熟边界 | 本地处理，不回退；无法证明的其他历史 epoch 返回 `not-ready` |
 | `get_block_by_number` | Fiber 目前只会查询第 `0` 块，因此返回 Light Client 的创世块 | 本地处理；其他高度返回 `unsupported` |
 | `get_header` | 先在本地查询，查不到时通过 Light Client P2P 调用 `fetch_header` | 本地处理，支持 JSON 和编码后的二进制格式 |
 | `get_header_by_number` | 先调用 `storage.get_block_hash(number)` 获取哈希，再查询区块头 | 本地无数据时返回 `not-ready`，不回退 |
 | `get_block_median_time` | 读取目标区块头及其父链，再使用 CKB 共识算法计算 | watchtower 只查询链头，使用 Light Client 已证明的最近区块头本地处理 |
 | `get_transaction` | 先在本地查询，查不到时通过 Light Client P2P 调用 `fetch_transaction` | 本地处理，支持 `verbosity` 和 `only_committed` 参数 |
-| `get_live_cell` | 第一版不在本地实现 | 固定发给完整节点 |
-| `send_transaction` | 第一版不在本地实现 | 固定发给完整节点，保持 Fiber 当前依赖的返回含义 |
+| `get_live_cell` | 通过 Light Client P2P 获取产生交易，动态注册完整 lock/type script，从 Cell 创建高度扫描到 tip，再查询 UTXO 索引 | 本地处理，不回退；扫描超时返回 `not-ready` |
+| `send_transaction` | 获取并验证输入、Cell Dep、Dep Group 和 Header Dep；用 UTXO filter 索引确认已提交输入仍为 live；调用 `LightClientChainService::send_transaction` 做本地验证和入队 | 本地处理，不回退；成功表示本地待广播池已接受 |
 
 当前 Fiber 生产代码没有调用 `get_cells_capacity`、`estimate_cycles` 和 `get_genesis_block`，因此第一版不对 Fiber 公开这三个 RPC。`get_genesis_block` 只在转换服务内部用来实现 `get_block_by_number(0)`。如果 Fiber 以后开始调用，必须先补充调用位置和对比测试，再对本地服务开放。
 
@@ -349,9 +343,31 @@ Light Client 的 `TransactionWithStatus` 只有 `status` 和 `block_hash`，但 
 
 ### 6.3 `get_live_cell`
 
-`get_live_cell` 是第一版最容易出错的方法。Light Client 在过滤区块时会维护 UTXO 索引，用来记录 Cell 是否已花费。但是，它的通用 `CellProvider::cell` 只要找到产生 Cell 的交易，就会暂时把该 Cell 当成未花费。因此，第一版把该方法固定发给完整节点，不能因为本地恰好找到交易就改成本地返回。
+`get_live_cell` 不能直接使用 Light Client 的通用 `CellProvider::cell`。该接口只要找到产生 Cell 的交易，就可能暂时把历史输出当成未花费；可靠的 live/dead 结论必须来自覆盖 Cell 创建区块至当前 tip 的 UTXO filter 索引。
 
-### 6.4 CKB SDK 间接调用的 RPC
+本地实现固定执行以下流程，并让交易获取与脚本扫描共享同一个 8 秒截止时间：
+
+1. 通过 Light Client P2P 获取并验证产生 Cell 的已提交交易。交易不存在、未提交或输出索引越界时返回 CKB RPC 兼容的 `unknown`。
+2. 选择输出的完整 lock script；如果 lock 未注册而 type script 已注册，则复用 type script。索引覆盖不到创建高度时，将脚本进度回退到创建高度前一块。
+3. 等待该脚本扫描到当前 Light Client tip。超时返回 `-32010 light client data not ready`，不能把未扫描当成 `dead`。
+4. 扫描完整区块后重新读取产生交易的真实 `tx_index`。通过交易证明初次保存的 `u32::MAX` 只是占位值，不能用于组成 UTXO 索引键。
+5. UTXO 索引包含目标 OutPoint 时返回 `live`；完整扫描后不包含时才返回 `dead`。`with_data` 决定是否附带 Cell data；Fiber 未使用的 `include_tx_pool=true` 明确返回 `unsupported`。
+
+### 6.4 `send_transaction`
+
+`send_transaction` 不等待完整节点 RPC，也不等待 CKB P2P 对端返回接收结果。CKB 的 relay 协议没有交易池 accept/reject ACK；等待固定时间不会把本地成功升级成远端交易池成功。
+
+本地成功边界固定为：
+
+1. 通过 Light Client P2P 获取交易引用的 input、Cell Dep、Dep Group 成员和 Header Dep；同一请求的准备阶段共享 8 秒截止时间。
+2. 对已提交 Cell 选择已经注册的 lock/type script（优先复用现有索引），从 Cell 创建高度扫描到当前 tip，并检查 UTXO 索引。数据尚未同步完成返回 `-32010`，确认输入已花费或引用无效返回 `-301`。
+3. 检查本地待广播交易之间的输入冲突。重复发送同一笔交易是幂等的，会重新加入广播队列；不同交易消费同一输入会被拒绝。
+4. 调用 Light Client 的交易验证，包含非上下文检查、since、容量、最低费率、DAO 约束和 Script VM 执行。
+5. 成功加入 `PendingTxs` 后立即返回交易哈希，并由 `RelayProtocol` 异步广播。
+
+Fiber 和 watchtower 继续通过 `get_transaction` 监听 pending/committed 状态并按现有逻辑重试。这里的成功不能解释为远端节点已接收、进入 proposal 或已经确认。Light Client 的内存待广播池最多保存 64 笔交易；交易被淘汰且尚未提交后，本地输入预留会在后续提交时清理。
+
+### 6.5 CKB SDK 间接调用的 RPC
 
 Fiber 的源码里不一定能直接搜到所有 RPC 方法名。资金交易使用的 `ckb_sdk::DefaultCellCollector` 还会间接调用：
 
@@ -364,7 +380,14 @@ Fiber 的源码里不一定能直接搜到所有 RPC 方法名。资金交易使
 
 RPC 清单和测试必须把这些间接调用一起统计。`get_indexer_tip` 反映的必须是 Light Client 脚本扫描进度，不能转发到完整节点，否则 CKB SDK 会在 Light Client 还没扫描完成时误以为索引已经准备好。
 
-`DefaultCellCollector::collect_live_cells_async` 每次执行时都会先调用成熟高度计算，随后才读取可用 Cell。在已经运行较长时间的链上，这个计算会调用 `get_epoch_by_number`。因此，只要 Fiber 仍使用 `DefaultCellCollector`，该方法就必须按固定规则发给完整节点。
+`DefaultCellCollector::collect_live_cells_async` 每次执行时都会先调用成熟高度计算，随后才读取可用 Cell。在已经运行较长时间的链上，这个计算会调用 `get_epoch_by_number(floor(tip_epoch - cellbase_maturity))`。
+
+Light Client 不保存任意历史 epoch 的完整目录，因此本地实现分两种情况：
+
+- 本地任一已证明区块头属于目标 epoch：由区块头中的 epoch fraction 精确推导 `start_number` 和 `length`。
+- 目标正好是 SDK 当前计算的成熟 epoch，但本地没有该 epoch 的区块头：在全部本地已证明区块头中选择 epoch fraction 不大于成熟点、且高度最大的区块，返回 `start_number = 该高度, length = 1` 的成熟度兼容视图。CKB SDK 据此算出的最大成熟高度就是该区块。
+
+第二种结果不是通用历史 epoch 查询接口，而是 Fiber 当前 cell collector 的保守兼容层。Light Client 索引返回的候选 Cell 都有本地产生区块头，所以它不会把未证明为成熟的 cellbase Cell 当成成熟；暂未扫描到的成熟 Cell 会留到后续资金选择重试。未来 epoch 返回 `null`，其他没有本地证明的历史 epoch 返回 `not-ready`。
 
 ## 7. 脚本注册和同步状态
 
@@ -430,7 +453,7 @@ Fiber 启动前必须满足：
 - 默认拒绝 JSON-RPC 批量请求。限制 `limit` 的最大值，并检查分页 `cursor`。
 - CKB P2P 网络不监听端口、不公布地址，也不接受入站连接。
 - 用不同错误明确表示“不存在”（`not_found`）、“未同步完成”（`not_ready`）、“不支持”（`unsupported`）、“验证失败”（`verification_failed`）和“内部错误”（`internal`）。
-- 只允许第 6 节表中明确标出的请求访问完整节点。路由在执行请求前决定，不能因为本地处理报错、超时或没有数据而临时转发。
+- 开启内置 Light Client 后不访问完整节点 HTTP RPC。路由在执行请求前决定，不能因为本地处理报错、超时或没有数据而临时转发。
 
 ## 9. 数据存储和依赖问题
 
@@ -474,10 +497,13 @@ Fiber 启动前必须满足：
 - 计算 `get_tip_block_number`、`get_header_by_number` 和区块中位时间。
 - `get_consensus` 返回启动 Light Client 时实际使用的共识参数。
 - `get_indexer_tip` 返回脚本扫描进度，而不是完整节点 indexer 的高度。
-- `get_epoch_by_number`、`get_live_cell` 和 `send_transaction` 按固定规则处理；其他请求即使本地失败也不转发。
+- `get_epoch_by_number`、`get_live_cell` 和 `send_transaction` 固定由 Light Client 本地处理；任何请求即使本地失败也不转发。
+- `get_epoch_by_number` 验证精确 epoch、成熟 epoch 的保守边界、未来 epoch 和本地未证明历史 epoch 四种结果。
+- `get_live_cell` 验证 live、dead、unknown、脚本扫描超时、创建交易占位 `tx_index` 被完整区块真实索引替换，以及 `with_data` 两种返回格式。
+- `send_transaction` 验证重复提交的幂等行为、并发输入冲突、已花费输入、缺失依赖、未完成脚本扫描和验证失败错误码。
 - 不重复注册相同脚本，并正确处理起始区块高度和同步状态。包含第 `N` 块时，验证注册高度为 `N - 1`。
 - `Exact` 查询可以动态注册完整脚本；`Prefix` 查询不能直接注册为 Light Client 脚本。
-- 收到对方加入的旧输入时，固定转发 `get_live_cell`。
+- 收到对方加入的旧输入时，从创建高度扫描其完整脚本；未扫描完成必须返回 `not-ready`，不能误报 `dead`。
 - 主网和测试网不填写 `ckb_light_client` 配置也能生成完整的内部配置。
 - YAML 不能修改本机 RPC 地址、P2P 监听地址、连接数量和服务列表。
 - 本地 RPC 对未列出方法、CORS、WebSocket、订阅和批量请求明确拒绝。
@@ -493,9 +519,9 @@ Fiber 启动前必须满足：
 先启动一条可控的 CKB 开发链，让 Light Client 通过 P2P 网络连接它，并验证：
 
 1. Fiber 启动、Type ID 解析和资金 Cell 查询。
-2. 双方出资时，对方加入的旧输入能够通过固定的 `get_live_cell` 路由完成检查。
-3. `get_epoch_by_number` 只由完整节点处理，`get_indexer_tip` 只由 Light Client 处理。
-4. 除固定方法外，即使本地服务返回错误，也没有其他完整节点 HTTP RPC 请求。
+2. 双方出资时，对方加入的旧输入能够通过本地 `get_live_cell` 完成脚本扫描和 UTXO 检查，并覆盖 live 与已花费两种情况。
+3. `get_epoch_by_number` 的返回使 CKB SDK 得到正确或保守的最大成熟高度，`get_indexer_tip` 和 `send_transaction` 也只由 Light Client 处理。
+4. 即使本地服务返回错误，也没有任何完整节点 HTTP RPC 请求；端到端配置可把原 `ckb.rpc_url` 指向不可访问地址验证这一点。
 5. 交易发送、跟踪、确认、重组、通道开启、通道关闭和 watchtower 流程。
 6. Light Client 不监听 CKB P2P 端口，只建立主动连接。
 7. 本地 RPC 不能调用第 6 节以外的方法。
@@ -504,8 +530,8 @@ Fiber 启动前必须满足：
 
 ### 阶段 0：验证能否编译
 
-- 增加 Light Client 的可选依赖和 `ckb-light-client` 功能开关，但暂时不改启动流程。
-- 确认不传功能开关时仍使用现有的外部 CKB RPC，并确认开启 `ckb-light-client` 时能够编译。
+- 增加 Light Client 的可选依赖和 `disbale-ckb-rpc` 功能开关，但暂时不改启动流程。
+- 确认不传功能开关时仍使用现有的外部 CKB RPC，并确认开启 `disbale-ckb-rpc` 时能够编译。
 - 验证 Linux/macOS 编译。
 - 分别验证 Android 和 iOS 中的 RocksDB 编译，并记录安装包增加的大小。
 - 确认 `ckb-*` 依赖能否与 Fiber 使用相同版本。
@@ -517,7 +543,7 @@ Fiber 启动前必须满足：
 - 实现只允许本机访问的 RPC 服务、运行状态检查和 `LocalCkbNodeHandle`。
 - 确认没有启动 `light-client-bin`、Light Client 自带 RPC、独立 metrics 和管理服务。
 - 实现可以直接转换的 RPC：`get_tip_header`、`get_tip_block_number`、`get_consensus`、`get_indexer_tip`、`get_cells` 和 `get_transactions`。
-- 实现固定路由：`get_epoch_by_number` 发给完整节点，其他方法不得因为本地错误而回退。
+- 实现固定本地路由；任何方法都不得因为本地错误而回退到完整节点 HTTP RPC。
 
 ### 阶段 2：让 Fiber 使用本地转换服务启动
 
@@ -530,7 +556,7 @@ Fiber 启动前必须满足：
 ### 阶段 3：资金交易和链上跟踪
 
 - 完成 `get_live_cell`、`send_transaction`，以及区块头和交易的 Light Client P2P 请求流程。
-- `get_live_cell` 和 `send_transaction` 第一版按第 6 节的固定路由处理。
+- `get_live_cell` 按第 6.3 节扫描脚本并查询 UTXO 索引；`send_transaction` 按第 6.4 节在 Light Client 本地验证、入队和广播。
 - 完成运行时脚本注册，并正确处理脚本尚未扫描到最新区块的情况。
 - 测试构建、发送和确认资金交易。
 
@@ -562,24 +588,24 @@ Fiber 启动前必须满足：
 - 没有启动 Light Client 命令行、公开 RPC、独立 metrics、管理接口和其他无关后台任务。
 - 调用 `fiber_stop` 后，本地 RPC 和 P2P 网络能按第 5.2 节说明的限制关闭。
 
-- 只有 `get_epoch_by_number`、`get_live_cell` 和 `send_transaction` 可以访问完整节点。
+- 不访问完整节点 HTTP RPC；`get_epoch_by_number`、`get_live_cell`、`send_transaction` 和其他方法只使用 Light Client 已验证存储或 Light Client P2P。
 - `get_indexer_tip` 和其他本地方法永远不转发。
 - 能完成双方出资、通道开启、链上确认、通道关闭和 watchtower 流程。
-- 测试能够记录并核对所有完整节点 RPC 请求，证明没有固定转发表以外的访问。
+- 测试能够记录并核对完整节点 HTTP RPC 请求为零。
 
 ## 14. 主要风险和处理办法
 
 | 问题 | 可能带来的后果 | 第一版的处理办法 |
 |---|---|---|
 | Fiber 使用的 CKB SDK 会间接调用源码中不明显的 RPC | 漏实现 `get_consensus`、`get_epoch_by_number` 或 `get_indexer_tip`，导致资金选择失败 | 以 CKB SDK 源码列出的调用为准建立 RPC 清单；升级 SDK 时重新核对 |
-| Light Client 不保存任意旧 epoch 所需的区块头 | 无法稳定实现 `get_epoch_by_number` | 固定发给完整节点 |
-| 对方在双方出资时临时加入旧 Cell | 相关脚本无法在 Fiber 的 10 秒超时内扫描完成 | 固定转发该 `get_live_cell` |
+| Light Client 不保存任意旧 epoch 所需的区块头 | 无法提供通用、精确的任意历史 `get_epoch_by_number` | 对 Fiber 的成熟 epoch 查询返回本地可证明的保守成熟边界；有已证明区块头时返回精确 epoch；其他历史查询返回 `not-ready` |
+| 对方在双方出资时临时加入旧 Cell | 相关脚本无法在 Fiber 的 10 秒超时内扫描完成 | 动态从创建高度注册脚本；8 秒内未完成返回 `not-ready`，由上层重试，不回退或猜测 |
 | 新脚本扫描旧区块的时间超过 Fiber RPC 的 10 秒限制 | 查询失败，或者把未同步误判为空结果 | 在启动时提前注册已知脚本。未同步完成时返回 `not-ready`，不返回空结果 |
-| `get_live_cell` 不能直接判断 Cell 是否已花费 | 可能使用已经花费的 Cell | 第一版固定发给完整节点 |
+| `get_live_cell` 不能直接用通用 `CellProvider` 判断是否已花费 | 可能使用已经花费的 Cell | 从创建高度扫描到 tip，并只以覆盖完整范围的 UTXO filter 索引判断 live/dead |
 | Fiber 会使用 Prefix 查询，但 Light Client 只接受完整脚本 | 直接注册前缀会漏掉 Cell 或交易 | 从 Fiber 本地数据、funding 交易和关闭交易输出中取得完整脚本，再逐个注册 |
 | 脚本注册高度含义理解错误 | 把产生 Cell 的第 `N` 块跳过去 | 需要处理第 `N` 块时注册 `N - 1`，并用包含第 `N` 块的测试确认 |
-| Light Client 的交易发送成功不等于完整节点交易池已经接收 | Fiber 日志和后续判断可能过早认为交易已被节点接受 | 第一版固定发给完整节点 |
-| 转发的数据没有经过 Light Client 验证 | 仍然需要信任完整节点返回的 epoch 和 Cell 状态 | 在使用说明中明确这一信任范围 |
+| Light Client 的交易发送成功不等于完整节点交易池已经接收 | Fiber 日志和后续判断可能过早认为交易已被节点接受 | 把成功严格定义为“本地验证并入待广播池”，继续由 Fiber/watchtower 查询状态和重试，不伪造远端 ACK |
+| Light Client 的通用 `CellProvider` 会把已保存的历史输出视为 live | 已花费输入仍可能通过脚本验证 | `send_transaction` 在验证前把相关 lock/type script 从创建高度扫描到 tip，并以 UTXO 索引做独立活性检查 |
 | Light Client 使用全局停止信号 | FFI 同时运行多个 Light Client 或重启 Light Client 时可能失败 | 第一版限制每个进程只运行一个 Light Client。后续让 Light Client 支持单个实例的停止信号 |
 | SQLite `links` 版本冲突 | iOS 和 Android 版无法完成链接 | 验证版本中让 Light Client 使用 RocksDB，正式版统一 `rusqlite` 版本 |
 | Light Client RPC 与全节点 RPC 的参数或返回格式不同 | Fiber SDK 无法解析返回数据 | 按 Fiber 实际使用的格式实现本地 RPC，并通过第 11.2 节的对比测试确认结果 |
@@ -595,9 +621,9 @@ Fiber 启动前必须满足：
 - 主网和测试网不需要单独的 Light Client 配置。
 - CKB P2P 只建立主动连接，不监听端口；本地 RPC 只提供 Fiber 必需的方法。
 - 每个进程只运行一个 Light Client，停止后不保证能够在同一进程内重启。
-- Light Client 处理本地能够可靠回答的 RPC；`get_epoch_by_number`、未完成脚本扫描的 `get_live_cell` 和第一版的 `send_transaction` 按固定规则发给完整节点。
+- Light Client 处理全部 Fiber 所需 RPC；`get_epoch_by_number` 使用成熟度兼容结果，`get_live_cell` 使用完整范围 UTXO 索引，`send_transaction` 在本地验证并广播。
 - 支持 Fiber 启动、Type ID 解析、双方出资、资金交易的构建、发送和跟踪，以及 watchtower 的主要流程。
-- 测试记录全部完整节点 RPC 请求，确认不存在错误回退和固定转发表以外的调用。
+- 测试确认不存在任何完整节点 HTTP RPC 请求或错误回退。
 - 移动端 SQLite 支持放到后续版本。
 
 这样可以回答 Light Client 现在能替代多少 RPC，同时保持 Fiber 现有流程兼容。
@@ -613,7 +639,7 @@ Fiber 启动前必须满足：
 | `crates/fiber-lib/src/ckb/client.rs` | `CkbChainClient` 的 RPC 封装，以及交易、区块头的 JSON 和二进制返回格式 |
 | `crates/fiber-lib/src/ckb/config.rs` | CKB RPC 客户端创建方式和 10 秒请求超时 |
 | `crates/fiber-lib/src/ckb/funding/funding_tx.rs` | `DefaultCellCollector` 的使用、创世块和链头查询，以及收到对方输入后逐个调用 `get_live_cell` 的流程 |
-| `crates/fiber-lib/src/ckb/actor.rs` | `send_transaction` 成功后的处理；当前日志把 RPC 成功理解为完整节点已经接收交易 |
+| `crates/fiber-lib/src/ckb/actor.rs` | `send_transaction` 成功后的处理和周期性重试；内置 Light Client 模式下 RPC 成功只代表本地验证并入待广播池 |
 | `crates/fiber-lib/src/ckb/tx_tracing_actor.rs` | 使用 `get_tip_header` 和 `get_transaction` 跟踪交易的流程 |
 | `crates/fiber-lib/src/fiber/network.rs` | 使用 `SearchMode::Prefix` 查询承诺交易相关 Cell 的位置 |
 | `crates/fiber-lib/src/watchtower/actor.rs` | watchtower 使用 `get_tip_header`、`get_block_median_time`、`get_cells`、`get_transactions`、`get_header_by_number`，以及读取交易状态 `block_number` 的位置 |

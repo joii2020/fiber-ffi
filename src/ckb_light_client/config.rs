@@ -55,7 +55,6 @@ pub(crate) enum LocalChain {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct LocalLightClientConfig {
-    pub(crate) upstream_rpc_url: String,
     pub(crate) chain: LocalChain,
     pub(crate) store_path: PathBuf,
     pub(crate) network_path: PathBuf,
@@ -74,7 +73,6 @@ impl LocalLightClientConfig {
     pub(crate) fn build(
         base_dir: PathBuf,
         fiber_chain: &str,
-        upstream_rpc_url: String,
         serialized: SerializedLightClientConfig,
     ) -> Result<Self, String> {
         let history_start_block = serialized
@@ -104,7 +102,6 @@ impl LocalLightClientConfig {
 
         let light_client_dir = base_dir.join("ckb-light-client");
         Ok(Self {
-            upstream_rpc_url,
             chain,
             store_path: light_client_dir.join("store"),
             network_path: light_client_dir.join("network"),
@@ -228,7 +225,6 @@ mod tests {
         let config = LocalLightClientConfig::build(
             PathBuf::from("/tmp/fiber"),
             "mainnet",
-            "http://127.0.0.1:8114".to_string(),
             deserialize("{}").unwrap(),
         )
         .unwrap();
@@ -258,7 +254,6 @@ mod tests {
         let config = LocalLightClientConfig::build(
             PathBuf::from("data"),
             "testnet",
-            "http://127.0.0.1:8114".to_string(),
             deserialize("history_start_block: '0x2a'").unwrap(),
         )
         .unwrap();
@@ -271,7 +266,6 @@ mod tests {
         let error = LocalLightClientConfig::build(
             PathBuf::from("/tmp/fiber"),
             "specs/dev.toml",
-            String::new(),
             deserialize("{}").unwrap(),
         )
         .unwrap_err();
@@ -280,7 +274,6 @@ mod tests {
         let config = LocalLightClientConfig::build(
             PathBuf::from("/tmp/fiber"),
             "specs/dev.toml",
-            String::new(),
             deserialize(&format!("bootnodes: ['{}']", MAINNET_BOOTNODES[0])).unwrap(),
         )
         .unwrap();
@@ -298,7 +291,6 @@ mod tests {
         let error = LocalLightClientConfig::build(
             PathBuf::from("data"),
             "mainnet",
-            String::new(),
             deserialize("bootnodes: ['/ip4/127.0.0.1/tcp/8114']").unwrap(),
         )
         .unwrap_err();
@@ -309,27 +301,9 @@ mod tests {
     fn rejects_invalid_history_start_block() {
         for value in ["42", "0x", "0xnope"] {
             let serialized = deserialize(&format!("history_start_block: '{value}'")).unwrap();
-            let error = LocalLightClientConfig::build(
-                PathBuf::from("data"),
-                "mainnet",
-                String::new(),
-                serialized,
-            )
-            .unwrap_err();
+            let error = LocalLightClientConfig::build(PathBuf::from("data"), "mainnet", serialized)
+                .unwrap_err();
             assert!(error.contains("history_start_block"));
         }
-    }
-
-    #[test]
-    fn keeps_the_fixed_upstream() {
-        let config = LocalLightClientConfig::build(
-            PathBuf::from("data"),
-            "mainnet",
-            "http://127.0.0.1:8114".to_string(),
-            deserialize("{}").unwrap(),
-        )
-        .unwrap();
-
-        assert_eq!(config.upstream_rpc_url, "http://127.0.0.1:8114");
     }
 }

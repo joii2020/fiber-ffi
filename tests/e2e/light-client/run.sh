@@ -164,6 +164,10 @@ source_config="$fixture_dir/tests/nodes/1/config.yml"
 light_client_config="$fixture_dir/tests/nodes/1/config-light-client.yml"
 require_file "$source_config"
 cp "$source_config" "$light_client_config"
+# Prove that the feature never relies on the legacy full-node HTTP endpoint.
+# Fiber still parses this field, but fiber-ffi must replace it in memory before
+# any CKB RPC client is constructed.
+sed -i.bak '/^ckb:$/a\  rpc_url: http://127.0.0.1:1' "$light_client_config"
 {
     printf '\n# Added by fiber-ffi/tests/e2e/light-client/run.sh.\n'
     printf 'ckb_light_client:\n'
@@ -190,6 +194,20 @@ library_dir="$repo_dir/target/debug"
     -Wl,-rpath,"$library_dir" \
     -lfiber_ffi \
     -o "$runner"
+
+# The Light Client proves a state transition after its stored tip. Generate one
+# block after its network has had time to connect; otherwise a fixture whose
+# four peers all stop at exactly the initial tip cannot produce the next proof
+# and script filtering remains at block zero. Do not keep mining, because the
+# startup readiness check intentionally waits for scripts to catch a stable tip.
+(
+    sleep 15
+    curl --fail --silent --show-error \
+        --header "Content-Type: application/json" \
+        --data '{"id":1,"jsonrpc":"2.0","method":"generate_block","params":[]}' \
+        "$ckb_rpc_url" >/dev/null
+) &
+ckb_pids+=("$!")
 
 echo "Starting fiber-ffi through its C ABI ..."
 ffi_log="$work_dir/fiber-ffi.log"

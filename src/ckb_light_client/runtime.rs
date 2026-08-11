@@ -166,7 +166,6 @@ impl LocalCkbNodeHandle {
             Arc::clone(&pending_txs),
         );
         let router = RpcRouter::new(
-            config.upstream_rpc_url.clone(),
             storage,
             chain_data,
             Arc::clone(&consensus),

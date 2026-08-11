@@ -1,27 +1,33 @@
 use std::{
-    sync::Arc,
+    collections::{HashMap, HashSet},
+    sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant},
 };
 
 use ckb_chain_spec::consensus::Consensus;
 use ckb_jsonrpc_types::{
-    BlockNumber, HeaderView, JsonBytes, Script, Transaction, TransactionView, Uint32, Uint64,
+    BlockNumber, CellData, CellInfo, CellWithStatus, EpochNumber, EpochView, HeaderView, JsonBytes,
+    OutPoint as JsonOutPoint, Script, Transaction, TransactionView, Uint32, Uint64,
 };
 use ckb_light_client_lib::{
     service::{
         CellType, FetchStatus, LightClientChainService, LightClientService, Pagination,
         ScriptStatus, ScriptType, SearchKey, SetScriptsCommand, Status, TransactionWithStatus, Tx,
     },
-    storage::{LightClientStorage, Storage, StorageWithChainData},
+    storage::{
+        IteratorDirection, IteratorStart, Key, KeyPrefix, LightClientStorage, Storage,
+        StorageBackend, StorageWithChainData,
+    },
 };
 use ckb_types::{
+    bytes::Bytes,
+    core::{DepType, EpochNumberWithFraction, TransactionView as CoreTransactionView},
     packed,
-    prelude::{Entity, Unpack},
+    prelude::{Entity, IntoTransactionView, Pack, Unpack},
     H256,
 };
 use jsonrpc_core::{Error, ErrorCode, Params, Result};
-use reqwest::Client;
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 use tracing::{debug, warn};
@@ -30,7 +36,9 @@ use super::config::REMOTE_DATA_TIMEOUT;
 
 const NOT_READY_ERROR: i64 = -32010;
 const UNSUPPORTED_ERROR: i64 = -32011;
-const UPSTREAM_ERROR: i64 = -32012;
+const TRANSACTION_FAILED_TO_RESOLVE: i64 = -301;
+const TRANSACTION_FAILED_TO_VERIFY: i64 = -302;
+const POOL_REJECTED_TRANSACTION_BY_MIN_FEE_RATE: i64 = -1104;
 const MAX_QUERY_LIMIT: u32 = 1_000;
 
 const LOCAL_METHODS: &[&str] = &[
@@ -40,62 +48,98 @@ const LOCAL_METHODS: &[&str] = &[
     "get_tip_block_number",
     "get_indexer_tip",
     "get_consensus",
+    "get_epoch_by_number",
     "get_block_by_number",
     "get_header",
     "get_header_by_number",
     "get_block_median_time",
     "get_transaction",
+    "get_live_cell",
+    "send_transaction",
 ];
-
-const UPSTREAM_METHODS: &[&str] = &["get_epoch_by_number", "get_live_cell", "send_transaction"];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Route {
     Local,
-    Upstream,
     Unsupported,
 }
 
 #[derive(Clone)]
 pub(crate) struct RpcRouter {
-    upstream_rpc_url: String,
     storage: Arc<Storage>,
     chain_service: LightClientChainService,
     consensus: Arc<Consensus>,
     history_start_block: u64,
-    upstream_client: Client,
-    runtime_handle: tokio::runtime::Handle,
+    pending_inputs: Arc<Mutex<PendingInputReservations>>,
+    indexed_script_starts: Arc<Mutex<HashMap<(packed::Script, IndexedScriptType), u64>>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum IndexedScriptType {
+    Lock,
+    Type,
+}
+
+impl IndexedScriptType {
+    fn service_type(self) -> ScriptType {
+        match self {
+            Self::Lock => ScriptType::Lock,
+            Self::Type => ScriptType::Type,
+        }
+    }
+}
+
+#[derive(Default)]
+struct PendingInputReservations {
+    owners: HashMap<packed::OutPoint, packed::Byte32>,
+}
+
+impl PendingInputReservations {
+    fn retain(&mut self, mut keep: impl FnMut(&packed::Byte32) -> bool) {
+        self.owners.retain(|_, owner| keep(owner));
+    }
+
+    fn conflicting_owner(
+        &self,
+        inputs: &[packed::OutPoint],
+        tx_hash: &packed::Byte32,
+    ) -> Option<(packed::OutPoint, packed::Byte32)> {
+        inputs.iter().find_map(|input| {
+            self.owners
+                .get(input)
+                .and_then(|owner| (owner != tx_hash).then(|| (input.clone(), owner.clone())))
+        })
+    }
+
+    fn reserve(&mut self, inputs: &[packed::OutPoint], tx_hash: &packed::Byte32) {
+        for input in inputs {
+            self.owners.insert(input.clone(), tx_hash.clone());
+        }
+    }
 }
 
 impl RpcRouter {
     pub(crate) fn new(
-        upstream_rpc_url: String,
         storage: Storage,
         chain_data: StorageWithChainData,
         consensus: Arc<Consensus>,
         history_start_block: u64,
     ) -> std::result::Result<Self, String> {
-        let upstream_client = Client::builder()
-            .timeout(REMOTE_DATA_TIMEOUT)
-            .no_proxy()
-            .build()
-            .map_err(|err| format!("failed to create CKB RPC upstream client: {err}"))?;
         let chain_service =
             LightClientChainService::new(chain_data.clone(), Arc::clone(&consensus));
 
         Ok(Self {
-            upstream_rpc_url,
             storage: Arc::new(storage),
             chain_service,
             consensus,
             history_start_block,
-            upstream_client,
-            runtime_handle: tokio::runtime::Handle::current(),
+            pending_inputs: Arc::new(Mutex::new(PendingInputReservations::default())),
+            indexed_script_starts: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
     pub(crate) fn methods() -> impl Iterator<Item = &'static str> {
-        LOCAL_METHODS.iter().chain(UPSTREAM_METHODS.iter()).copied()
+        LOCAL_METHODS.iter().copied()
     }
 
     pub(crate) fn tip_header(&self) -> HeaderView {
@@ -112,6 +156,27 @@ impl RpcRouter {
     ) -> std::result::Result<(), String> {
         let scripts = scripts.into_iter().collect::<Vec<_>>();
         if !scripts.is_empty() {
+            let mut starts = self
+                .indexed_script_starts
+                .lock()
+                .map_err(|_| "indexed script coverage lock is poisoned".to_string())?;
+            for status in &scripts {
+                let script_type = match status.script_type {
+                    ScriptType::Lock => IndexedScriptType::Lock,
+                    ScriptType::Type => IndexedScriptType::Type,
+                };
+                let status_block = status.block_number.value();
+                let first_indexed_block = if status_block == 0 {
+                    0
+                } else {
+                    status_block.saturating_add(1)
+                };
+                starts
+                    .entry((status.script.clone().into(), script_type))
+                    .and_modify(|start| *start = (*start).min(first_indexed_block))
+                    .or_insert(first_indexed_block);
+            }
+            drop(starts);
             self.chain_service
                 .set_scripts(scripts, Some(SetScriptsCommand::Partial));
         }
@@ -123,7 +188,6 @@ impl RpcRouter {
         let route = route_method(method);
         let result = match route {
             Route::Local => self.handle_local(method, params),
-            Route::Upstream => self.forward_upstream(method, params),
             Route::Unsupported => Err(unsupported(format!(
                 "{method} is not supported by the embedded CKB RPC gateway"
             ))),
@@ -148,11 +212,14 @@ impl RpcRouter {
             "get_consensus" => to_value(ckb_jsonrpc_types::Consensus::from(
                 (*self.consensus).clone(),
             )),
+            "get_epoch_by_number" => self.get_epoch_by_number(params),
             "get_block_by_number" => self.get_block_by_number(params),
             "get_header" => self.get_header(params),
             "get_header_by_number" => self.get_header_by_number(params),
             "get_block_median_time" => self.get_block_median_time(params),
             "get_transaction" => self.get_transaction(params),
+            "get_live_cell" => self.get_live_cell(params),
+            "send_transaction" => self.send_transaction(params),
             _ => Err(Error::method_not_found()),
         }
     }
@@ -276,6 +343,61 @@ impl RpcRouter {
         }))
     }
 
+    fn get_epoch_by_number(&self, params: Params) -> Result<Value> {
+        let params = positional(params)?;
+        if params.len() != 1 {
+            return Err(invalid_params(
+                "get_epoch_by_number accepts exactly one epoch number",
+            ));
+        }
+        let requested = required_param::<EpochNumber>(&params, 0, "epoch_number")?.value();
+        let tip = self.chain_service.get_tip_header();
+        let mut headers = self.stored_headers()?;
+        headers.push(tip.clone());
+        headers.push(self.consensus.genesis_block().header().into());
+
+        let epoch = resolve_epoch_view_for_fiber(
+            requested,
+            &tip,
+            self.consensus.cellbase_maturity(),
+            &headers,
+        )
+        .map_err(not_ready)?;
+        to_value(epoch)
+    }
+
+    /// Return every proved header addressable by block number in the Light
+    /// Client store. A block matching a registered script always has such a
+    /// mapping, which is the property the Fiber cell collector needs here.
+    fn stored_headers(&self) -> Result<Vec<HeaderView>> {
+        let prefix = vec![KeyPrefix::BlockNumber as u8];
+        let take_prefix = prefix.clone();
+        let entries = self.storage.collect_iterator(
+            IteratorStart::From(prefix),
+            IteratorDirection::Forward,
+            Box::new(move |key| key.starts_with(&take_prefix)),
+            Box::new(|_key, value| Some(value.to_vec())),
+            usize::MAX,
+        );
+
+        entries
+            .into_iter()
+            .map(|entry| {
+                let hash = packed::Byte32::from_slice(&entry.value).map_err(|err| {
+                    internal_error(format!(
+                        "invalid stored block hash while resolving epoch: {err}"
+                    ))
+                })?;
+                self.storage.get_header(&hash).ok_or_else(|| {
+                    internal_error(format!(
+                        "stored block number mapping has no header for {hash:?}"
+                    ))
+                })
+            })
+            .map(|result| result.map(Into::into))
+            .collect()
+    }
+
     fn get_block_by_number(&self, params: Params) -> Result<Value> {
         let params = positional(params)?;
         let number = required_param::<BlockNumber>(&params, 0, "block_number")?.value();
@@ -396,11 +518,442 @@ impl RpcRouter {
         )
     }
 
+    fn get_live_cell(&self, params: Params) -> Result<Value> {
+        let params = positional(params)?;
+        if !(2..=3).contains(&params.len()) {
+            return Err(invalid_params(
+                "get_live_cell accepts out_point, with_data, and optional include_tx_pool",
+            ));
+        }
+        let out_point = required_param::<JsonOutPoint>(&params, 0, "out_point")?;
+        let with_data = required_param::<bool>(&params, 1, "with_data")?;
+        let include_tx_pool = optional_param::<bool>(&params, 2)?.unwrap_or(false);
+        if include_tx_pool {
+            return Err(unsupported(
+                "get_live_cell include_tx_pool=true is not supported by the embedded Light Client",
+            ));
+        }
+
+        let out_point: packed::OutPoint = out_point.into();
+        let tx_hash: H256 = out_point.tx_hash().unpack();
+        let deadline = Instant::now() + REMOTE_DATA_TIMEOUT;
+        let transaction = self.fetch_transaction_until(&tx_hash, deadline)?;
+        if !matches!(transaction.tx_status.status, Status::Committed) {
+            return to_value(cell_with_status("unknown", None));
+        }
+        let transaction = transaction.transaction.ok_or_else(|| {
+            not_ready(format!(
+                "committed producing transaction for {out_point:?} is not ready"
+            ))
+        })?;
+        let transaction: packed::Transaction = transaction.inner.into();
+        let output_index: u32 = out_point.index().unpack();
+        let Some(output) = transaction.raw().outputs().get(output_index as usize) else {
+            return to_value(cell_with_status("unknown", None));
+        };
+        let Some(data) = transaction
+            .raw()
+            .outputs_data()
+            .get(output_index as usize)
+            .map(|data| data.raw_data())
+        else {
+            return Err(internal_error(format!(
+                "producing transaction for {out_point:?} has no matching output data"
+            )));
+        };
+
+        if !self.committed_cell_is_live(&out_point, &output, deadline)? {
+            return to_value(cell_with_status("dead", None));
+        }
+
+        let data = with_data.then(|| CellData {
+            content: JsonBytes::from_bytes(data.clone()),
+            hash: packed::CellOutput::calc_data_hash(&data).into(),
+        });
+        to_value(cell_with_status(
+            "live",
+            Some(CellInfo {
+                output: output.into(),
+                data,
+            }),
+        ))
+    }
+
+    fn send_transaction(&self, params: Params) -> Result<Value> {
+        let params = positional(params)?;
+        if params.len() > 2 {
+            return Err(invalid_params(
+                "send_transaction accepts transaction and optional outputs_validator",
+            ));
+        }
+        let transaction = required_param::<Transaction>(&params, 0, "transaction")?;
+        if let Some(outputs_validator) = optional_param::<String>(&params, 1)? {
+            if outputs_validator != "passthrough" {
+                return Err(unsupported(format!(
+                    "outputs_validator {outputs_validator:?} is not supported by the embedded Light Client"
+                )));
+            }
+        }
+
+        let packed_transaction: packed::Transaction = transaction.clone().into();
+        let transaction_view = packed_transaction.into_view();
+        let tx_hash = transaction_view.hash();
+        let inputs = transaction_view.input_pts_iter().collect::<Vec<_>>();
+        let mut unique_inputs = HashSet::with_capacity(inputs.len());
+        if let Some(duplicated) = inputs
+            .iter()
+            .find(|input| !unique_inputs.insert((*input).clone()))
+        {
+            return Err(transaction_failed_to_resolve(format!(
+                "Resolve failed Dead({duplicated:?}): the transaction contains a duplicated input"
+            )));
+        }
+
+        // Fetch and prove all referenced chain data before running the Light Client's
+        // contextual verifier. In particular, this compensates for its storage
+        // CellProvider treating every stored historical output as live.
+        self.prepare_transaction(&transaction_view, Instant::now() + REMOTE_DATA_TIMEOUT)?;
+
+        // Keep conflict detection and insertion into PendingTxs in one critical
+        // section. This makes concurrent RPC submissions atomic from the local
+        // gateway's point of view.
+        let mut pending_inputs = self
+            .pending_inputs
+            .lock()
+            .map_err(|_| internal_error("pending input reservation lock is poisoned"))?;
+        pending_inputs.retain(|owner| {
+            let owner: H256 = owner.unpack();
+            matches!(
+                self.chain_service.get_transaction(&owner).tx_status.status,
+                Status::Pending
+            )
+        });
+        if let Some((input, owner)) = pending_inputs.conflicting_owner(&inputs, &tx_hash) {
+            return Err(transaction_failed_to_resolve(format!(
+                "Resolve failed Dead({input:?}): input is reserved by pending transaction {owner:?}"
+            )));
+        }
+
+        let returned_hash = self
+            .chain_service
+            .send_transaction(transaction.clone())
+            .map_err(map_send_transaction_error)?;
+        let returned_hash: packed::Byte32 = returned_hash.pack();
+        if returned_hash != tx_hash {
+            return Err(internal_error(format!(
+                "Light Client returned transaction hash {returned_hash:?}, expected {tx_hash:?}"
+            )));
+        }
+        pending_inputs.reserve(&inputs, &tx_hash);
+        drop(pending_inputs);
+
+        let first_required_block = self
+            .chain_service
+            .get_tip_header()
+            .inner
+            .number
+            .value()
+            .saturating_add(1);
+        self.register_transaction_output_scripts(&transaction, first_required_block);
+
+        to_value(H256::from(tx_hash))
+    }
+
+    fn prepare_transaction(
+        &self,
+        transaction: &CoreTransactionView,
+        deadline: Instant,
+    ) -> Result<()> {
+        for header_hash in transaction.header_deps().into_iter() {
+            let header_hash: H256 = header_hash.unpack();
+            if self.fetch_header_until(&header_hash, deadline)?.is_none() {
+                return Err(transaction_failed_to_resolve(format!(
+                    "Resolve failed InvalidHeader({header_hash:#x})"
+                )));
+            }
+        }
+
+        let mut prepared = HashMap::<packed::OutPoint, Bytes>::new();
+        for input in transaction.input_pts_iter() {
+            self.prepare_out_point(&input, &mut prepared, deadline)?;
+        }
+        for cell_dep in transaction.cell_deps().into_iter() {
+            let out_point = cell_dep.out_point();
+            let data = self.prepare_out_point(&out_point, &mut prepared, deadline)?;
+            if cell_dep.dep_type() == DepType::DepGroup.into() {
+                let dep_group = packed::OutPointVec::from_slice(data.as_ref()).map_err(|err| {
+                    transaction_failed_to_resolve(format!(
+                        "Resolve failed InvalidDepGroup({out_point:?}): {err}"
+                    ))
+                })?;
+                if dep_group.is_empty() {
+                    return Err(transaction_failed_to_resolve(format!(
+                        "Resolve failed InvalidDepGroup({out_point:?}): dep group is empty"
+                    )));
+                }
+                for dep_out_point in dep_group.into_iter() {
+                    self.prepare_out_point(&dep_out_point, &mut prepared, deadline)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn prepare_out_point(
+        &self,
+        out_point: &packed::OutPoint,
+        prepared: &mut HashMap<packed::OutPoint, Bytes>,
+        deadline: Instant,
+    ) -> Result<Bytes> {
+        if let Some(data) = prepared.get(out_point) {
+            return Ok(data.clone());
+        }
+
+        let tx_hash: H256 = out_point.tx_hash().unpack();
+        let transaction = self.fetch_transaction_until(&tx_hash, deadline)?;
+        let status = transaction.tx_status.status;
+        let transaction = transaction.transaction.ok_or_else(|| {
+            transaction_failed_to_resolve(format!(
+                "Resolve failed Unknown({out_point:?}): producing transaction is not committed or locally pending"
+            ))
+        })?;
+        let transaction: packed::Transaction = transaction.inner.into();
+        let output_index: u32 = out_point.index().unpack();
+        let output = transaction
+            .raw()
+            .outputs()
+            .get(output_index as usize)
+            .ok_or_else(|| {
+                transaction_failed_to_resolve(format!(
+                    "Resolve failed Unknown({out_point:?}): output index is out of bounds"
+                ))
+            })?;
+        let data = transaction
+            .raw()
+            .outputs_data()
+            .get(output_index as usize)
+            .ok_or_else(|| {
+                transaction_failed_to_resolve(format!(
+                    "Resolve failed Unknown({out_point:?}): output data is missing"
+                ))
+            })?
+            .raw_data();
+
+        match status {
+            Status::Pending => {}
+            Status::Committed => self.ensure_committed_cell_live(out_point, &output, deadline)?,
+            Status::Unknown => {
+                return Err(transaction_failed_to_resolve(format!(
+                    "Resolve failed Unknown({out_point:?})"
+                )));
+            }
+        }
+        prepared.insert(out_point.clone(), data.clone());
+        Ok(data)
+    }
+
+    fn ensure_committed_cell_live(
+        &self,
+        out_point: &packed::OutPoint,
+        output: &packed::CellOutput,
+        deadline: Instant,
+    ) -> Result<()> {
+        if self.committed_cell_is_live(out_point, output, deadline)? {
+            Ok(())
+        } else {
+            Err(transaction_failed_to_resolve(format!(
+                "Resolve failed Dead({out_point:?})"
+            )))
+        }
+    }
+
+    fn committed_cell_is_live(
+        &self,
+        out_point: &packed::OutPoint,
+        output: &packed::CellOutput,
+        deadline: Instant,
+    ) -> Result<bool> {
+        let Some((block_number, _, _)) = self.storage.get_transaction(&out_point.tx_hash()) else {
+            return Err(not_ready(format!(
+                "producing transaction for {out_point:?} is not stored yet"
+            )));
+        };
+        let output_index: u32 = out_point.index().unpack();
+        let lock_script = output.lock();
+        let type_script = output.type_().to_opt();
+        let statuses = self.chain_service.get_scripts();
+        let lock_script_json: Script = lock_script.clone().into();
+        let lock_registered = statuses.iter().any(|status| {
+            status.script == lock_script_json && matches!(status.script_type, ScriptType::Lock)
+        });
+        let type_registered = type_script.as_ref().is_some_and(|type_script| {
+            let type_script: Script = type_script.clone().into();
+            statuses.iter().any(|status| {
+                status.script == type_script && matches!(status.script_type, ScriptType::Type)
+            })
+        });
+        let (indexed_script, indexed_script_type) = if !lock_registered && type_registered {
+            (
+                type_script.expect("registered type script should exist"),
+                IndexedScriptType::Type,
+            )
+        } else {
+            (lock_script, IndexedScriptType::Lock)
+        };
+        let script: Script = indexed_script.clone().into();
+        let service_script_type = indexed_script_type.service_type();
+        let existing_status = statuses.into_iter().find(|status| {
+            status.script == script && same_script_type(&status.script_type, &service_script_type)
+        });
+
+        let mut index_covers_creation = self
+            .indexed_script_starts
+            .lock()
+            .map_err(|_| internal_error("indexed script coverage lock is poisoned"))?
+            .get(&(indexed_script.clone(), indexed_script_type))
+            .is_some_and(|start| *start <= block_number);
+        if let Some(status) = existing_status.as_ref() {
+            if status.block_number.value() < block_number {
+                index_covers_creation = true;
+            }
+        } else {
+            self.rewind_script(&script, indexed_script_type, block_number)?;
+            index_covers_creation = true;
+        }
+
+        self.wait_script_ready_until(&script, &service_script_type, deadline)?;
+        if self.cell_index_contains_out_point(
+            &indexed_script,
+            indexed_script_type,
+            block_number,
+            output_index,
+            out_point,
+        )? {
+            self.note_indexed_script_start(indexed_script, indexed_script_type, block_number)?;
+            return Ok(true);
+        }
+
+        // A script already at the tip may have been registered after this cell
+        // was created. Rewind it once so an absent UTXO becomes proof that the
+        // output was consumed, rather than merely never indexed.
+        if !index_covers_creation {
+            self.rewind_script(&script, indexed_script_type, block_number)?;
+            self.wait_script_ready_until(&script, &service_script_type, deadline)?;
+        }
+        self.note_indexed_script_start(indexed_script.clone(), indexed_script_type, block_number)?;
+        if self.cell_index_contains_out_point(
+            &indexed_script,
+            indexed_script_type,
+            block_number,
+            output_index,
+            out_point,
+        )? {
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
+
+    fn rewind_script(
+        &self,
+        script: &Script,
+        script_type: IndexedScriptType,
+        first_required_block: u64,
+    ) -> Result<()> {
+        self.chain_service.set_scripts(
+            vec![ScriptStatus {
+                script: script.clone(),
+                script_type: script_type.service_type(),
+                block_number: BlockNumber::from(first_required_block.saturating_sub(1)),
+            }],
+            Some(SetScriptsCommand::Partial),
+        );
+        self.note_indexed_script_start(script.clone().into(), script_type, first_required_block)
+    }
+
+    fn note_indexed_script_start(
+        &self,
+        script: packed::Script,
+        script_type: IndexedScriptType,
+        first_indexed_block: u64,
+    ) -> Result<()> {
+        let mut starts = self
+            .indexed_script_starts
+            .lock()
+            .map_err(|_| internal_error("indexed script coverage lock is poisoned"))?;
+        starts
+            .entry((script, script_type))
+            .and_modify(|start| *start = (*start).min(first_indexed_block))
+            .or_insert(first_indexed_block);
+        Ok(())
+    }
+
+    fn cell_index_contains(
+        &self,
+        script: &packed::Script,
+        script_type: IndexedScriptType,
+        block_number: u64,
+        tx_index: u32,
+        output_index: u32,
+        expected_tx_hash: &packed::Byte32,
+    ) -> Result<bool> {
+        let key = match script_type {
+            IndexedScriptType::Lock => {
+                Key::CellLockScript(script, block_number, tx_index, output_index)
+            }
+            IndexedScriptType::Type => {
+                Key::CellTypeScript(script, block_number, tx_index, output_index)
+            }
+        }
+        .into_vec();
+        let value = self.storage.get(key).map_err(|err| {
+            internal_error(format!("failed to read Light Client UTXO index: {err}"))
+        })?;
+        Ok(value.as_deref() == Some(expected_tx_hash.as_slice()))
+    }
+
+    fn cell_index_contains_out_point(
+        &self,
+        script: &packed::Script,
+        script_type: IndexedScriptType,
+        block_number: u64,
+        output_index: u32,
+        out_point: &packed::OutPoint,
+    ) -> Result<bool> {
+        // A transaction fetched through a transaction proof is initially stored
+        // with an unknown tx index. Filtering its complete block replaces that
+        // placeholder with the canonical index, so reload it after the script
+        // scan rather than retaining the pre-scan value.
+        let Some((stored_block_number, tx_index, _)) =
+            self.storage.get_transaction(&out_point.tx_hash())
+        else {
+            return Err(not_ready(format!(
+                "producing transaction for {out_point:?} disappeared during script scan"
+            )));
+        };
+        if stored_block_number != block_number {
+            return Err(internal_error(format!(
+                "producing transaction for {out_point:?} moved from block {block_number} to {stored_block_number}"
+            )));
+        }
+        self.cell_index_contains(
+            script,
+            script_type,
+            block_number,
+            tx_index,
+            output_index,
+            &out_point.tx_hash(),
+        )
+    }
+
     fn fetch_header(&self, hash: &H256) -> Result<Option<HeaderView>> {
+        self.fetch_header_until(hash, Instant::now() + REMOTE_DATA_TIMEOUT)
+    }
+
+    fn fetch_header_until(&self, hash: &H256, deadline: Instant) -> Result<Option<HeaderView>> {
         if let Some(header) = self.chain_service.get_header(hash) {
             return Ok(Some(header));
         }
-        let deadline = Instant::now() + REMOTE_DATA_TIMEOUT;
         loop {
             match self.chain_service.fetch_header(hash) {
                 FetchStatus::Fetched { data } => return Ok(Some(data)),
@@ -415,12 +968,18 @@ impl RpcRouter {
     }
 
     fn fetch_transaction(&self, hash: &H256) -> Result<TransactionWithStatus> {
+        self.fetch_transaction_until(hash, Instant::now() + REMOTE_DATA_TIMEOUT)
+    }
+
+    fn fetch_transaction_until(
+        &self,
+        hash: &H256,
+        deadline: Instant,
+    ) -> Result<TransactionWithStatus> {
         let transaction = self.chain_service.get_transaction(hash);
         if transaction.transaction.is_some() {
             return Ok(transaction);
         }
-
-        let deadline = Instant::now() + REMOTE_DATA_TIMEOUT;
         loop {
             match self.chain_service.fetch_transaction(hash) {
                 FetchStatus::Fetched { data } => return Ok(data),
@@ -455,7 +1014,15 @@ impl RpcRouter {
     }
 
     fn wait_script_ready(&self, script: &Script, script_type: &ScriptType) -> Result<()> {
-        let deadline = Instant::now() + REMOTE_DATA_TIMEOUT;
+        self.wait_script_ready_until(script, script_type, Instant::now() + REMOTE_DATA_TIMEOUT)
+    }
+
+    fn wait_script_ready_until(
+        &self,
+        script: &Script,
+        script_type: &ScriptType,
+        deadline: Instant,
+    ) -> Result<()> {
         loop {
             let tip = self.chain_service.get_tip_header().inner.number.value();
             let ready = self.chain_service.get_scripts().into_iter().any(|status| {
@@ -543,73 +1110,87 @@ impl RpcRouter {
                 .set_scripts(added, Some(SetScriptsCommand::Partial));
         }
     }
+}
 
-    fn forward_upstream(&self, method: &str, params: Params) -> Result<Value> {
-        let submitted_transaction = if method == "send_transaction" {
-            match &params {
-                Params::Array(values) => values
-                    .first()
-                    .and_then(|value| serde_json::from_value::<Transaction>(value.clone()).ok()),
-                Params::Map(_) | Params::None => None,
-            }
-        } else {
-            None
-        };
-        let params = match params {
-            Params::Array(values) => Value::Array(values),
-            Params::Map(values) => Value::Object(values),
-            Params::None => Value::Array(Vec::new()),
-        };
-        let response = self
-            .runtime_handle
-            .block_on(
-                self.upstream_client
-                    .post(&self.upstream_rpc_url)
-                    .json(&json!({
-                        "jsonrpc": "2.0",
-                        "id": 1,
-                        "method": method,
-                        "params": params,
-                    }))
-                    .send(),
-            )
-            .and_then(|response| response.error_for_status())
-            .map_err(|err| upstream_error(format!("upstream {method} request failed: {err}")))?;
-        let response = self
-            .runtime_handle
-            .block_on(response.json::<Value>())
-            .map_err(|err| upstream_error(format!("invalid upstream {method} response: {err}")))?;
+/// Resolve the epoch query used by ckb-sdk's `DefaultCellCollector`.
+///
+/// If any proved local header belongs to the requested epoch, it contains the
+/// exact epoch start and length. Otherwise, the only supported historical
+/// query is the maturity target derived from the current tip. For that query a
+/// one-block synthetic epoch makes ckb-sdk calculate the greatest block number
+/// of a locally indexed mature header. This is selection-equivalent for Fiber:
+/// every candidate returned by the Light Client index has its creating block
+/// header stored, while an as-yet unindexed candidate is conservatively skipped
+/// until the next collection attempt.
+fn resolve_epoch_view_for_fiber(
+    requested: u64,
+    tip: &HeaderView,
+    cellbase_maturity: EpochNumberWithFraction,
+    stored_headers: &[HeaderView],
+) -> std::result::Result<Option<EpochView>, String> {
+    let tip_epoch = EpochNumberWithFraction::from_full_value(tip.inner.epoch.value());
+    if requested > tip_epoch.number() {
+        return Ok(None);
+    }
 
-        if let Some(error) = response.get("error") {
-            let code = error
-                .get("code")
-                .and_then(Value::as_i64)
-                .unwrap_or(UPSTREAM_ERROR);
-            return Err(Error {
-                code: ErrorCode::ServerError(code),
-                message: error
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("upstream CKB RPC error")
-                    .to_string(),
-                data: error.get("data").cloned(),
-            });
-        }
-        let result = response
-            .get("result")
-            .cloned()
-            .ok_or_else(|| upstream_error(format!("upstream {method} response has no result")))?;
-        if let Some(transaction) = submitted_transaction {
-            let first_required_block = self
-                .chain_service
-                .get_tip_header()
-                .inner
-                .number
-                .value()
-                .saturating_add(1);
-            self.register_transaction_output_scripts(&transaction, first_required_block);
-        }
-        Ok(result)
+    if let Some(header) = stored_headers.iter().find(|header| {
+        EpochNumberWithFraction::from_full_value(header.inner.epoch.value()).number() == requested
+    }) {
+        return Ok(Some(epoch_view_from_header(header)));
+    }
+
+    let tip_epoch_rational = tip_epoch.to_rational();
+    let maturity_rational = cellbase_maturity.to_rational();
+    if tip_epoch_rational < maturity_rational {
+        return Err(format!(
+            "epoch {requested} is not represented by a proved local header"
+        ));
+    }
+    let mature_epoch = tip_epoch_rational - maturity_rational;
+    let mature_epoch_number = u64::from_le_bytes(
+        mature_epoch.clone().into_u256().to_le_bytes()[..8]
+            .try_into()
+            .expect("epoch number fits into u64"),
+    );
+    if requested != mature_epoch_number {
+        return Err(format!(
+            "epoch {requested} is not represented by a proved local header"
+        ));
+    }
+
+    let mature_header = stored_headers
+        .iter()
+        .filter(|header| {
+            EpochNumberWithFraction::from_full_value(header.inner.epoch.value()).to_rational()
+                <= mature_epoch
+        })
+        .max_by_key(|header| header.inner.number.value())
+        .ok_or_else(|| {
+            format!("no proved local header can establish maturity for epoch {requested}")
+        })?;
+
+    Ok(Some(EpochView {
+        number: EpochNumber::from(requested),
+        start_number: mature_header.inner.number,
+        length: BlockNumber::from(1u64),
+        compact_target: mature_header.inner.compact_target,
+    }))
+}
+
+fn epoch_view_from_header(header: &HeaderView) -> EpochView {
+    let epoch = EpochNumberWithFraction::from_full_value(header.inner.epoch.value());
+    EpochView {
+        number: EpochNumber::from(epoch.number()),
+        start_number: BlockNumber::from(header.inner.number.value().saturating_sub(epoch.index())),
+        length: BlockNumber::from(epoch.length()),
+        compact_target: header.inner.compact_target,
+    }
+}
+
+fn cell_with_status(status: &str, cell: Option<CellInfo>) -> CellWithStatus {
+    CellWithStatus {
+        cell,
+        status: status.to_string(),
     }
 }
 
@@ -635,8 +1216,6 @@ fn search_mode(search_key: &Value) -> SearchMode {
 fn route_method(method: &str) -> Route {
     if LOCAL_METHODS.contains(&method) {
         Route::Local
-    } else if UPSTREAM_METHODS.contains(&method) {
-        Route::Upstream
     } else {
         Route::Unsupported
     }
@@ -899,11 +1478,43 @@ fn unsupported(message: impl Into<String>) -> Error {
     }
 }
 
-fn upstream_error(message: impl Into<String>) -> Error {
+fn transaction_failed_to_resolve(message: impl Into<String>) -> Error {
+    transaction_error(
+        TRANSACTION_FAILED_TO_RESOLVE,
+        "TransactionFailedToResolve",
+        message,
+    )
+}
+
+fn transaction_failed_to_verify(message: impl Into<String>) -> Error {
+    transaction_error(
+        TRANSACTION_FAILED_TO_VERIFY,
+        "TransactionFailedToVerify",
+        message,
+    )
+}
+
+fn map_send_transaction_error(err: ckb_light_client_lib::error::Error) -> Error {
+    let message = err.to_string();
+    if message.contains("OutPoint(") {
+        transaction_failed_to_resolve(message)
+    } else if message.to_ascii_lowercase().contains("low fee rate") {
+        transaction_error(
+            POOL_REJECTED_TRANSACTION_BY_MIN_FEE_RATE,
+            "PoolRejectedTransactionByMinFeeRate",
+            message,
+        )
+    } else {
+        transaction_failed_to_verify(message)
+    }
+}
+
+fn transaction_error(code: i64, name: &'static str, message: impl Into<String>) -> Error {
+    let message = message.into();
     Error {
-        code: ErrorCode::ServerError(UPSTREAM_ERROR),
-        message: message.into(),
-        data: None,
+        code: ErrorCode::ServerError(code),
+        message: format!("{name}: {message}"),
+        data: Some(Value::String(message)),
     }
 }
 
@@ -917,13 +1528,144 @@ fn internal_error(message: impl Into<String>) -> Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{route_method, Route};
+    use ckb_types::{
+        core::{EpochNumberWithFraction, HeaderBuilder},
+        packed,
+    };
+    use jsonrpc_core::ErrorCode;
+
+    use super::{
+        map_send_transaction_error, resolve_epoch_view_for_fiber, route_method,
+        PendingInputReservations, Route, POOL_REJECTED_TRANSACTION_BY_MIN_FEE_RATE,
+        TRANSACTION_FAILED_TO_RESOLVE, TRANSACTION_FAILED_TO_VERIFY,
+    };
+
+    fn header(
+        number: u64,
+        epoch_number: u64,
+        epoch_index: u64,
+        epoch_length: u64,
+    ) -> ckb_jsonrpc_types::HeaderView {
+        HeaderBuilder::default()
+            .number(number)
+            .epoch(
+                EpochNumberWithFraction::new(epoch_number, epoch_index, epoch_length).full_value(),
+            )
+            .compact_target(0x1e08_3126u32)
+            .build()
+            .into()
+    }
 
     #[test]
     fn routing_is_fixed_before_execution() {
         assert_eq!(route_method("get_cells"), Route::Local);
-        assert_eq!(route_method("get_epoch_by_number"), Route::Upstream);
-        assert_eq!(route_method("send_transaction"), Route::Upstream);
+        assert_eq!(route_method("get_epoch_by_number"), Route::Local);
+        assert_eq!(route_method("get_live_cell"), Route::Local);
+        assert_eq!(route_method("send_transaction"), Route::Local);
         assert_eq!(route_method("set_scripts"), Route::Unsupported);
+    }
+
+    #[test]
+    fn epoch_query_returns_exact_view_from_a_proved_header() {
+        let tip = header(105, 10, 5, 10);
+        let proved = header(63, 6, 3, 10);
+
+        let epoch =
+            resolve_epoch_view_for_fiber(6, &tip, EpochNumberWithFraction::new(4, 0, 1), &[proved])
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(epoch.number.value(), 6);
+        assert_eq!(epoch.start_number.value(), 60);
+        assert_eq!(epoch.length.value(), 10);
+        assert_eq!(epoch.compact_target.value(), 0x1e08_3126);
+    }
+
+    #[test]
+    fn maturity_epoch_without_a_header_uses_the_latest_proved_mature_block() {
+        let tip = header(105, 10, 5, 10);
+        let latest_proved_mature = header(59, 5, 9, 10);
+        let proved_but_immature = header(70, 7, 0, 10);
+
+        let epoch = resolve_epoch_view_for_fiber(
+            6,
+            &tip,
+            EpochNumberWithFraction::new(4, 0, 1),
+            &[latest_proved_mature, proved_but_immature],
+        )
+        .unwrap()
+        .unwrap();
+
+        // ckb-sdk computes start + floor(fraction * length). A length of one
+        // therefore gives exactly the latest proved mature block, 59.
+        assert_eq!(epoch.number.value(), 6);
+        assert_eq!(epoch.start_number.value(), 59);
+        assert_eq!(epoch.length.value(), 1);
+    }
+
+    #[test]
+    fn epoch_query_does_not_invent_unrelated_history_or_future_epochs() {
+        let tip = header(105, 10, 5, 10);
+        let proved = header(59, 5, 9, 10);
+        let maturity = EpochNumberWithFraction::new(4, 0, 1);
+
+        assert!(
+            resolve_epoch_view_for_fiber(4, &tip, maturity, std::slice::from_ref(&proved)).is_err()
+        );
+        assert_eq!(
+            resolve_epoch_view_for_fiber(11, &tip, maturity, &[proved]).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn pending_input_reservations_are_idempotent_and_detect_conflicts() {
+        let input = packed::OutPoint::new(packed::Byte32::new([1; 32]), 0);
+        let first = packed::Byte32::new([2; 32]);
+        let second = packed::Byte32::new([3; 32]);
+        let mut reservations = PendingInputReservations::default();
+
+        reservations.reserve(std::slice::from_ref(&input), &first);
+        assert!(reservations
+            .conflicting_owner(std::slice::from_ref(&input), &first)
+            .is_none());
+        assert_eq!(
+            reservations
+                .conflicting_owner(std::slice::from_ref(&input), &second)
+                .map(|(_, owner)| owner),
+            Some(first.clone())
+        );
+
+        reservations.retain(|owner| owner != &first);
+        assert!(reservations
+            .conflicting_owner(std::slice::from_ref(&input), &second)
+            .is_none());
+    }
+
+    #[test]
+    fn light_client_verification_errors_use_ckb_rpc_codes() {
+        let resolve = map_send_transaction_error(ckb_light_client_lib::error::Error::runtime(
+            "invalid transaction: OutPoint(Unknown(...))",
+        ));
+        assert_eq!(
+            resolve.code,
+            ErrorCode::ServerError(TRANSACTION_FAILED_TO_RESOLVE)
+        );
+
+        let low_fee = map_send_transaction_error(ckb_light_client_lib::error::Error::runtime(
+            "Transaction rejected by low fee rate",
+        ));
+        assert_eq!(
+            low_fee.code,
+            ErrorCode::ServerError(POOL_REJECTED_TRANSACTION_BY_MIN_FEE_RATE)
+        );
+
+        let verify = map_send_transaction_error(ckb_light_client_lib::error::Error::runtime(
+            "invalid transaction: Script(Error {...})",
+        ));
+        assert_eq!(
+            verify.code,
+            ErrorCode::ServerError(TRANSACTION_FAILED_TO_VERIFY)
+        );
     }
 }
