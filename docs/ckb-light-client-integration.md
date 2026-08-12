@@ -19,9 +19,9 @@
 在 `fiber-ffi` 中增加 Cargo 功能开关，用它决定从哪里读取 CKB 链上数据：
 
 - 未开启 Light Client 功能：保持现有行为。Fiber 通过 `CkbConfig.rpc_url` 访问外部 CKB 全节点 RPC。
-- 开启 `disbale-ckb-rpc`：启动内置 Light Client 和本地 RPC 转换服务。
+- 开启 `disable-ckb-rpc`：启动内置 Light Client 和本地 RPC 转换服务。
 
-开启 `disbale-ckb-rpc` 时，`fiber-ffi` 将：
+开启 `disable-ckb-rpc` 时，`fiber-ffi` 将：
 
 1. 在当前进程中启动 `ckb-light-client-lib`。
 2. 在 `127.0.0.1` 的随机端口启动一个本地 CKB JSON-RPC 转换服务。
@@ -56,7 +56,7 @@ flowchart LR
 
 - 不修改 Fiber 源码，实现 Fiber 目前会用到的 CKB RPC 方法。
 - 保持现有 `fiber-ffi` C API 不变。用 Cargo 功能开关选择数据来源。普通的主网和测试网运行不要求用户填写 Light Client 配置。
-- 不传 `disbale-ckb-rpc` 时，编译结果和现有的外部 RPC 行为保持不变。
+- 不传 `disable-ckb-rpc` 时，编译结果和现有的外部 RPC 行为保持不变。
 - Light Client 遇到无法处理的请求时，不得因为失败而临时改用外部 RPC。
 - 只启动 Fiber 所需的 Light Client 服务。所有无关功能默认关闭，而且不提供运行时开关重新开启。
 
@@ -88,7 +88,7 @@ Cargo 功能开关在编译时决定是否包含 Light Client。已经编译好�
 ```toml
 [features]
 default = ["rocksdb", "watchtower"]
-disbale-ckb-rpc = [
+disable-ckb-rpc = [
     "dep:ckb-light-client-lib",
     "dep:ckb-async-runtime",
     "dep:ckb-network",
@@ -106,10 +106,10 @@ jsonrpc-core = { version = "...", optional = true }
 jsonrpc-http-server = { version = "...", optional = true }
 ```
 
-`disbale-ckb-rpc` 不加入 `default`。编译方式如下：
+`disable-ckb-rpc` 不加入 `default`。编译方式如下：
 
 - 不传功能开关：保持现有的外部 CKB 全节点 RPC 模式。
-- `--features disbale-ckb-rpc`：编译 Light Client 依赖并启动内置 Light Client。
+- `--features disable-ckb-rpc`：编译 Light Client 依赖并启动内置 Light Client。
 
 `ckb-light-client-lib` 应固定到已发布的版本或某个确定的 Git 提交，正式编译时不要指向会继续变化的分支。本地开发时可以临时使用 `path` 依赖。
 
@@ -146,7 +146,7 @@ ckb_light_client:
 配置规则：
 
 - 未开启 Light Client 功能：继续使用 `ckb.rpc_url`，不启动 Light Client，也不读取 `ckb_light_client` 配置。
-- 开启 `disbale-ckb-rpc`：YAML 中的 `ckb.rpc_url` 只为兼容 Fiber 现有配置格式而解析；不会保存为上游地址。在内存中把传给 Fiber 的 `rpc_url` 改为本地转换服务地址。
+- 开启 `disable-ckb-rpc`：YAML 中的 `ckb.rpc_url` 只为兼容 Fiber 现有配置格式而解析；不会保存为上游地址。在内存中把传给 Fiber 的 `rpc_url` 改为本地转换服务地址。
 - YAML 不允许覆盖本机 RPC 地址、P2P 监听地址、连接数量和服务列表。这样可以防止内置 Light Client 被配置成对外服务。
 
 ## 4. `fiber-ffi` 内部模块
@@ -282,7 +282,7 @@ struct ParsedFfiConfig {
 `RunningNode` 增加：
 
 ```rust
-#[cfg(feature = "disbale-ckb-rpc")]
+#[cfg(feature = "disable-ckb-rpc")]
 local_ckb: Option<LocalCkbNodeHandle>,
 ```
 
@@ -530,8 +530,8 @@ Fiber 启动前必须满足：
 
 ### 阶段 0：验证能否编译
 
-- 增加 Light Client 的可选依赖和 `disbale-ckb-rpc` 功能开关，但暂时不改启动流程。
-- 确认不传功能开关时仍使用现有的外部 CKB RPC，并确认开启 `disbale-ckb-rpc` 时能够编译。
+- 增加 Light Client 的可选依赖和 `disable-ckb-rpc` 功能开关，但暂时不改启动流程。
+- 确认不传功能开关时仍使用现有的外部 CKB RPC，并确认开启 `disable-ckb-rpc` 时能够编译。
 - 验证 Linux/macOS 编译。
 - 分别验证 Android 和 iOS 中的 RocksDB 编译，并记录安装包增加的大小。
 - 确认 `ckb-*` 依赖能否与 Fiber 使用相同版本。

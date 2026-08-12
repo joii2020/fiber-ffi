@@ -16,7 +16,7 @@ during startup so the Light Client can prove a state transition beyond its
 initial stored tip and advance script filtering against a stable tip.
 
 The harness builds the `ckb-light-client-portable` helper feature, which enables
-the public `disbale-ckb-rpc` feature. The RC1 Light Client dependency does not
+the public `disable-ckb-rpc` feature. The RC1 Light Client dependency does not
 expose its RocksDB `portable` feature, so `fiber-ffi` provides this
 feature-unification shim to keep E2E/CI binaries from depending on the build
 host's AVX2/BMI instruction set.

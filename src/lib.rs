@@ -35,7 +35,7 @@ use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tracing::{debug, info, trace};
 use tracing_subscriber::EnvFilter;
 
-#[cfg(feature = "disbale-ckb-rpc")]
+#[cfg(feature = "disable-ckb-rpc")]
 mod ckb_light_client;
 
 #[cfg(feature = "watchtower")]
@@ -1021,13 +1021,13 @@ struct RunningNode {
     network_actor: ActorRef<NetworkActorMessage>,
     store: fnn::store::Store,
     fiber_config: FiberConfig,
-    #[cfg(feature = "disbale-ckb-rpc")]
+    #[cfg(feature = "disable-ckb-rpc")]
     local_ckb: Option<ckb_light_client::LocalCkbNodeHandle>,
 }
 
 struct ParsedFfiConfig {
     fiber: Config,
-    #[cfg(feature = "disbale-ckb-rpc")]
+    #[cfg(feature = "disable-ckb-rpc")]
     light_client: ckb_light_client::config::LocalLightClientConfig,
 }
 
@@ -1048,7 +1048,7 @@ struct FfiSerializedConfig {
     services: Option<Vec<FfiService>>,
     fiber: Option<<FiberConfig as ClapSerde>::Opt>,
     ckb: Option<<CkbConfig as ClapSerde>::Opt>,
-    #[cfg(feature = "disbale-ckb-rpc")]
+    #[cfg(feature = "disable-ckb-rpc")]
     ckb_light_client: Option<ckb_light_client::config::SerializedLightClientConfig>,
 }
 
@@ -1097,7 +1097,7 @@ fn parse_config_from_path(
         .fiber
         .map(FiberConfig::from)
         .ok_or_else(|| "fiber config must be set".to_string())?;
-    #[cfg(feature = "disbale-ckb-rpc")]
+    #[cfg(feature = "disable-ckb-rpc")]
     let fiber_chain = fiber_config.chain.clone();
     let (fiber, disabled_fiber) = if services.contains(&FfiService::Fiber) {
         (Some(fiber_config), None)
@@ -1120,7 +1120,7 @@ fn parse_config_from_path(
         check_validate: false,
     };
 
-    #[cfg(feature = "disbale-ckb-rpc")]
+    #[cfg(feature = "disable-ckb-rpc")]
     let light_client = ckb_light_client::config::LocalLightClientConfig::build(
         fiber.base_dir.clone(),
         &fiber_chain,
@@ -1129,7 +1129,7 @@ fn parse_config_from_path(
 
     Ok(ParsedFfiConfig {
         fiber,
-        #[cfg(feature = "disbale-ckb-rpc")]
+        #[cfg(feature = "disable-ckb-rpc")]
         light_client,
     })
 }
@@ -1162,7 +1162,7 @@ async fn start_node(
     );
 
     let parsed_config = parse_config_from_path(&config_path, database_prefix)?;
-    #[cfg(feature = "disbale-ckb-rpc")]
+    #[cfg(feature = "disable-ckb-rpc")]
     debug!(
         chain = %parsed_config.light_client.chain_label(),
         store_path = %parsed_config.light_client.store_path.display(),
@@ -1175,7 +1175,7 @@ async fn start_node(
         remote_data_timeout_seconds = ckb_light_client::config::REMOTE_DATA_TIMEOUT.as_secs(),
         "validated embedded CKB Light Client configuration"
     );
-    #[cfg(feature = "disbale-ckb-rpc")]
+    #[cfg(feature = "disable-ckb-rpc")]
     let light_client_config = parsed_config.light_client.clone();
     let config = parsed_config.fiber;
     let fiber_config = config
@@ -1197,7 +1197,7 @@ async fn start_node(
         .build_genesis()
         .map_err(|err| format!("failed to build ckb genesis block: {err}"))?;
 
-    #[cfg(feature = "disbale-ckb-rpc")]
+    #[cfg(feature = "disable-ckb-rpc")]
     let (ckb_config, local_ckb) = {
         let mut ckb_config = ckb_config;
         let required_scripts = required_light_client_scripts(
@@ -1336,7 +1336,7 @@ async fn start_node(
         network_actor,
         store,
         fiber_config,
-        #[cfg(feature = "disbale-ckb-rpc")]
+        #[cfg(feature = "disable-ckb-rpc")]
         local_ckb,
     })
 }
@@ -1348,14 +1348,14 @@ async fn stop_node_on_signal(node: RunningNode, stop_rx: oneshot::Receiver<()>) 
         .stop(Some("fiber_stop requested".to_string()));
     node.root_tracker.close();
     node.root_tracker.wait().await;
-    #[cfg(feature = "disbale-ckb-rpc")]
+    #[cfg(feature = "disable-ckb-rpc")]
     if let Some(local_ckb) = node.local_ckb {
         local_ckb.shutdown().await;
     }
     debug!("fiber ffi runtime stopped");
 }
 
-#[cfg(feature = "disbale-ckb-rpc")]
+#[cfg(feature = "disable-ckb-rpc")]
 fn required_light_client_scripts(
     fiber_config: &FiberConfig,
     ckb_config: &CkbConfig,

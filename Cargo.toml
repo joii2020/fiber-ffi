@@ -8,7 +8,7 @@ crate-type = ["cdylib"]
 
 [features]
 default = ["rocksdb", "watchtower"]
-disbale-ckb-rpc = [
+disable-ckb-rpc = [
     "dep:ckb-app-config",
     "dep:ckb-async-runtime",
     "dep:ckb-hash",
@@ -26,7 +26,7 @@ disbale-ckb-rpc = [
 # unifies it explicitly for binaries that must run on a different CPU than the
 # build host, including the E2E harness and CI artifacts.
 ckb-light-client-portable = [
-    "disbale-ckb-rpc",
+    "disable-ckb-rpc",
     "fnn/portable",
     "dep:ckb-rocksdb",
 ]

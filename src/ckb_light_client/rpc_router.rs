@@ -154,33 +154,19 @@ impl RpcRouter {
         &self,
         scripts: impl IntoIterator<Item = ScriptStatus>,
     ) -> std::result::Result<(), String> {
-        let scripts = scripts.into_iter().collect::<Vec<_>>();
-        if !scripts.is_empty() {
-            let mut starts = self
-                .indexed_script_starts
-                .lock()
-                .map_err(|_| "indexed script coverage lock is poisoned".to_string())?;
-            for status in &scripts {
-                let script_type = match status.script_type {
-                    ScriptType::Lock => IndexedScriptType::Lock,
-                    ScriptType::Type => IndexedScriptType::Type,
-                };
-                let status_block = status.block_number.value();
-                let first_indexed_block = if status_block == 0 {
-                    0
-                } else {
-                    status_block.saturating_add(1)
-                };
-                starts
-                    .entry((status.script.clone().into(), script_type))
-                    .and_modify(|start| *start = (*start).min(first_indexed_block))
-                    .or_insert(first_indexed_block);
-            }
-            drop(starts);
-            self.chain_service
-                .set_scripts(scripts, Some(SetScriptsCommand::Partial));
-        }
-        Ok(())
+        self.ensure_script_coverage(scripts.into_iter().map(|status| {
+            let script_type = match status.script_type {
+                ScriptType::Lock => IndexedScriptType::Lock,
+                ScriptType::Type => IndexedScriptType::Type,
+            };
+            let status_block = status.block_number.value();
+            let first_indexed_block = if status_block == 0 {
+                0
+            } else {
+                status_block.saturating_add(1)
+            };
+            (status.script, script_type, first_indexed_block)
+        }))
     }
 
     pub(crate) fn handle(&self, method: &'static str, params: Params) -> Result<Value> {
@@ -248,6 +234,27 @@ impl RpcRouter {
         }
 
         let service = LightClientService::new(Arc::clone(&self.storage));
+        if search_mode == SearchMode::Exact {
+            let script = search_key.script.clone();
+            let script_type = copy_script_type(&search_key.script_type);
+            let page = collect_exact_page(
+                limit,
+                after,
+                |page_limit, cursor| {
+                    service
+                        .get_cells(
+                            decode(search_value.clone(), "search_key")?,
+                            decode(order_value.clone(), "order")?,
+                            page_limit,
+                            cursor,
+                        )
+                        .map_err(|err| invalid_params(err.to_string()))
+                },
+                |cell| cell_matches_script(&cell.output, &script, &script_type).then_some(cell),
+            )?;
+            return to_value(page);
+        }
+
         let page = service
             .get_cells(
                 search_key,
@@ -256,25 +263,6 @@ impl RpcRouter {
                 after,
             )
             .map_err(|err| invalid_params(err.to_string()))?;
-
-        if search_mode == SearchMode::Exact {
-            let script = decode::<SearchKey>(search_value, "search_key")?.script;
-            let script_type = decode::<SearchKey>(
-                required_param::<Value>(&params, 0, "search_key")?,
-                "search_key",
-            )?
-            .script_type;
-            let objects = page
-                .objects
-                .into_iter()
-                .filter(|cell| cell_matches_script(&cell.output, &script, &script_type))
-                .collect();
-            return to_value(Pagination {
-                objects,
-                last_cursor: page.last_cursor,
-            });
-        }
-
         to_value(page)
     }
 
@@ -287,7 +275,7 @@ impl RpcRouter {
         validate_limit(limit)?;
 
         let mode = search_mode(&search_value);
-        let search_key = decode::<SearchKey>(search_value, "search_key")?;
+        let search_key = decode::<SearchKey>(search_value.clone(), "search_key")?;
         let exact_match = (mode == SearchMode::Exact).then(|| {
             (
                 search_key.script.clone(),
@@ -307,23 +295,35 @@ impl RpcRouter {
             }
         }
 
-        let mut page = LightClientService::new(Arc::clone(&self.storage))
-            .get_transactions(
-                search_key,
-                decode(order_value, "order")?,
-                Uint32::from(limit),
+        let service = LightClientService::new(Arc::clone(&self.storage));
+        let page = if let Some((script, script_type)) = exact_match {
+            collect_exact_page(
+                limit,
                 after,
-            )
-            .map_err(|err| invalid_params(err.to_string()))?;
-        if let Some((script, script_type)) = exact_match {
-            page.objects = page
-                .objects
-                .into_iter()
-                .filter_map(|transaction| {
+                |page_limit, cursor| {
+                    service
+                        .get_transactions(
+                            decode(search_value.clone(), "search_key")?,
+                            decode(order_value.clone(), "order")?,
+                            page_limit,
+                            cursor,
+                        )
+                        .map_err(|err| invalid_params(err.to_string()))
+                },
+                |transaction| {
                     filter_exact_transaction(transaction, &script, &script_type, &self.storage)
-                })
-                .collect();
-        }
+                },
+            )?
+        } else {
+            service
+                .get_transactions(
+                    search_key,
+                    decode(order_value, "order")?,
+                    Uint32::from(limit),
+                    after,
+                )
+                .map_err(|err| invalid_params(err.to_string()))?
+        };
         indexer_transactions_to_value(page)
     }
 
@@ -504,7 +504,10 @@ impl RpcRouter {
                     internal_error(format!("invalid transaction hash from Light Client: {err}"))
                 })?;
                 if let Some((block_number, _, _)) = self.storage.get_transaction(&packed_hash) {
-                    self.register_transaction_output_scripts(&transaction_view.inner, block_number);
+                    self.register_transaction_output_scripts(
+                        &transaction_view.inner,
+                        block_number,
+                    )?;
                 }
             }
         }
@@ -654,7 +657,7 @@ impl RpcRouter {
             .number
             .value()
             .saturating_add(1);
-        self.register_transaction_output_scripts(&transaction, first_required_block);
+        self.register_transaction_output_scripts(&transaction, first_required_block)?;
 
         to_value(H256::from(tx_hash))
     }
@@ -802,56 +805,20 @@ impl RpcRouter {
         };
         let script: Script = indexed_script.clone().into();
         let service_script_type = indexed_script_type.service_type();
-        let existing_status = statuses.into_iter().find(|status| {
-            status.script == script && same_script_type(&status.script_type, &service_script_type)
-        });
-
-        let mut index_covers_creation = self
-            .indexed_script_starts
-            .lock()
-            .map_err(|_| internal_error("indexed script coverage lock is poisoned"))?
-            .get(&(indexed_script.clone(), indexed_script_type))
-            .is_some_and(|start| *start <= block_number);
-        if let Some(status) = existing_status.as_ref() {
-            if status.block_number.value() < block_number {
-                index_covers_creation = true;
-            }
-        } else {
+        let index_covers_creation =
+            self.script_index_covers_creation(&indexed_script, indexed_script_type, block_number)?;
+        if !index_covers_creation {
             self.rewind_script(&script, indexed_script_type, block_number)?;
-            index_covers_creation = true;
         }
 
         self.wait_script_ready_until(&script, &service_script_type, deadline)?;
-        if self.cell_index_contains_out_point(
+        self.cell_index_contains_out_point(
             &indexed_script,
             indexed_script_type,
             block_number,
             output_index,
             out_point,
-        )? {
-            self.note_indexed_script_start(indexed_script, indexed_script_type, block_number)?;
-            return Ok(true);
-        }
-
-        // A script already at the tip may have been registered after this cell
-        // was created. Rewind it once so an absent UTXO becomes proof that the
-        // output was consumed, rather than merely never indexed.
-        if !index_covers_creation {
-            self.rewind_script(&script, indexed_script_type, block_number)?;
-            self.wait_script_ready_until(&script, &service_script_type, deadline)?;
-        }
-        self.note_indexed_script_start(indexed_script.clone(), indexed_script_type, block_number)?;
-        if self.cell_index_contains_out_point(
-            &indexed_script,
-            indexed_script_type,
-            block_number,
-            output_index,
-            out_point,
-        )? {
-            return Ok(true);
-        }
-
-        Ok(false)
+        )
     }
 
     fn rewind_script(
@@ -860,31 +827,109 @@ impl RpcRouter {
         script_type: IndexedScriptType,
         first_required_block: u64,
     ) -> Result<()> {
-        self.chain_service.set_scripts(
-            vec![ScriptStatus {
-                script: script.clone(),
-                script_type: script_type.service_type(),
-                block_number: BlockNumber::from(first_required_block.saturating_sub(1)),
-            }],
-            Some(SetScriptsCommand::Partial),
-        );
-        self.note_indexed_script_start(script.clone().into(), script_type, first_required_block)
+        self.ensure_script_coverage(std::iter::once((
+            script.clone(),
+            script_type,
+            first_required_block,
+        )))
+        .map_err(internal_error)
     }
 
-    fn note_indexed_script_start(
+    fn script_index_covers_creation(
         &self,
-        script: packed::Script,
+        script: &packed::Script,
         script_type: IndexedScriptType,
-        first_indexed_block: u64,
-    ) -> Result<()> {
+        block_number: u64,
+    ) -> Result<bool> {
+        let key = (script.clone(), script_type);
         let mut starts = self
             .indexed_script_starts
             .lock()
             .map_err(|_| internal_error("indexed script coverage lock is poisoned"))?;
-        starts
-            .entry((script, script_type))
-            .and_modify(|start| *start = (*start).min(first_indexed_block))
-            .or_insert(first_indexed_block);
+        if starts
+            .get(&key)
+            .is_some_and(|first_indexed_block| *first_indexed_block <= block_number)
+        {
+            return Ok(true);
+        }
+
+        let script_json: Script = script.clone().into();
+        let status = self.chain_service.get_scripts().into_iter().find(|status| {
+            status.script == script_json
+                && same_script_type(&status.script_type, &script_type.service_type())
+        });
+        let Some(status) = status else {
+            return Ok(false);
+        };
+        let status_block = status.block_number.value();
+        if status_block >= block_number {
+            return Ok(false);
+        }
+
+        // Seeing an in-progress script below the producing block proves that its
+        // contiguous scan starts no later than the next block. Record that
+        // conservative boundary while script updates are excluded by the lock.
+        let first_indexed_block = if status_block == 0 {
+            0
+        } else {
+            status_block.saturating_add(1)
+        };
+        starts.insert(key, first_indexed_block);
+        Ok(true)
+    }
+
+    /// Register scripts while holding the coverage lock across `set_scripts`.
+    ///
+    /// `SetScriptsCommand::Partial` overwrites a script's stored progress. Keeping
+    /// the comparison, write, and in-memory update in one critical section makes
+    /// the earliest requested start authoritative even when requests race.
+    fn ensure_script_coverage(
+        &self,
+        scripts: impl IntoIterator<Item = (Script, IndexedScriptType, u64)>,
+    ) -> std::result::Result<(), String> {
+        let mut requested = HashMap::<(packed::Script, IndexedScriptType), (Script, u64)>::new();
+        for (script, script_type, first_indexed_block) in scripts {
+            let key = (script.clone().into(), script_type);
+            requested
+                .entry(key)
+                .and_modify(|(_, start)| *start = (*start).min(first_indexed_block))
+                .or_insert((script, first_indexed_block));
+        }
+
+        let mut starts = self
+            .indexed_script_starts
+            .lock()
+            .map_err(|_| "indexed script coverage lock is poisoned".to_string())?;
+        let updates = requested
+            .into_iter()
+            .filter_map(|(key, (script, requested_start))| {
+                let needs_update = starts
+                    .get(&key)
+                    .is_none_or(|known_start| requested_start < *known_start);
+                needs_update.then_some((key, script, requested_start))
+            })
+            .collect::<Vec<_>>();
+        if updates.is_empty() {
+            return Ok(());
+        }
+
+        self.chain_service.set_scripts(
+            updates
+                .iter()
+                .map(|(key, script, first_indexed_block)| ScriptStatus {
+                    script: script.clone(),
+                    script_type: match key.1 {
+                        IndexedScriptType::Lock => ScriptType::Lock,
+                        IndexedScriptType::Type => ScriptType::Type,
+                    },
+                    block_number: BlockNumber::from(first_indexed_block.saturating_sub(1)),
+                })
+                .collect(),
+            Some(SetScriptsCommand::Partial),
+        );
+        for (key, _, requested_start) in updates {
+            starts.insert(key, requested_start);
+        }
         Ok(())
     }
 
@@ -1002,15 +1047,16 @@ impl RpcRouter {
             return Ok(());
         }
 
-        self.chain_service.set_scripts(
-            vec![ScriptStatus {
-                script: search_key.script.clone(),
-                script_type: copy_script_type(&search_key.script_type),
-                block_number: BlockNumber::from(start_block.saturating_sub(1)),
-            }],
-            Some(SetScriptsCommand::Partial),
-        );
-        Ok(())
+        let script_type = match &search_key.script_type {
+            ScriptType::Lock => IndexedScriptType::Lock,
+            ScriptType::Type => IndexedScriptType::Type,
+        };
+        self.ensure_script_coverage(std::iter::once((
+            search_key.script.clone(),
+            script_type,
+            start_block,
+        )))
+        .map_err(internal_error)
     }
 
     fn wait_script_ready(&self, script: &Script, script_type: &ScriptType) -> Result<()> {
@@ -1071,7 +1117,7 @@ impl RpcRouter {
         &self,
         transaction: &Transaction,
         first_required_block: u64,
-    ) {
+    ) -> Result<()> {
         let existing = self.chain_service.get_scripts();
         let mut added = Vec::new();
 
@@ -1083,20 +1129,19 @@ impl RpcRouter {
                     .map(|script| (script, ScriptType::Type)),
             );
             for (script, script_type) in scripts {
-                let already_registered =
-                    existing
-                        .iter()
-                        .chain(added.iter())
-                        .any(|status: &ScriptStatus| {
-                            status.script == *script
-                                && same_script_type(&status.script_type, &script_type)
-                        });
+                let indexed_script_type = match script_type {
+                    ScriptType::Lock => IndexedScriptType::Lock,
+                    ScriptType::Type => IndexedScriptType::Type,
+                };
+                let already_registered = existing.iter().any(|status| {
+                    status.script == *script && same_script_type(&status.script_type, &script_type)
+                }) || added.iter().any(
+                    |(added_script, added_type, _): &(Script, IndexedScriptType, u64)| {
+                        added_script == script && *added_type == indexed_script_type
+                    },
+                );
                 if !already_registered {
-                    added.push(ScriptStatus {
-                        script: script.clone(),
-                        script_type,
-                        block_number: BlockNumber::from(first_required_block.saturating_sub(1)),
-                    });
+                    added.push((script.clone(), indexed_script_type, first_required_block));
                 }
             }
         }
@@ -1106,9 +1151,9 @@ impl RpcRouter {
                 script_count = added.len(),
                 first_required_block, "registered scripts discovered in a transaction"
             );
-            self.chain_service
-                .set_scripts(added, Some(SetScriptsCommand::Partial));
+            self.ensure_script_coverage(added).map_err(internal_error)?;
         }
+        Ok(())
     }
 }
 
@@ -1263,6 +1308,50 @@ fn validate_limit(limit: u32) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// Fill one exact-match page from a source whose primary-script lookup is only
+/// prefix-aware. Each source request is capped at the number of exact results
+/// still needed, so the returned cursor never skips an unreturned exact match.
+fn collect_exact_page<T>(
+    limit: u32,
+    after: Option<JsonBytes>,
+    mut fetch: impl FnMut(Uint32, Option<JsonBytes>) -> Result<Pagination<T>>,
+    mut exact_match: impl FnMut(T) -> Option<T>,
+) -> Result<Pagination<T>> {
+    let mut objects = Vec::with_capacity(limit as usize);
+    let mut cursor = after;
+    let mut last_cursor = cursor
+        .clone()
+        .unwrap_or_else(|| JsonBytes::from_vec(Vec::new()));
+
+    while objects.len() < limit as usize {
+        let remaining = limit - objects.len() as u32;
+        let page = fetch(Uint32::from(remaining), cursor.clone())?;
+        let source_is_exhausted = page.objects.is_empty();
+        let next_cursor = page.last_cursor;
+        let cursor_advanced = cursor.as_ref() != Some(&next_cursor);
+
+        if !source_is_exhausted {
+            last_cursor = next_cursor.clone();
+        }
+        objects.extend(page.objects.into_iter().filter_map(&mut exact_match));
+
+        if source_is_exhausted {
+            break;
+        }
+        if !cursor_advanced {
+            return Err(internal_error(
+                "Light Client prefix pagination cursor did not advance",
+            ));
+        }
+        cursor = Some(next_cursor);
+    }
+
+    Ok(Pagination {
+        objects,
+        last_cursor,
+    })
 }
 
 fn copy_script_type(script_type: &ScriptType) -> ScriptType {
@@ -1528,6 +1617,8 @@ fn internal_error(message: impl Into<String>) -> Error {
 
 #[cfg(test)]
 mod tests {
+    use ckb_jsonrpc_types::JsonBytes;
+    use ckb_light_client_lib::service::Pagination;
     use ckb_types::{
         core::{EpochNumberWithFraction, HeaderBuilder},
         packed,
@@ -1535,7 +1626,7 @@ mod tests {
     use jsonrpc_core::ErrorCode;
 
     use super::{
-        map_send_transaction_error, resolve_epoch_view_for_fiber, route_method,
+        collect_exact_page, map_send_transaction_error, resolve_epoch_view_for_fiber, route_method,
         PendingInputReservations, Route, POOL_REJECTED_TRANSACTION_BY_MIN_FEE_RATE,
         TRANSACTION_FAILED_TO_RESOLVE, TRANSACTION_FAILED_TO_VERIFY,
     };
@@ -1640,6 +1731,35 @@ mod tests {
         assert!(reservations
             .conflicting_owner(std::slice::from_ref(&input), &second)
             .is_none());
+    }
+
+    #[test]
+    fn exact_pagination_continues_past_prefix_only_results() {
+        let source = [1u8, 2, 3, 4];
+        let mut requested_limits = Vec::new();
+        let page = collect_exact_page(
+            2,
+            None,
+            |limit, after| {
+                requested_limits.push(limit.value());
+                let start = after
+                    .as_ref()
+                    .and_then(|cursor| cursor.as_bytes().first())
+                    .copied()
+                    .unwrap_or_default() as usize;
+                let end = (start + limit.value() as usize).min(source.len());
+                Ok(Pagination {
+                    objects: source[start..end].to_vec(),
+                    last_cursor: JsonBytes::from_vec(vec![end as u8]),
+                })
+            },
+            |value| (value % 2 == 0).then_some(value),
+        )
+        .unwrap();
+
+        assert_eq!(page.objects, vec![2, 4]);
+        assert_eq!(page.last_cursor.as_bytes(), &[4]);
+        assert_eq!(requested_limits, vec![2, 1, 1]);
     }
 
     #[test]
