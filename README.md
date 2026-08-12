@@ -31,6 +31,32 @@ reported as `FIBER_FFI_STATUS_INVALID_ARGUMENT`. Complex CKB objects such as
 sub-objects through dedicated `*_json` fields, so callers no longer need to
 build the full RPC request JSON.
 
+## Preparing CKB before Fiber starts
+
+`fiber_prepare_ckb` gives mobile applications an asynchronous pre-start step.
+The function always exists, regardless of the selected Cargo features, and its
+completion callback is never invoked inline on the calling stack. Android and
+iOS bridges should dispatch it onto their main event loop before updating UI.
+
+- With `disable-ckb-rpc`, it starts the embedded CKB Light Client, waits for its
+  verified chain data and required scripts, and keeps the prepared instance
+  alive. The next `fiber_start` with the same `config_path` and
+  `database_prefix` reuses that instance.
+- Without `disable-ckb-rpc`, it asynchronously succeeds with
+  `{"ready":true,"mode":"external_rpc","skipped":true}` and leaves the
+  existing external-RPC startup behavior unchanged.
+
+Applications must keep the config file contents, config path, database
+directory, and CKB funding key unchanged between preparation and `fiber_start`.
+If Fiber is started while CKB is still preparing, the start call fails and the
+application should wait for the completion callback before retrying.
+
+For a public-testnet demo, set `ckb_light_client.history_start_block` to a
+trusted block at or before both the wallet's earliest relevant cell and every
+configured Type ID deployment. Scanning from `0x0` is correct for recovery but
+can take far longer than an interactive demo; moving the start forward without
+checking those two bounds can hide spendable cells or contract dependencies.
+
 ## Dependency
 
 The original crate depended on `fnn` through the fiber workspace path:
@@ -111,3 +137,15 @@ WSL, Linux, macOS, or Git Bash:
 ```sh
 make build-android
 ```
+
+For the Android `Prepare CKB` demo with no full-node RPC dependency, build the
+library with the embedded portable Light Client enabled:
+
+```sh
+make build-android MOBILE_FEATURES="sqlite ckb-light-client-portable"
+```
+
+Copy the resulting `libfiber_ffi.so` into
+`demos/android/app/src/main/jniLibs/arm64-v8a/` before building the APK. A
+library built with the default `sqlite` feature still exposes
+`fiber_prepare_ckb`, but reports `mode: external_rpc` and `skipped: true`.

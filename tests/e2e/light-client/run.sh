@@ -215,4 +215,5 @@ FIBER_SECRET_KEY_PASSWORD=password1 "$runner" "$light_client_config" 2>&1 | tee 
 
 grep -q "embedded CKB Light Client is ready" "$ffi_log"
 grep -q "embedded CKB Light Client RPC gateway started" "$ffi_log"
-grep -q "redirected Fiber CKB RPC to the embedded Light Client gateway" "$ffi_log"
+grep -q 'fiber_prepare_ckb: {"mode":"light_client","ready":true,"skipped":false}' "$ffi_log"
+grep -q "reusing prepared embedded CKB Light Client gateway" "$ffi_log"

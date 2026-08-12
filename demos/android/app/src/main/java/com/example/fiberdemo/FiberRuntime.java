@@ -60,11 +60,53 @@ public final class FiberRuntime {
     };
     private static final SecureRandom SECURE_RANDOM = new SecureRandom();
     private static final List<NativeEventListener> nativeEventListeners = new CopyOnWriteArrayList<>();
+    private static final List<CkbPrepareListener> ckbPrepareListeners = new CopyOnWriteArrayList<>();
     private static boolean running;
+    private static boolean ckbPreparing;
+    private static boolean ckbReady;
     private static boolean nativeLibrariesLoaded;
     private static String nativeLoadError;
 
     private FiberRuntime() {
+    }
+
+    public static synchronized String prepareCkb(Context context) {
+        String loadError = ensureNativeLibrariesLoaded();
+        if (loadError != null) {
+            return loadError;
+        }
+        if (running) {
+            return "CKB preparation skipped: Fiber is already running";
+        }
+        if (ckbPreparing) {
+            return "CKB preparation already in progress";
+        }
+
+        try {
+            File configFile = ensureConfigFile(context.getApplicationContext());
+            File dataDir = new File(context.getFilesDir(), "fiber-data");
+            if (!dataDir.exists() && !dataDir.mkdirs()) {
+                return "CKB preparation failed: cannot create data directory";
+            }
+            if (!hasCkbKey(context)) {
+                return "CKB preparation failed: CKB private key is not set";
+            }
+
+            ckbPreparing = true;
+            ckbReady = false;
+            String result = nativePrepareCkb(
+                    configFile.getAbsolutePath(),
+                    dataDir.getAbsolutePath(),
+                    "info"
+            );
+            if (!result.equals("CKB preparation started")) {
+                ckbPreparing = false;
+            }
+            return result;
+        } catch (IOException exception) {
+            ckbPreparing = false;
+            return "CKB preparation failed: " + exception.getMessage();
+        }
     }
 
     public static synchronized String start(Context context) {
@@ -89,6 +131,9 @@ public final class FiberRuntime {
                     "info"
             );
             running = result.startsWith("Fiber started") || result.equals("Fiber already running");
+            if (running) {
+                ckbReady = false;
+            }
             return result;
         } catch (IOException exception) {
             return "Fiber start failed: " + exception.getMessage();
@@ -103,6 +148,7 @@ public final class FiberRuntime {
 
         String result = nativeStop();
         running = false;
+        ckbReady = false;
         return result;
     }
 
@@ -203,6 +249,14 @@ public final class FiberRuntime {
         return running;
     }
 
+    public static synchronized boolean isCkbPreparing() {
+        return ckbPreparing;
+    }
+
+    public static synchronized boolean isCkbReady() {
+        return ckbReady;
+    }
+
     public static boolean hasCkbKey(Context context) {
         return getCkbKeyFile(context.getApplicationContext()).exists()
                 && getSavedPubkeyHash(context.getApplicationContext()) != null;
@@ -229,6 +283,9 @@ public final class FiberRuntime {
         }
         try (FileOutputStream output = new FileOutputStream(keyFile)) {
             output.write((normalizedKey + "\n").getBytes(StandardCharsets.US_ASCII));
+        }
+        synchronized (FiberRuntime.class) {
+            ckbReady = false;
         }
 
         context.getApplicationContext()
@@ -262,6 +319,14 @@ public final class FiberRuntime {
 
     public static void removeNativeEventListener(NativeEventListener listener) {
         nativeEventListeners.remove(listener);
+    }
+
+    public static void addCkbPrepareListener(CkbPrepareListener listener) {
+        ckbPrepareListeners.add(listener);
+    }
+
+    public static void removeCkbPrepareListener(CkbPrepareListener listener) {
+        ckbPrepareListeners.remove(listener);
     }
 
     private static File ensureConfigFile(Context context) throws IOException {
@@ -605,6 +670,14 @@ public final class FiberRuntime {
         }
     }
 
+    private static synchronized void onCkbPrepared(int status, String resultJson) {
+        ckbPreparing = false;
+        ckbReady = status == 0;
+        for (CkbPrepareListener listener : ckbPrepareListeners) {
+            listener.onCkbPrepared(status, resultJson);
+        }
+    }
+
     private static NativeResult fromNativeCall(String value) {
         NativeResult result = NativeResult.fromPrefixed(value);
         if (!result.success && result.error != null && result.error.contains("node is not running")) {
@@ -632,6 +705,8 @@ public final class FiberRuntime {
         }
     }
 
+    private static native String nativePrepareCkb(String configPath, String databasePrefix, String logLevel);
+
     private static native String nativeStart(String configPath, String databasePrefix, String logLevel);
 
     private static native String nativeStop();
@@ -654,6 +729,10 @@ public final class FiberRuntime {
 
     public interface NativeEventListener {
         void onNativeEvent(String eventJson);
+    }
+
+    public interface CkbPrepareListener {
+        void onCkbPrepared(int status, String resultJson);
     }
 
     public static final class CkbAccount {

@@ -20,5 +20,18 @@ program alignment (4096) cannot be smaller than system page size (16384)
 
 The JNI bridge links `libfiber_ffi.so` directly and calls the exported functions from `fiber_ffi.h`:
 
+- `fiber_prepare_ckb(...)`
 - `fiber_start(const FiberStartOptions *options, FiberHandle **out_handle)`
 - `fiber_stop(FiberHandle *handle)`
+
+To exercise the `Prepare CKB` button with the embedded Light Client rather than
+the asynchronous external-RPC no-op, build from the repository root with:
+
+```sh
+make build-android MOBILE_FEATURES="sqlite ckb-light-client-portable"
+```
+
+The bundled testnet config starts its first-run scan at `0x125bae1`, the block
+containing the oldest configured Fiber contract dependency. This is suitable
+for a fresh demo wallet. Move `ckb_light_client.history_start_block` back to the
+earliest relevant block before importing an older funded wallet.

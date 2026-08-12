@@ -42,11 +42,17 @@ public class MainActivity extends AppCompatActivity {
     private final SimpleDateFormat logTimeFormat = new SimpleDateFormat("HH:mm:ss", Locale.US);
     private final FiberRuntime.NativeEventListener nativeEventListener =
             eventJson -> runOnUiThread(() -> appendLog("event: " + eventJson));
+    private final FiberRuntime.CkbPrepareListener ckbPrepareListener =
+            (status, resultJson) -> runOnUiThread(() -> {
+                appendLog("CKB preparation completed: " + resultJson);
+                updateHomeButtons();
+            });
 
     private LinearLayout contentView;
     private TextView logView;
     private ScrollView logScrollView;
     private Button startStopButton;
+    private Button prepareCkbButton;
     private Button ckbKeyButton;
     private Button nodeInfoButton;
     private Button peersButton;
@@ -69,6 +75,7 @@ public class MainActivity extends AppCompatActivity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         FiberRuntime.addNativeEventListener(nativeEventListener);
+        FiberRuntime.addCkbPrepareListener(ckbPrepareListener);
 
         int padding = getResources().getDimensionPixelSize(R.dimen.screen_padding);
 
@@ -123,6 +130,7 @@ public class MainActivity extends AppCompatActivity {
     @Override
     protected void onDestroy() {
         FiberRuntime.removeNativeEventListener(nativeEventListener);
+        FiberRuntime.removeCkbPrepareListener(ckbPrepareListener);
         executor.shutdownNow();
         super.onDestroy();
     }
@@ -160,6 +168,10 @@ public class MainActivity extends AppCompatActivity {
         ckbKeyButton.setAllCaps(false);
         ckbKeyButton.setOnClickListener(view -> handleCkbKeyButton());
 
+        prepareCkbButton = new Button(this);
+        prepareCkbButton.setAllCaps(false);
+        prepareCkbButton.setOnClickListener(view -> prepareCkb());
+
         startStopButton = new Button(this);
         startStopButton.setAllCaps(false);
         startStopButton.setOnClickListener(view -> toggleNode());
@@ -170,6 +182,7 @@ public class MainActivity extends AppCompatActivity {
         nodeInfoButton.setOnClickListener(view -> refreshNodeInfo());
 
         buttonRow.addView(ckbKeyButton, weightedWrapParams(1f));
+        buttonRow.addView(prepareCkbButton, weightedWrapParams(1f));
         buttonRow.addView(startStopButton, weightedWrapParams(1f));
         buttonRow.addView(nodeInfoButton, weightedWrapParams(1f));
         contentView.addView(buttonRow, matchWrapParams());
@@ -362,6 +375,16 @@ public class MainActivity extends AppCompatActivity {
                 }
             });
         }
+    }
+
+    private void prepareCkb() {
+        if (!FiberRuntime.hasCkbKey(this)) {
+            appendLog("Prepare CKB skipped: CKB private key is not set");
+            showCkbKeyDialog();
+            return;
+        }
+        appendLog(FiberRuntime.prepareCkb(this));
+        updateHomeButtons();
     }
 
     private void handleCkbKeyButton() {
@@ -999,7 +1022,17 @@ public class MainActivity extends AppCompatActivity {
         }
         if (startStopButton != null) {
             startStopButton.setText(running ? R.string.fiber_stop : R.string.fiber_start);
-            startStopButton.setEnabled(running || hasCkbKey);
+            startStopButton.setEnabled(running || (hasCkbKey && !FiberRuntime.isCkbPreparing()));
+        }
+        if (prepareCkbButton != null) {
+            if (FiberRuntime.isCkbPreparing()) {
+                prepareCkbButton.setText("Preparing CKB…");
+            } else if (FiberRuntime.isCkbReady()) {
+                prepareCkbButton.setText("CKB Ready");
+            } else {
+                prepareCkbButton.setText("Prepare CKB");
+            }
+            prepareCkbButton.setEnabled(!running && hasCkbKey && !FiberRuntime.isCkbPreparing());
         }
         if (nodeInfoButton != null) {
             nodeInfoButton.setEnabled(running);
@@ -1020,7 +1053,15 @@ public class MainActivity extends AppCompatActivity {
             ckbKeyButton.setEnabled(!busy);
         }
         if (startStopButton != null) {
-            startStopButton.setEnabled(!busy && (FiberRuntime.isRunning() || FiberRuntime.hasCkbKey(this)));
+            startStopButton.setEnabled(!busy
+                    && (FiberRuntime.isRunning()
+                    || (FiberRuntime.hasCkbKey(this) && !FiberRuntime.isCkbPreparing())));
+        }
+        if (prepareCkbButton != null) {
+            prepareCkbButton.setEnabled(!busy
+                    && !FiberRuntime.isRunning()
+                    && FiberRuntime.hasCkbKey(this)
+                    && !FiberRuntime.isCkbPreparing());
         }
         if (nodeInfoButton != null) {
             nodeInfoButton.setEnabled(!busy && FiberRuntime.isRunning());

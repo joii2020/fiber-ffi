@@ -7,6 +7,7 @@ IOS_DEPLOYMENT_TARGET ?= 15.0
 ANDROID_API ?= 23
 ANDROID_TARGET ?= aarch64-linux-android
 ANDROID_RUSTFLAGS ?= -C link-arg=-Wl,-z,max-page-size=16384
+MOBILE_FEATURES ?= sqlite
 
 ANDROID_HOST_TAG ?= $(notdir $(firstword $(wildcard $(ANDROID_NDK_HOME)/toolchains/llvm/prebuilt/*)))
 ANDROID_TOOLCHAIN_DIR ?= $(ANDROID_NDK_HOME)/toolchains/llvm/prebuilt/$(ANDROID_HOST_TAG)
@@ -49,7 +50,7 @@ build-ios:
 		CARGO_TARGET_$${target_env}_LINKER="$$clang" \
 		OPENSSL_STATIC=1 \
 		RUSTFLAGS="$(IOS_RUSTFLAGS) -C link-arg=$$min_flag $${RUSTFLAGS:-}" \
-		$(CARGO) build --release --locked --target "$$target" --no-default-features --features "sqlite"
+		$(CARGO) build --release --locked --target "$$target" --no-default-features --features "$(MOBILE_FEATURES)"
 
 build-ios-sim:
 	@set -e; \
@@ -79,7 +80,7 @@ build-ios-sim:
 		CARGO_TARGET_$${target_env}_LINKER="$$clang" \
 		OPENSSL_STATIC=1 \
 		RUSTFLAGS="$(IOS_RUSTFLAGS) -C link-arg=$$min_flag $${RUSTFLAGS:-}" \
-		$(CARGO) build --release --locked --target "$$target" --no-default-features --features "sqlite"
+		$(CARGO) build --release --locked --target "$$target" --no-default-features --features "$(MOBILE_FEATURES)"
 
 build-android:
 	@set -e; \
@@ -100,4 +101,4 @@ build-android:
 		CARGO_TARGET_$${target_env}_LINKER="$$linker" \
 		RUSTFLAGS="$(ANDROID_RUSTFLAGS) $${RUSTFLAGS:-}" \
 		BINDGEN_EXTRA_CLANG_ARGS="--sysroot=$(ANDROID_TOOLCHAIN_DIR)/sysroot --target=$(ANDROID_TARGET) -D__ANDROID_API__=$(ANDROID_API)" \
-		$(CARGO) build --release --locked --target "$(ANDROID_TARGET)" --no-default-features --features sqlite; \
+		$(CARGO) build --release --locked --target "$(ANDROID_TARGET)" --no-default-features --features "$(MOBILE_FEATURES)"; \

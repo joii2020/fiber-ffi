@@ -291,7 +291,25 @@ typedef enum FiberFfiStatus {
   FIBER_FFI_STATUS_PANIC = 5,
 } FiberFfiStatus;
 
+/* result_json is borrowed and is valid only for the duration of the callback. */
+typedef void (*fiber_ckb_prepare_callback)(FiberFfiStatus status,
+                                           const char *result_json,
+                                           void *user_data);
+
 const char *fiber_version(void);
+
+/*
+ * Asynchronously prepares the CKB backend used by the next fiber_start call.
+ * A return value of OK means the request was accepted; completion is reported
+ * exactly once through callback. The callback is never invoked inline.
+ *
+ * With disable-ckb-rpc, this starts and synchronizes the embedded Light Client
+ * and keeps it alive for a matching fiber_start call. Without that feature, it
+ * asynchronously reports {"ready":true,"mode":"external_rpc","skipped":true}.
+ */
+FiberFfiStatus fiber_prepare_ckb(const FiberStartOptions *options,
+                                 fiber_ckb_prepare_callback callback,
+                                 void *callback_user_data);
 
 FiberFfiStatus fiber_start(const FiberStartOptions *options,
                            FiberHandle **out_handle);

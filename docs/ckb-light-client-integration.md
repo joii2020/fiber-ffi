@@ -55,7 +55,7 @@ flowchart LR
 ### 2.1 第一版必须做到
 
 - 不修改 Fiber 源码，实现 Fiber 目前会用到的 CKB RPC 方法。
-- 保持现有 `fiber-ffi` C API 不变。用 Cargo 功能开关选择数据来源。普通的主网和测试网运行不要求用户填写 Light Client 配置。
+- 保持原有 `fiber_start` 兼容，并增加稳定的异步 `fiber_prepare_ckb` C API。用 Cargo 功能开关选择数据来源。普通的主网和测试网运行不要求用户填写 Light Client 配置。
 - 不传 `disable-ckb-rpc` 时，编译结果和现有的外部 RPC 行为保持不变。
 - Light Client 遇到无法处理的请求时，不得因为失败而临时改用外部 RPC。
 - 只启动 Fiber 所需的 Light Client 服务。所有无关功能默认关闭，而且不提供运行时开关重新开启。
@@ -234,6 +234,17 @@ CKB P2P 网络只保留以下能力：
 
 ### 5.1 启动
 
+移动端可以先调用 `fiber_prepare_ckb(options, callback, user_data)`，把链头和
+启动所需脚本的同步放到显式的准备阶段。开启 `disable-ckb-rpc` 时，成功回调后
+Light Client 继续存活；下一次使用同一配置文件和数据目录的 `fiber_start`
+直接接管该实例。未开启该功能时，这个 API 仍异步成功，并通过 JSON 返回
+`mode: external_rpc`、`skipped: true`。回调不在调用栈内同步执行，回调中的
+JSON 只在回调期间有效。
+
+为兼容已有调用方，不先调用 `fiber_prepare_ckb` 也可以直接调用 `fiber_start`，
+此时仍在启动过程中完成 Light Client 准备。如果准备还没有完成就调用
+`fiber_start`，调用会明确失败，应用应等待准备回调后重试。
+
 ```mermaid
 sequenceDiagram
     participant App
@@ -242,13 +253,15 @@ sequenceDiagram
     participant GW as RPC 转换服务
     participant Fiber
 
-    App->>FFI: fiber_start(config)
+    App->>FFI: fiber_prepare_ckb(config, callback)
     FFI->>FFI: 读取 Fiber 配置和少量可选项
     FFI->>LC: 打开数据库，启动只出站的 P2P 网络
     FFI->>GW: 绑定 127.0.0.1:0
     FFI->>LC: 注册启动必需脚本
     FFI->>LC: 等待区块头准备完成
     FFI->>LC: 等待启动必需脚本扫描到所需高度
+    FFI-->>App: callback(ready)
+    App->>FFI: fiber_start(same config)
     FFI->>FFI: ckb_config.rpc_url = GW.rpc_url
     FFI->>Fiber: 执行现有 start_node 后半段
     Fiber->>GW: CKB RPC

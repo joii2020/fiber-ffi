@@ -99,6 +99,13 @@ ckb:
             args: "0x97d30b723c0b2c66e9cb8d4d0df4ab5d7222cbb00d4a9a2055ce2e5d7f0d8b0f"
       auto_accept_amount: 1000000000
 
+# Public-testnet demo scan origin. This covers the Fiber contract and RUSD
+# deployments used above, while avoiding a first-run scan from genesis. If you
+# import a wallet that received cells before this block, move it back to the
+# wallet's earliest relevant block (or use 0x0 for a full recovery scan).
+ckb_light_client:
+  history_start_block: "0x125bae1"
+
 services:
   - fiber
   - rpc

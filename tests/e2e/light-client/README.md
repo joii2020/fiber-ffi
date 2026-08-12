@@ -7,7 +7,7 @@ IDs, adds the custom-chain `ckb_light_client.bootnodes` entries, and exercises t
 shared library through the public C ABI:
 
 ```text
-fiber_start -> fiber_node_info -> fiber_stop
+fiber_prepare_ckb -> callback -> fiber_start -> fiber_node_info -> fiber_stop
 ```
 
 The Fiber checkout is never modified. Its fixtures are copied before the
@@ -52,7 +52,9 @@ FIBER_SOURCE_DIR=/path/to/fiber KEEP_E2E_WORKDIR=1 make e2e-light-client
 The harness now asserts that the embedded Light Client obtains data from four
 peers, scans every startup-required script to its verified tip, starts the local
 loopback RPC gateway, and rewrites Fiber's in-memory CKB RPC URL before Fiber
-starts. The generated Fiber configuration deliberately points its legacy
+starts. The harness now also proves that `fiber_start` can take over the
+already-running Light Client prepared by the asynchronous C ABI. The generated
+Fiber configuration deliberately points its legacy
 `ckb.rpc_url` at the unreachable `127.0.0.1:1`, so a successful run also proves
 startup has no full-node HTTP RPC dependency. It checks the complete public C
 ABI start/info/stop lifecycle.

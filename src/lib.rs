@@ -11,6 +11,9 @@ use std::{
     thread::{self, JoinHandle},
 };
 
+#[cfg(feature = "disable-ckb-rpc")]
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use ckb_chain_spec::ChainSpec;
 use ckb_resource::Resource;
 use clap_serde_derive::ClapSerde;
@@ -59,6 +62,7 @@ pub enum FiberFfiStatus {
 }
 
 pub type FiberEventCallback = unsafe extern "C" fn(*const c_char, *mut c_void);
+pub type FiberCkbPrepareCallback = unsafe extern "C" fn(FiberFfiStatus, *const c_char, *mut c_void);
 
 #[repr(C)]
 pub struct FiberStartOptions {
@@ -328,6 +332,15 @@ struct EventCallback {
 unsafe impl Send for EventCallback {}
 unsafe impl Sync for EventCallback {}
 
+#[derive(Copy, Clone)]
+struct CkbPrepareCallback {
+    callback: FiberCkbPrepareCallback,
+    user_data: usize,
+}
+
+unsafe impl Send for CkbPrepareCallback {}
+unsafe impl Sync for CkbPrepareCallback {}
+
 pub struct FiberHandle {
     stop_tx: Mutex<Option<oneshot::Sender<()>>>,
     thread: Mutex<Option<JoinHandle<()>>>,
@@ -347,8 +360,50 @@ enum StartupMessage {
     Failed(String),
 }
 
+#[cfg(feature = "disable-ckb-rpc")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CkbPreparationKey {
+    config_path: String,
+    database_prefix: Option<String>,
+    config_contents_hash: String,
+    funding_pubkey_hash: String,
+}
+
+#[cfg(feature = "disable-ckb-rpc")]
+struct PreparedCkbWorker {
+    id: u64,
+    key: CkbPreparationKey,
+    start_tx: oneshot::Sender<PreparedCkbStartCommand>,
+    thread: Option<JoinHandle<()>>,
+}
+
+#[cfg(feature = "disable-ckb-rpc")]
+enum CkbPreparationState {
+    Idle,
+    Preparing(PreparedCkbWorker),
+    Ready(PreparedCkbWorker),
+    InUse(CkbPreparationKey),
+}
+
+#[cfg(feature = "disable-ckb-rpc")]
+struct PreparedCkbStartCommand {
+    callback: Option<EventCallback>,
+    startup_tx: std_mpsc::Sender<StartupMessage>,
+    stop_rx: oneshot::Receiver<()>,
+}
+
+#[derive(Default)]
+struct PreparedCkbStart {
+    #[cfg(feature = "disable-ckb-rpc")]
+    local_ckb: Option<ckb_light_client::LocalCkbNodeHandle>,
+}
+
 static INIT_LOGGING: Once = Once::new();
 static CHAIN_HASH_STATE: Mutex<Option<String>> = Mutex::new(None);
+#[cfg(feature = "disable-ckb-rpc")]
+static CKB_PREPARATION_STATE: Mutex<CkbPreparationState> = Mutex::new(CkbPreparationState::Idle);
+#[cfg(feature = "disable-ckb-rpc")]
+static NEXT_CKB_PREPARATION_ID: AtomicU64 = AtomicU64::new(1);
 
 thread_local! {
     static LAST_ERROR: RefCell<Option<String>> = const { RefCell::new(None) };
@@ -357,6 +412,66 @@ thread_local! {
 #[no_mangle]
 pub extern "C" fn fiber_version() -> *const c_char {
     concat!(env!("CARGO_PKG_VERSION"), "\0").as_ptr() as *const c_char
+}
+
+/// Prepare the CKB backend used by the next `fiber_start` call.
+///
+/// The completion callback is never invoked inline. Its JSON string is borrowed
+/// and is only valid for the duration of the callback.
+///
+/// # Safety
+///
+/// `options` and its referenced strings must remain valid for this call.
+/// `completion_callback_user_data` must remain valid until the callback returns,
+/// according to the ownership rules chosen by the caller.
+#[no_mangle]
+pub unsafe extern "C" fn fiber_prepare_ckb(
+    options: *const FiberStartOptions,
+    completion_callback: Option<FiberCkbPrepareCallback>,
+    completion_callback_user_data: *mut c_void,
+) -> FiberFfiStatus {
+    ffi_boundary(|| {
+        let options = checked_options(options)?;
+        let completion_callback = completion_callback.ok_or_else(|| {
+            ffi_error(
+                FiberFfiStatus::NullPointer,
+                "completion_callback must be non-null",
+            )
+        })?;
+        let config_path = required_string(options.config_path, "config_path")?;
+        let database_prefix = optional_string(options.database_prefix)?;
+        let log_level = optional_string(options.log_level)?.unwrap_or_else(|| "info".to_string());
+        let callback = CkbPrepareCallback {
+            callback: completion_callback,
+            user_data: completion_callback_user_data as usize,
+        };
+
+        init_logging(&log_level);
+
+        #[cfg(not(feature = "disable-ckb-rpc"))]
+        let _ = (&config_path, &database_prefix);
+
+        #[cfg(feature = "disable-ckb-rpc")]
+        schedule_embedded_ckb_preparation(config_path, database_prefix, callback)?;
+
+        #[cfg(not(feature = "disable-ckb-rpc"))]
+        thread::Builder::new()
+            .name("fiber-ffi-prepare-ckb".to_string())
+            .spawn(move || {
+                emit_ckb_prepare_completion(
+                    callback,
+                    FiberFfiStatus::Ok,
+                    json!({
+                        "ready": true,
+                        "mode": "external_rpc",
+                        "skipped": true,
+                    }),
+                );
+            })
+            .map_err(|err| ffi_error(FiberFfiStatus::StartupFailed, err.to_string()))?;
+
+        Ok(FiberFfiStatus::Ok)
+    })
 }
 
 #[no_mangle]
@@ -387,59 +502,47 @@ pub unsafe extern "C" fn fiber_start(
 
         let (startup_tx, startup_rx) = std_mpsc::channel();
         let (stop_tx, stop_rx) = oneshot::channel();
-        let thread = thread::Builder::new()
-            .name("fiber-ffi-runtime".to_string())
-            .spawn(move || {
-                let runtime = match tokio::runtime::Builder::new_multi_thread()
-                    .enable_all()
-                    .build()
+        #[cfg(feature = "disable-ckb-rpc")]
+        let thread = match take_prepared_ckb_worker(ckb_preparation_key(
+            config_path.clone(),
+            database_prefix.clone(),
+        )?)? {
+            Some(mut worker) => {
+                let worker_key = worker.key.clone();
+                if worker
+                    .start_tx
+                    .send(PreparedCkbStartCommand {
+                        callback,
+                        startup_tx: startup_tx.clone(),
+                        stop_rx,
+                    })
+                    .is_err()
                 {
-                    Ok(runtime) => runtime,
-                    Err(err) => {
-                        let _ = startup_tx.send(StartupMessage::Failed(format!(
-                            "failed to create tokio runtime: {err}"
-                        )));
-                        return;
-                    }
-                };
-
-                let runtime_handle = runtime.handle().clone();
-                let startup_tx_for_panic = startup_tx.clone();
-                let startup_result = catch_unwind(AssertUnwindSafe(|| {
-                    runtime.block_on(async move {
-                        match start_node(config_path, database_prefix, callback).await {
-                            Ok(node) => {
-                                let network_actor = node.network_actor.clone();
-                                let store = node.store.clone();
-                                let fiber_config = node.fiber_config.clone();
-                                let _ = startup_tx.send(StartupMessage::Started {
-                                    runtime_handle,
-                                    network_actor,
-                                    store,
-                                    fiber_config: Box::new(fiber_config),
-                                });
-                                stop_node_on_signal(node, stop_rx).await;
-                            }
-                            Err(err) => {
-                                let _ = startup_tx.send(StartupMessage::Failed(err));
-                            }
-                        }
-                    });
-                }));
-                if let Err(err) = startup_result {
-                    let message = if let Some(message) = err.downcast_ref::<&str>() {
-                        (*message).to_string()
-                    } else if let Some(message) = err.downcast_ref::<String>() {
-                        message.clone()
-                    } else {
-                        "unknown panic".to_string()
-                    };
-                    let _ = startup_tx_for_panic.send(StartupMessage::Failed(format!(
-                        "runtime thread panicked during startup: {message}"
-                    )));
+                    clear_ckb_in_use(&worker_key);
+                    return Err(ffi_error(
+                        FiberFfiStatus::StartupFailed,
+                        "prepared CKB runtime exited before Fiber could start",
+                    ));
                 }
-            })
-            .map_err(|err| ffi_error(FiberFfiStatus::StartupFailed, err.to_string()))?;
+                match worker.thread.take() {
+                    Some(thread) => thread,
+                    None => {
+                        clear_ckb_in_use(&worker_key);
+                        return Err(ffi_error(
+                            FiberFfiStatus::Panic,
+                            "prepared CKB runtime thread is missing",
+                        ));
+                    }
+                }
+            }
+            None => {
+                spawn_fiber_runtime(config_path, database_prefix, callback, startup_tx, stop_rx)?
+            }
+        };
+
+        #[cfg(not(feature = "disable-ckb-rpc"))]
+        let thread =
+            spawn_fiber_runtime(config_path, database_prefix, callback, startup_tx, stop_rx)?;
 
         match startup_rx.recv() {
             Ok(StartupMessage::Started {
@@ -472,6 +575,419 @@ pub unsafe extern "C" fn fiber_start(
             }
         }
     })
+}
+
+fn spawn_fiber_runtime(
+    config_path: String,
+    database_prefix: Option<String>,
+    callback: Option<EventCallback>,
+    startup_tx: std_mpsc::Sender<StartupMessage>,
+    stop_rx: oneshot::Receiver<()>,
+) -> FfiCallResult<JoinHandle<()>> {
+    thread::Builder::new()
+        .name("fiber-ffi-runtime".to_string())
+        .spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(err) => {
+                    let _ = startup_tx.send(StartupMessage::Failed(format!(
+                        "failed to create tokio runtime: {err}"
+                    )));
+                    return;
+                }
+            };
+
+            let runtime_handle = runtime.handle().clone();
+            let startup_tx_for_panic = startup_tx.clone();
+            let startup_result = catch_unwind(AssertUnwindSafe(|| {
+                runtime.block_on(run_fiber_node(
+                    runtime_handle,
+                    config_path,
+                    database_prefix,
+                    callback,
+                    startup_tx,
+                    stop_rx,
+                    PreparedCkbStart::default(),
+                ));
+            }));
+            if let Err(err) = startup_result {
+                let _ = startup_tx_for_panic.send(StartupMessage::Failed(format!(
+                    "runtime thread panicked during startup: {}",
+                    panic_message(err)
+                )));
+            }
+        })
+        .map_err(|err| ffi_error(FiberFfiStatus::StartupFailed, err.to_string()))
+}
+
+async fn run_fiber_node(
+    runtime_handle: TokioHandle,
+    config_path: String,
+    database_prefix: Option<String>,
+    callback: Option<EventCallback>,
+    startup_tx: std_mpsc::Sender<StartupMessage>,
+    stop_rx: oneshot::Receiver<()>,
+    prepared_ckb: PreparedCkbStart,
+) {
+    match start_node(config_path, database_prefix, callback, prepared_ckb).await {
+        Ok(node) => {
+            let network_actor = node.network_actor.clone();
+            let store = node.store.clone();
+            let fiber_config = node.fiber_config.clone();
+            let _ = startup_tx.send(StartupMessage::Started {
+                runtime_handle,
+                network_actor,
+                store,
+                fiber_config: Box::new(fiber_config),
+            });
+            stop_node_on_signal(node, stop_rx).await;
+        }
+        Err(err) => {
+            let _ = startup_tx.send(StartupMessage::Failed(err));
+        }
+    }
+}
+
+fn panic_message(err: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = err.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = err.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown panic".to_string()
+    }
+}
+
+#[cfg(feature = "disable-ckb-rpc")]
+fn schedule_embedded_ckb_preparation(
+    config_path: String,
+    database_prefix: Option<String>,
+    callback: CkbPrepareCallback,
+) -> FfiCallResult<()> {
+    let key = ckb_preparation_key(config_path.clone(), database_prefix.clone())?;
+    let mut state = CKB_PREPARATION_STATE
+        .lock()
+        .map_err(|_| ffi_error(FiberFfiStatus::Panic, "CKB preparation mutex poisoned"))?;
+
+    match &*state {
+        CkbPreparationState::Preparing(worker) => {
+            let detail = if worker.key == key {
+                "CKB preparation is already in progress"
+            } else {
+                "CKB preparation is already in progress for a different configuration"
+            };
+            return Err(ffi_error(FiberFfiStatus::InvalidArgument, detail));
+        }
+        CkbPreparationState::Ready(worker) => {
+            if worker.key != key {
+                return Err(ffi_error(
+                    FiberFfiStatus::InvalidArgument,
+                    "CKB is already prepared for a different configuration",
+                ));
+            }
+            spawn_embedded_ckb_ready(callback)
+                .map_err(|err| ffi_error(FiberFfiStatus::StartupFailed, err))?;
+            return Ok(());
+        }
+        CkbPreparationState::InUse(active_key) => {
+            let detail = if active_key == &key {
+                "prepared CKB is already in use by Fiber"
+            } else {
+                "CKB is already in use by Fiber with a different configuration"
+            };
+            return Err(ffi_error(FiberFfiStatus::InvalidArgument, detail));
+        }
+        CkbPreparationState::Idle => {}
+    }
+
+    let id = NEXT_CKB_PREPARATION_ID.fetch_add(1, Ordering::Relaxed);
+    let (start_tx, start_rx) = oneshot::channel();
+    let (begin_tx, begin_rx) = std_mpsc::sync_channel(0);
+    let worker_key = key.clone();
+    let thread = thread::Builder::new()
+        .name("fiber-ffi-prepare-ckb".to_string())
+        .spawn(move || {
+            if begin_rx.recv().is_err() {
+                return;
+            }
+            run_embedded_ckb_preparation(
+                id,
+                worker_key,
+                config_path,
+                database_prefix,
+                callback,
+                start_rx,
+            );
+        })
+        .map_err(|err| ffi_error(FiberFfiStatus::StartupFailed, err.to_string()))?;
+
+    *state = CkbPreparationState::Preparing(PreparedCkbWorker {
+        id,
+        key,
+        start_tx,
+        thread: Some(thread),
+    });
+    drop(state);
+    begin_tx.send(()).map_err(|_| {
+        ffi_error(
+            FiberFfiStatus::StartupFailed,
+            "failed to start CKB preparation runtime",
+        )
+    })?;
+    Ok(())
+}
+
+#[cfg(feature = "disable-ckb-rpc")]
+fn run_embedded_ckb_preparation(
+    id: u64,
+    key: CkbPreparationKey,
+    config_path: String,
+    database_prefix: Option<String>,
+    callback: CkbPrepareCallback,
+    start_rx: oneshot::Receiver<PreparedCkbStartCommand>,
+) {
+    let completion_sent = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let completion_sent_in_runtime = completion_sent.clone();
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            clear_ckb_preparation(id);
+            emit_ckb_prepare_failure(callback, format!("failed to create tokio runtime: {err}"));
+            return;
+        }
+    };
+    let runtime_handle = runtime.handle().clone();
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        runtime.block_on(async move {
+            match prepare_local_ckb(&config_path, database_prefix.clone()).await {
+                Ok(local_ckb) => {
+                    if !mark_ckb_preparation_ready(id) {
+                        local_ckb.shutdown().await;
+                        return;
+                    }
+                    completion_sent_in_runtime.store(true, Ordering::Release);
+                    if let Err(err) = spawn_embedded_ckb_ready(callback) {
+                        clear_ckb_preparation(id);
+                        local_ckb.shutdown().await;
+                        emit_ckb_prepare_failure(
+                            callback,
+                            format!("failed to dispatch CKB preparation callback: {err}"),
+                        );
+                        return;
+                    }
+
+                    match start_rx.await {
+                        Ok(command) => {
+                            run_fiber_node(
+                                runtime_handle,
+                                config_path,
+                                database_prefix,
+                                command.callback,
+                                command.startup_tx,
+                                command.stop_rx,
+                                PreparedCkbStart {
+                                    local_ckb: Some(local_ckb),
+                                },
+                            )
+                            .await;
+                            clear_ckb_in_use(&key);
+                        }
+                        Err(_) => {
+                            local_ckb.shutdown().await;
+                            clear_ckb_preparation(id);
+                        }
+                    }
+                }
+                Err(err) => {
+                    clear_ckb_preparation(id);
+                    completion_sent_in_runtime.store(true, Ordering::Release);
+                    emit_ckb_prepare_failure(callback, err);
+                }
+            }
+        });
+    }));
+
+    if let Err(err) = result {
+        clear_ckb_preparation(id);
+        if !completion_sent.swap(true, Ordering::AcqRel) {
+            emit_ckb_prepare_failure(
+                callback,
+                format!("CKB preparation runtime panicked: {}", panic_message(err)),
+            );
+        }
+    }
+}
+
+#[cfg(feature = "disable-ckb-rpc")]
+fn mark_ckb_preparation_ready(id: u64) -> bool {
+    let Ok(mut state) = CKB_PREPARATION_STATE.lock() else {
+        return false;
+    };
+    let current = std::mem::replace(&mut *state, CkbPreparationState::Idle);
+    match current {
+        CkbPreparationState::Preparing(worker) if worker.id == id => {
+            *state = CkbPreparationState::Ready(worker);
+            true
+        }
+        other => {
+            *state = other;
+            false
+        }
+    }
+}
+
+#[cfg(feature = "disable-ckb-rpc")]
+fn clear_ckb_preparation(id: u64) {
+    let Ok(mut state) = CKB_PREPARATION_STATE.lock() else {
+        return;
+    };
+    let should_clear = matches!(
+        &*state,
+        CkbPreparationState::Preparing(worker) | CkbPreparationState::Ready(worker)
+            if worker.id == id
+    );
+    if should_clear {
+        *state = CkbPreparationState::Idle;
+    }
+}
+
+#[cfg(feature = "disable-ckb-rpc")]
+fn clear_ckb_in_use(key: &CkbPreparationKey) {
+    let Ok(mut state) = CKB_PREPARATION_STATE.lock() else {
+        return;
+    };
+    if matches!(&*state, CkbPreparationState::InUse(active_key) if active_key == key) {
+        *state = CkbPreparationState::Idle;
+    }
+}
+
+#[cfg(feature = "disable-ckb-rpc")]
+fn take_prepared_ckb_worker(key: CkbPreparationKey) -> FfiCallResult<Option<PreparedCkbWorker>> {
+    let mut state = CKB_PREPARATION_STATE
+        .lock()
+        .map_err(|_| ffi_error(FiberFfiStatus::Panic, "CKB preparation mutex poisoned"))?;
+    let current = std::mem::replace(&mut *state, CkbPreparationState::Idle);
+    match current {
+        CkbPreparationState::Idle => Ok(None),
+        CkbPreparationState::Preparing(worker) => {
+            *state = CkbPreparationState::Preparing(worker);
+            Err(ffi_error(
+                FiberFfiStatus::StartupFailed,
+                "CKB is still preparing; wait for the preparation callback before starting Fiber",
+            ))
+        }
+        CkbPreparationState::Ready(worker) if worker.key == key => {
+            *state = CkbPreparationState::InUse(key);
+            Ok(Some(worker))
+        }
+        CkbPreparationState::Ready(worker) => {
+            *state = CkbPreparationState::Ready(worker);
+            Err(ffi_error(
+                FiberFfiStatus::StartupFailed,
+                "CKB was prepared with a different configuration, config_path, database_prefix, or funding key",
+            ))
+        }
+        CkbPreparationState::InUse(active_key) => {
+            *state = CkbPreparationState::InUse(active_key);
+            Err(ffi_error(
+                FiberFfiStatus::StartupFailed,
+                "prepared CKB is already in use by Fiber",
+            ))
+        }
+    }
+}
+
+#[cfg(feature = "disable-ckb-rpc")]
+fn ckb_preparation_key(
+    config_path: String,
+    database_prefix: Option<String>,
+) -> FfiCallResult<CkbPreparationKey> {
+    let config_contents = std::fs::read(&config_path).map_err(|err| {
+        ffi_error(
+            FiberFfiStatus::InvalidArgument,
+            format!("failed to read config file {config_path}: {err}"),
+        )
+    })?;
+    let parsed_config = parse_config_from_path(&config_path, database_prefix.clone())
+        .map_err(|err| ffi_error(FiberFfiStatus::InvalidArgument, err))?;
+    let ckb_config = parsed_config.fiber.ckb.as_ref().ok_or_else(|| {
+        ffi_error(
+            FiberFfiStatus::InvalidArgument,
+            "service fiber requires service ckb to be enabled",
+        )
+    })?;
+    let secret_key = ckb_config.read_secret_key().map_err(|err| {
+        ffi_error(
+            FiberFfiStatus::InvalidArgument,
+            format!("failed to read the CKB funding key: {err}"),
+        )
+    })?;
+    let funding_pubkey_hash = hex::encode(ckb_hash::blake2b_256(
+        secret_key.public_key(secp256k1::SECP256K1).serialize(),
+    ));
+
+    Ok(CkbPreparationKey {
+        config_path,
+        database_prefix,
+        config_contents_hash: hex::encode(ckb_hash::blake2b_256(&config_contents)),
+        funding_pubkey_hash,
+    })
+}
+
+#[cfg(feature = "disable-ckb-rpc")]
+fn emit_embedded_ckb_ready(callback: CkbPrepareCallback) {
+    emit_ckb_prepare_completion(
+        callback,
+        FiberFfiStatus::Ok,
+        json!({
+            "ready": true,
+            "mode": "light_client",
+            "skipped": false,
+        }),
+    );
+}
+
+#[cfg(feature = "disable-ckb-rpc")]
+fn spawn_embedded_ckb_ready(callback: CkbPrepareCallback) -> std::result::Result<(), String> {
+    thread::Builder::new()
+        .name("fiber-ffi-prepare-ckb-callback".to_string())
+        .spawn(move || emit_embedded_ckb_ready(callback))
+        .map(|_| ())
+        .map_err(|err| err.to_string())
+}
+
+#[cfg(feature = "disable-ckb-rpc")]
+fn emit_ckb_prepare_failure(callback: CkbPrepareCallback, error: impl Into<String>) {
+    let error = sanitize_error_message(error.into());
+    emit_ckb_prepare_completion(
+        callback,
+        FiberFfiStatus::StartupFailed,
+        json!({
+            "ready": false,
+            "mode": "light_client",
+            "error": error,
+        }),
+    );
+}
+
+fn emit_ckb_prepare_completion(
+    callback: CkbPrepareCallback,
+    status: FiberFfiStatus,
+    result: serde_json::Value,
+) {
+    let result = serde_json::to_string(&result)
+        .unwrap_or_else(|_| "{\"ready\":false,\"error\":\"serialization failed\"}".to_string());
+    let result = CString::new(result)
+        .expect("CKB preparation completion JSON cannot contain an interior NUL");
+    unsafe {
+        (callback.callback)(status, result.as_ptr(), callback.user_data as *mut c_void);
+    }
 }
 
 #[no_mangle]
@@ -1153,10 +1669,58 @@ fn set_base_dir(value: &mut serde_yaml::Value, section: &str, base_dir: &Path) {
     );
 }
 
+#[cfg(feature = "disable-ckb-rpc")]
+async fn prepare_local_ckb(
+    config_path: &str,
+    database_prefix: Option<String>,
+) -> std::result::Result<ckb_light_client::LocalCkbNodeHandle, String> {
+    let parsed_config = parse_config_from_path(config_path, database_prefix)?;
+    debug!(
+        chain = %parsed_config.light_client.chain_label(),
+        store_path = %parsed_config.light_client.store_path.display(),
+        network_path = %parsed_config.light_client.network_path.display(),
+        history_start_block = parsed_config.light_client.history_start_block,
+        bootnodes = parsed_config.light_client.bootnodes.len(),
+        local_rpc_listen_address = %ckb_light_client::config::LocalLightClientConfig::local_rpc_listen_address(),
+        max_outbound_peers = ckb_light_client::config::MAX_OUTBOUND_PEERS,
+        header_ready_timeout_seconds = ckb_light_client::config::HEADER_READY_TIMEOUT.as_secs(),
+        remote_data_timeout_seconds = ckb_light_client::config::REMOTE_DATA_TIMEOUT.as_secs(),
+        "validated embedded CKB Light Client configuration"
+    );
+
+    let config = parsed_config.fiber;
+    let fiber_config = config
+        .fiber
+        .as_ref()
+        .ok_or_else(|| "fiber service must be enabled in config services".to_string())?;
+    let ckb_config = config
+        .ckb
+        .as_ref()
+        .ok_or_else(|| "service fiber requires service ckb to be enabled".to_string())?;
+    let chain_spec = ChainSpec::load_from(&match fiber_config.chain.as_str() {
+        "mainnet" => Resource::bundled("specs/mainnet.toml".to_string()),
+        "testnet" => Resource::bundled("specs/testnet.toml".to_string()),
+        path => Resource::file_system(Path::new(&config.base_dir).join(path)),
+    })
+    .map_err(|err| format!("failed to load chain spec: {err}"))?;
+    let genesis_block = chain_spec
+        .build_genesis()
+        .map_err(|err| format!("failed to build ckb genesis block: {err}"))?;
+    let required_scripts = required_light_client_scripts(
+        fiber_config,
+        ckb_config,
+        &genesis_block,
+        parsed_config.light_client.history_start_block,
+    )?;
+
+    ckb_light_client::LocalCkbNodeHandle::start(parsed_config.light_client, required_scripts).await
+}
+
 async fn start_node(
     config_path: String,
     database_prefix: Option<String>,
     callback: Option<EventCallback>,
+    prepared_ckb: PreparedCkbStart,
 ) -> std::result::Result<RunningNode, String> {
     info!(
         "Starting node with git version {} ({})",
@@ -1201,7 +1765,15 @@ async fn start_node(
         .map_err(|err| format!("failed to build ckb genesis block: {err}"))?;
 
     #[cfg(feature = "disable-ckb-rpc")]
-    let (ckb_config, local_ckb) = {
+    let (ckb_config, local_ckb) = if let Some(local_ckb) = prepared_ckb.local_ckb {
+        let mut ckb_config = ckb_config;
+        ckb_config.rpc_url = local_ckb.rpc_url().to_string();
+        info!(
+            rpc_url = %ckb_config.rpc_url,
+            "reusing prepared embedded CKB Light Client gateway"
+        );
+        (ckb_config, Some(local_ckb))
+    } else {
         let mut ckb_config = ckb_config;
         let required_scripts = required_light_client_scripts(
             &fiber_config,
@@ -1219,6 +1791,9 @@ async fn start_node(
         );
         (ckb_config, Some(local_ckb))
     };
+
+    #[cfg(not(feature = "disable-ckb-rpc"))]
+    let _ = prepared_ckb;
 
     let store = fnn::store::open_store_with_migration(
         fiber_config.store_path(),
@@ -2878,4 +3453,58 @@ fn clear_last_error() {
 
 fn sanitize_error_message(message: String) -> String {
     message.replace('\0', "\\0")
+}
+
+#[cfg(all(test, not(feature = "disable-ckb-rpc")))]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    unsafe extern "C" fn prepare_callback(
+        status: FiberFfiStatus,
+        result_json: *const c_char,
+        user_data: *mut c_void,
+    ) {
+        let sender =
+            &*(user_data as *const std_mpsc::Sender<(FiberFfiStatus, String, thread::ThreadId)>);
+        let result_json = CStr::from_ptr(result_json).to_string_lossy().into_owned();
+        sender
+            .send((status, result_json, thread::current().id()))
+            .expect("test receiver must remain alive");
+    }
+
+    #[test]
+    fn prepare_ckb_without_embedded_client_completes_asynchronously() {
+        let config_path = CString::new("unused-for-external-rpc-mode").unwrap();
+        let options = FiberStartOptions {
+            config_path: config_path.as_ptr(),
+            database_prefix: ptr::null(),
+            log_level: ptr::null(),
+            event_callback: None,
+            event_callback_user_data: ptr::null_mut(),
+        };
+        let caller_thread = thread::current().id();
+        let (sender, receiver): (
+            std_mpsc::Sender<(FiberFfiStatus, String, thread::ThreadId)>,
+            std_mpsc::Receiver<(FiberFfiStatus, String, thread::ThreadId)>,
+        ) = std_mpsc::channel();
+        let sender_ptr = (&sender as *const std_mpsc::Sender<_>) as *mut c_void;
+
+        let status = unsafe { fiber_prepare_ckb(&options, Some(prepare_callback), sender_ptr) };
+        assert_eq!(status, FiberFfiStatus::Ok);
+
+        let (callback_status, result_json, callback_thread) = receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("preparation callback must run");
+        assert_eq!(callback_status, FiberFfiStatus::Ok);
+        assert_ne!(callback_thread, caller_thread);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&result_json).unwrap(),
+            json!({
+                "ready": true,
+                "mode": "external_rpc",
+                "skipped": true,
+            })
+        );
+    }
 }

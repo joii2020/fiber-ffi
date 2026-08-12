@@ -248,6 +248,15 @@ async fn wait_until_ready(
     router: &RpcRouter,
     network_controller: &NetworkController,
 ) -> Result<(), String> {
+    wait_chain_ready(router, network_controller).await?;
+    wait_required_scripts(router).await;
+    Ok(())
+}
+
+async fn wait_chain_ready(
+    router: &RpcRouter,
+    network_controller: &NetworkController,
+) -> Result<(), String> {
     let deadline = tokio::time::Instant::now() + HEADER_READY_TIMEOUT;
     let required_peers = (MAX_OUTBOUND_PEERS / 2) as usize;
     let mut last_progress_log = tokio::time::Instant::now() - Duration::from_secs(5);
@@ -256,28 +265,19 @@ async fn wait_until_ready(
         let connected_peers = network_controller.connected_peers().len();
         let tip = router.tip_header();
         let tip_number = tip.inner.number.value();
-        let scripts = router.script_statuses();
-        let slowest_script = scripts
-            .iter()
-            .map(|status| status.block_number.value())
-            .min()
-            .unwrap_or_default();
         let tip_is_current = tip_number > 0 && header_is_current(tip.inner.timestamp.value());
-        let scripts_are_ready = !scripts.is_empty() && slowest_script >= tip_number;
 
-        if connected_peers >= required_peers && tip_is_current && scripts_are_ready {
+        if connected_peers >= required_peers && tip_is_current {
             info!(
                 connected_peers,
-                tip_number,
-                script_count = scripts.len(),
-                "embedded CKB Light Client is ready"
+                tip_number, "embedded CKB Light Client chain is ready"
             );
             return Ok(());
         }
 
         if tokio::time::Instant::now() >= deadline {
             return Err(format!(
-                "embedded CKB Light Client was not ready within {}s: connected peers {connected_peers}/{required_peers}, tip {tip_number}, slowest script {slowest_script}, current tip {tip_is_current}",
+                "embedded CKB Light Client chain was not ready within {}s: connected peers {connected_peers}/{required_peers}, tip {tip_number}, current tip {tip_is_current}",
                 HEADER_READY_TIMEOUT.as_secs()
             ));
         }
@@ -287,10 +287,43 @@ async fn wait_until_ready(
                 connected_peers,
                 required_peers,
                 tip_number,
-                slowest_script,
                 tip_is_current,
-                scripts_are_ready,
-                "waiting for embedded CKB Light Client readiness"
+                "waiting for embedded CKB Light Client chain readiness"
+            );
+            last_progress_log = tokio::time::Instant::now();
+        }
+        tokio::time::sleep(READINESS_POLL_INTERVAL).await;
+    }
+}
+
+async fn wait_required_scripts(router: &RpcRouter) {
+    let mut last_progress_log = tokio::time::Instant::now() - Duration::from_secs(5);
+
+    loop {
+        let tip_number = router.tip_header().inner.number.value();
+        let scripts = router.script_statuses();
+        let slowest_script = scripts
+            .iter()
+            .map(|status| status.block_number.value())
+            .min()
+            .unwrap_or_default();
+        let scripts_are_ready = !scripts.is_empty() && slowest_script >= tip_number;
+
+        if scripts_are_ready {
+            info!(
+                tip_number,
+                script_count = scripts.len(),
+                "embedded CKB Light Client is ready"
+            );
+            return;
+        }
+
+        if last_progress_log.elapsed() >= Duration::from_secs(5) {
+            info!(
+                tip_number,
+                slowest_script,
+                script_count = scripts.len(),
+                "waiting for embedded CKB Light Client required scripts"
             );
             last_progress_log = tokio::time::Instant::now();
         }
