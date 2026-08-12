@@ -23,7 +23,9 @@ use fnn::{
     },
     fiber::{graph::NetworkGraph, network::init_chain_hash},
     fiber::{NetworkActorCommand, NetworkActorMessage},
-    start_network, Config, FiberConfig, NetworkServiceEvent,
+    start_network,
+    store::actor::{StoreActor, StoreActorInitializationParameter},
+    Config, FiberConfig, NetworkServiceEvent,
 };
 use ractor::{Actor, ActorRef};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -340,7 +342,7 @@ enum StartupMessage {
         runtime_handle: TokioHandle,
         network_actor: ActorRef<NetworkActorMessage>,
         store: fnn::store::Store,
-        fiber_config: FiberConfig,
+        fiber_config: Box<FiberConfig>,
     },
     Failed(String),
 }
@@ -414,7 +416,7 @@ pub unsafe extern "C" fn fiber_start(
                                     runtime_handle,
                                     network_actor,
                                     store,
-                                    fiber_config,
+                                    fiber_config: Box::new(fiber_config),
                                 });
                                 stop_node_on_signal(node, stop_rx).await;
                             }
@@ -452,7 +454,7 @@ pub unsafe extern "C" fn fiber_start(
                     runtime_handle,
                     network_actor,
                     store,
-                    fiber_config,
+                    fiber_config: *fiber_config,
                 });
                 *out_handle = Box::into_raw(handle);
                 Ok(FiberFfiStatus::Ok)
@@ -1118,6 +1120,7 @@ fn parse_config_from_path(
         ckb,
         base_dir,
         check_validate: false,
+        restore: None,
     };
 
     #[cfg(feature = "disable-ckb-rpc")]
@@ -1228,6 +1231,22 @@ async fn start_node(
     let root_token = CancellationToken::new();
     let root_actor = RootActor::start(root_tracker.clone(), root_token.clone()).await;
 
+    let store_actor = Actor::spawn_linked(
+        Some("store_actor".to_string()),
+        StoreActor::new(),
+        StoreActorInitializationParameter {
+            store: store.clone(),
+            backup_path: fiber_config.base_dir().join("backups"),
+            ckb_key_path: ckb_config.base_dir().join("key"),
+            fiber_key_path: fiber_config.base_dir().join("sk"),
+            backup_interval_hours: 24,
+        },
+        root_actor.get_cell(),
+    )
+    .await
+    .map_err(|err| format!("failed to start store actor: {err}"))?
+    .0;
+
     let chain_hash = genesis_block.hash().into();
     let chain_hash_label = format!("{chain_hash:?}");
     {
@@ -1289,6 +1308,7 @@ async fn start_node(
         root_tracker.clone(),
         root_actor.get_cell(),
         store.clone(),
+        Some(store_actor),
         network_graph,
         default_shutdown_script,
     )

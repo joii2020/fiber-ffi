@@ -10,7 +10,7 @@ pub(crate) const HEADER_READY_TIMEOUT: Duration = Duration::from_secs(120);
 pub(crate) const REMOTE_DATA_TIMEOUT: Duration = Duration::from_secs(8);
 
 // Copied from the configuration shipped with the selected ckb-light-client tag:
-// https://github.com/nervosnetwork/ckb-light-client/blob/v0.5.5-rc1/config/mainnet.toml
+// https://github.com/nervosnetwork/ckb-light-client/blob/12e29522ab7e078ada704d4ac04cbc0498009b7b/config/mainnet.toml
 const MAINNET_BOOTNODES: &[&str] = &[
     "/ip4/16.163.82.218/tcp/8114/p2p/QmaZMemLXSsxKUrYNucjEbPxVX3rBKsGhWW2muWtWxUWyh",
     "/ip4/35.79.196.111/tcp/8114/p2p/QmYCRVonLfP18LSoz2WCHaXDorUYxuUMfhtcXK1TuZ1iwF",
@@ -30,7 +30,7 @@ const MAINNET_BOOTNODES: &[&str] = &[
 ];
 
 // Source:
-// https://github.com/nervosnetwork/ckb-light-client/blob/v0.5.5-rc1/config/testnet.toml
+// https://github.com/nervosnetwork/ckb-light-client/blob/12e29522ab7e078ada704d4ac04cbc0498009b7b/config/testnet.toml
 const TESTNET_BOOTNODES: &[&str] = &[
     "/ip4/18.217.146.65/tcp/8111/p2p/QmT6DFfm18wtbJz3y4aPNn3ac86N4d4p4xtfQRRPf73frC",
     "/ip4/18.136.60.221/tcp/8111/p2p/QmTt6HeNakL8Fpmevrhdna7J4NzEMf9pLchf1CXtmtSrwb",

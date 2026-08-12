@@ -542,8 +542,9 @@ impl RpcRouter {
         let deadline = Instant::now() + REMOTE_DATA_TIMEOUT;
         let transaction = self.fetch_transaction_until(&tx_hash, deadline)?;
         if !matches!(transaction.tx_status.status, Status::Committed) {
-            return to_value(cell_with_status("unknown", None));
+            return to_value(cell_with_status("unknown", None, None));
         }
+        let block_hash = transaction.tx_status.block_hash.clone();
         let transaction = transaction.transaction.ok_or_else(|| {
             not_ready(format!(
                 "committed producing transaction for {out_point:?} is not ready"
@@ -552,7 +553,7 @@ impl RpcRouter {
         let transaction: packed::Transaction = transaction.inner.into();
         let output_index: u32 = out_point.index().unpack();
         let Some(output) = transaction.raw().outputs().get(output_index as usize) else {
-            return to_value(cell_with_status("unknown", None));
+            return to_value(cell_with_status("unknown", None, None));
         };
         let Some(data) = transaction
             .raw()
@@ -566,7 +567,7 @@ impl RpcRouter {
         };
 
         if !self.committed_cell_is_live(&out_point, &output, deadline)? {
-            return to_value(cell_with_status("dead", None));
+            return to_value(cell_with_status("dead", None, None));
         }
 
         let data = with_data.then(|| CellData {
@@ -579,6 +580,7 @@ impl RpcRouter {
                 output: output.into(),
                 data,
             }),
+            block_hash,
         ))
     }
 
@@ -1232,10 +1234,15 @@ fn epoch_view_from_header(header: &HeaderView) -> EpochView {
     }
 }
 
-fn cell_with_status(status: &str, cell: Option<CellInfo>) -> CellWithStatus {
+fn cell_with_status(
+    status: &str,
+    cell: Option<CellInfo>,
+    block_hash: Option<H256>,
+) -> CellWithStatus {
     CellWithStatus {
         cell,
         status: status.to_string(),
+        block_hash,
     }
 }
 
