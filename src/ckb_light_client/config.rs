@@ -9,6 +9,7 @@ use std::{
 use ckb_app_config::{NetworkConfig, SupportProtocol};
 use serde::Deserialize;
 use tentacle::multiaddr::Multiaddr;
+use tracing::debug;
 
 pub(crate) const LOCAL_RPC_LISTEN_ADDRESS: &str = "127.0.0.1:0";
 pub(crate) const MAX_OUTBOUND_PEERS: u32 = 8;
@@ -248,6 +249,30 @@ impl LocalLightClientConfig {
             LocalChain::Testnet => "testnet".to_string(),
             LocalChain::Custom(path) => path.display().to_string(),
         }
+    }
+
+    pub(crate) fn log_summary(&self) {
+        debug!(
+            chain = %self.chain_label(),
+            store_path = %self.store_path.display(),
+            network_path = %self.network_path.display(),
+            history_start_block = self.history_start_block,
+            peer_funding_liveness_rpc_configured = self.peer_funding_liveness_rpc_url.is_some(),
+            startup_min_peers = self.startup_min_peers,
+            startup_script_lag_tolerance = self.startup_script_lag_tolerance,
+            operational_lag_tolerance = self.operational_lag_tolerance,
+            bootnodes = self.bootnodes.len(),
+            preferred_peers = self.preferred_peers.len(),
+            filter_preferred_peer_chance_percent = self.filter_preferred_peer_chance_percent,
+            filter_request_timeout_seconds = self.filter_request_timeout_seconds,
+            filter_peer_failure_threshold = self.filter_peer_failure_threshold,
+            filter_peer_cooldown_seconds = self.filter_peer_cooldown_seconds,
+            local_rpc_listen_address = %Self::local_rpc_listen_address(),
+            max_outbound_peers = MAX_OUTBOUND_PEERS,
+            header_ready_timeout_seconds = HEADER_READY_TIMEOUT.as_secs(),
+            remote_data_timeout_seconds = REMOTE_DATA_TIMEOUT.as_secs(),
+            "validated embedded CKB Light Client configuration"
+        );
     }
 
     pub(crate) fn network_config(&self) -> Result<NetworkConfig, String> {

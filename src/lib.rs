@@ -444,6 +444,21 @@ struct CkbReadiness {
     reason: Option<String>,
 }
 
+impl CkbReadiness {
+    fn unavailable(tip_block_number: Option<u64>, reason: impl Into<String>) -> Self {
+        Self {
+            ready: false,
+            mode: ckb_readiness_mode(),
+            tip_block_number,
+            indexed_block_number: None,
+            lag: None,
+            max_acceptable_lag: CKB_READINESS_MAX_INDEXER_LAG,
+            wait_estimate: None,
+            reason: Some(reason.into()),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 struct CkbBalance {
     ready: bool,
@@ -624,16 +639,10 @@ async fn query_ckb_readiness(ckb_config: &CkbConfig) -> CkbReadiness {
     let tip = match client.get_tip_header().await {
         Ok(tip) => tip,
         Err(err) => {
-            return CkbReadiness {
-                ready: false,
-                mode: ckb_readiness_mode(),
-                tip_block_number: None,
-                indexed_block_number: None,
-                lag: None,
-                max_acceptable_lag: CKB_READINESS_MAX_INDEXER_LAG,
-                wait_estimate: None,
-                reason: Some(format!("failed to query CKB chain tip: {err}")),
-            };
+            return CkbReadiness::unavailable(
+                None,
+                format!("failed to query CKB chain tip: {err}"),
+            );
         }
     };
     let tip_block_number = tip.inner.number.value();
@@ -641,41 +650,32 @@ async fn query_ckb_readiness(ckb_config: &CkbConfig) -> CkbReadiness {
     let indexed_tip = match client.get_indexer_tip().await {
         Ok(Some(indexed_tip)) => indexed_tip,
         Ok(None) => {
-            return CkbReadiness {
-                ready: false,
-                mode: ckb_readiness_mode(),
-                tip_block_number: Some(tip_block_number),
-                indexed_block_number: None,
-                lag: None,
-                max_acceptable_lag: CKB_READINESS_MAX_INDEXER_LAG,
-                wait_estimate: None,
-                reason: Some("CKB indexer tip is not available".to_string()),
-            };
+            return CkbReadiness::unavailable(
+                Some(tip_block_number),
+                "CKB indexer tip is not available",
+            );
         }
         Err(err) => {
-            return CkbReadiness {
-                ready: false,
-                mode: ckb_readiness_mode(),
-                tip_block_number: Some(tip_block_number),
-                indexed_block_number: None,
-                lag: None,
-                max_acceptable_lag: CKB_READINESS_MAX_INDEXER_LAG,
-                wait_estimate: None,
-                reason: Some(format!("failed to query CKB indexer tip: {err}")),
-            };
+            return CkbReadiness::unavailable(
+                Some(tip_block_number),
+                format!("failed to query CKB indexer tip: {err}"),
+            );
         }
     };
-    let now_millis = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
 
     evaluate_ckb_readiness(
         tip_block_number,
         tip_timestamp_millis,
         indexed_tip.block_number.value(),
-        now_millis,
+        unix_time_millis(),
     )
+}
+
+fn unix_time_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 fn current_ckb_readiness(handle: &FiberHandle) -> CkbReadiness {
@@ -683,15 +683,11 @@ fn current_ckb_readiness(handle: &FiberHandle) -> CkbReadiness {
     let mut readiness = if let Some(local_ckb) = handle.ckb_monitor.as_ref() {
         let (tip_block_number, tip_timestamp_millis, indexed_block_number) =
             local_ckb.sync_snapshot();
-        let now_millis = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
         evaluate_ckb_readiness_with_lag_tolerance(
             tip_block_number,
             tip_timestamp_millis,
             indexed_block_number,
-            now_millis,
+            unix_time_millis(),
             local_ckb.operational_lag_tolerance(),
         )
     } else {
@@ -925,6 +921,7 @@ fn select_wallet_history_start_block(
         .saturating_sub(safety_blocks)
 }
 
+#[cfg(any(feature = "disable-ckb-rpc", test))]
 fn select_earliest_history_start_block(
     configured: Option<u64>,
     persisted: Option<u64>,
@@ -1185,8 +1182,9 @@ pub unsafe extern "C" fn fiber_ckb_funding_address(
         prepare_out_string(out_address)?;
         let config_path = required_string(options.config_path, "config_path")?;
         let database_prefix = optional_string(options.database_prefix)?;
-        let parsed_config = parse_config_from_path(&config_path, database_prefix)
-            .map_err(|err| ffi_error(FiberFfiStatus::InvalidArgument, err))?;
+        let (parsed_config, genesis_block) =
+            parse_config_with_genesis(&config_path, database_prefix)
+                .map_err(|err| ffi_error(FiberFfiStatus::InvalidArgument, err))?;
         let fiber_config = parsed_config.fiber.fiber.as_ref().ok_or_else(|| {
             ffi_error(
                 FiberFfiStatus::InvalidArgument,
@@ -1199,11 +1197,6 @@ pub unsafe extern "C" fn fiber_ckb_funding_address(
                 "service fiber requires service ckb to be enabled",
             )
         })?;
-        let genesis_block = load_chain_genesis_block(
-            &fiber_config.chain,
-            Path::new(&parsed_config.fiber.base_dir),
-        )
-        .map_err(|err| ffi_error(FiberFfiStatus::InvalidArgument, err))?;
         let funding_lock = funding_lock_from_genesis(ckb_config, &genesis_block)
             .map_err(|err| ffi_error(FiberFfiStatus::InvalidArgument, err))?;
         let address = CkbAddress::new(
@@ -2760,6 +2753,28 @@ fn parse_config_from_path(
     })
 }
 
+fn parse_config_with_genesis(
+    config_path: &str,
+    database_prefix: Option<String>,
+) -> std::result::Result<(ParsedFfiConfig, ckb_types::core::BlockView), String> {
+    let parsed_config = parse_config_from_path(config_path, database_prefix)?;
+    let fiber_config = parsed_config
+        .fiber
+        .fiber
+        .as_ref()
+        .ok_or_else(|| "fiber service must be enabled in config services".to_string())?;
+    parsed_config
+        .fiber
+        .ckb
+        .as_ref()
+        .ok_or_else(|| "service fiber requires service ckb to be enabled".to_string())?;
+    let genesis_block = load_chain_genesis_block(
+        &fiber_config.chain,
+        Path::new(&parsed_config.fiber.base_dir),
+    )?;
+    Ok((parsed_config, genesis_block))
+}
+
 fn set_base_dir(value: &mut serde_yaml::Value, section: &str, base_dir: &Path) {
     let Some(root) = value.as_mapping_mut() else {
         return;
@@ -2900,46 +2915,16 @@ async fn prepare_local_ckb(
     status_reporter: ckb_light_client::CkbPrepareStatusReporter<'_>,
 ) -> std::result::Result<ckb_light_client::LocalCkbNodeHandle, String> {
     status_reporter(ckb_light_client::CkbPrepareStatus::Initializing);
-    let mut parsed_config = parse_config_from_path(config_path, database_prefix)?;
-    let fiber_config = parsed_config
-        .fiber
-        .fiber
-        .as_ref()
-        .ok_or_else(|| "fiber service must be enabled in config services".to_string())?;
-    let genesis_block = load_chain_genesis_block(
-        &fiber_config.chain,
-        Path::new(&parsed_config.fiber.base_dir),
-    )?;
+    let (mut parsed_config, genesis_block) =
+        parse_config_with_genesis(config_path, database_prefix)?;
     resolve_wallet_birthday(
         &mut parsed_config,
         &genesis_block,
         discovered_history_start_block,
         status_reporter,
     )?;
-    debug!(
-        chain = %parsed_config.light_client.chain_label(),
-        store_path = %parsed_config.light_client.store_path.display(),
-        network_path = %parsed_config.light_client.network_path.display(),
-        history_start_block = parsed_config.light_client.history_start_block,
-        peer_funding_liveness_rpc_configured = parsed_config.light_client.peer_funding_liveness_rpc_url.is_some(),
-        startup_min_peers = parsed_config.light_client.startup_min_peers,
-        startup_script_lag_tolerance = parsed_config.light_client.startup_script_lag_tolerance,
-        operational_lag_tolerance = parsed_config.light_client.operational_lag_tolerance,
-        bootnodes = parsed_config.light_client.bootnodes.len(),
-        preferred_peers = parsed_config.light_client.preferred_peers.len(),
-        filter_preferred_peer_chance_percent = parsed_config.light_client.filter_preferred_peer_chance_percent,
-        filter_request_timeout_seconds = parsed_config.light_client.filter_request_timeout_seconds,
-        filter_peer_failure_threshold = parsed_config.light_client.filter_peer_failure_threshold,
-        filter_peer_cooldown_seconds = parsed_config.light_client.filter_peer_cooldown_seconds,
-        local_rpc_listen_address = %ckb_light_client::config::LocalLightClientConfig::local_rpc_listen_address(),
-        max_outbound_peers = ckb_light_client::config::MAX_OUTBOUND_PEERS,
-        header_ready_timeout_seconds = ckb_light_client::config::HEADER_READY_TIMEOUT.as_secs(),
-        remote_data_timeout_seconds = ckb_light_client::config::REMOTE_DATA_TIMEOUT.as_secs(),
-        "validated embedded CKB Light Client configuration"
-    );
+    parsed_config.light_client.log_summary();
 
-    let history_start_block = parsed_config.light_client.history_start_block;
-    let trust_pinned_cell_deps = parsed_config.light_client.trust_pinned_cell_deps;
     let light_client_config = parsed_config.light_client;
     let config = parsed_config.fiber;
     let fiber_config = config
@@ -2950,19 +2935,36 @@ async fn prepare_local_ckb(
         .ckb
         .as_ref()
         .ok_or_else(|| "service fiber requires service ckb to be enabled".to_string())?;
-    let (required_scripts, pinned_cell_deps) = required_light_client_dependencies(
+    start_embedded_ckb(
+        light_client_config,
         fiber_config,
         ckb_config,
         &genesis_block,
-        history_start_block,
-        trust_pinned_cell_deps,
-    )?;
+        Some(status_reporter),
+    )
+    .await
+}
 
+#[cfg(feature = "disable-ckb-rpc")]
+async fn start_embedded_ckb(
+    config: ckb_light_client::config::LocalLightClientConfig,
+    fiber_config: &FiberConfig,
+    ckb_config: &CkbConfig,
+    genesis_block: &ckb_types::core::BlockView,
+    status_reporter: Option<ckb_light_client::CkbPrepareStatusReporter<'_>>,
+) -> std::result::Result<ckb_light_client::LocalCkbNodeHandle, String> {
+    let (required_scripts, pinned_cell_deps) = required_light_client_dependencies(
+        fiber_config,
+        ckb_config,
+        genesis_block,
+        config.history_start_block,
+        config.trust_pinned_cell_deps,
+    )?;
     ckb_light_client::LocalCkbNodeHandle::start(
-        light_client_config,
+        config,
         required_scripts,
         pinned_cell_deps,
-        Some(status_reporter),
+        status_reporter,
     )
     .await
 }
@@ -2979,42 +2981,13 @@ async fn start_node(
         fnn::get_git_commit_info()
     );
 
-    let parsed_config = parse_config_from_path(&config_path, database_prefix)?;
+    let (parsed_config, genesis_block) = parse_config_with_genesis(&config_path, database_prefix)?;
     #[cfg(feature = "disable-ckb-rpc")]
     let mut parsed_config = parsed_config;
-    let fiber_config_for_chain = parsed_config
-        .fiber
-        .fiber
-        .as_ref()
-        .ok_or_else(|| "fiber service must be enabled in config services".to_string())?;
-    let genesis_block = load_chain_genesis_block(
-        &fiber_config_for_chain.chain,
-        Path::new(&parsed_config.fiber.base_dir),
-    )?;
     #[cfg(feature = "disable-ckb-rpc")]
     resolve_wallet_birthday(&mut parsed_config, &genesis_block, None, &|_| {})?;
     #[cfg(feature = "disable-ckb-rpc")]
-    debug!(
-        chain = %parsed_config.light_client.chain_label(),
-        store_path = %parsed_config.light_client.store_path.display(),
-        network_path = %parsed_config.light_client.network_path.display(),
-        history_start_block = parsed_config.light_client.history_start_block,
-        peer_funding_liveness_rpc_configured = parsed_config.light_client.peer_funding_liveness_rpc_url.is_some(),
-        startup_min_peers = parsed_config.light_client.startup_min_peers,
-        startup_script_lag_tolerance = parsed_config.light_client.startup_script_lag_tolerance,
-        operational_lag_tolerance = parsed_config.light_client.operational_lag_tolerance,
-        bootnodes = parsed_config.light_client.bootnodes.len(),
-        preferred_peers = parsed_config.light_client.preferred_peers.len(),
-        filter_preferred_peer_chance_percent = parsed_config.light_client.filter_preferred_peer_chance_percent,
-        filter_request_timeout_seconds = parsed_config.light_client.filter_request_timeout_seconds,
-        filter_peer_failure_threshold = parsed_config.light_client.filter_peer_failure_threshold,
-        filter_peer_cooldown_seconds = parsed_config.light_client.filter_peer_cooldown_seconds,
-        local_rpc_listen_address = %ckb_light_client::config::LocalLightClientConfig::local_rpc_listen_address(),
-        max_outbound_peers = ckb_light_client::config::MAX_OUTBOUND_PEERS,
-        header_ready_timeout_seconds = ckb_light_client::config::HEADER_READY_TIMEOUT.as_secs(),
-        remote_data_timeout_seconds = ckb_light_client::config::REMOTE_DATA_TIMEOUT.as_secs(),
-        "validated embedded CKB Light Client configuration"
-    );
+    parsed_config.light_client.log_summary();
     #[cfg(feature = "disable-ckb-rpc")]
     let light_client_config = parsed_config.light_client.clone();
     let config = parsed_config.fiber;
@@ -3038,17 +3011,11 @@ async fn start_node(
         (ckb_config, Some(local_ckb))
     } else {
         let mut ckb_config = ckb_config;
-        let (required_scripts, pinned_cell_deps) = required_light_client_dependencies(
+        let local_ckb = start_embedded_ckb(
+            light_client_config,
             &fiber_config,
             &ckb_config,
             &genesis_block,
-            light_client_config.history_start_block,
-            light_client_config.trust_pinned_cell_deps,
-        )?;
-        let local_ckb = ckb_light_client::LocalCkbNodeHandle::start(
-            light_client_config,
-            required_scripts,
-            pinned_cell_deps,
             None,
         )
         .await?;

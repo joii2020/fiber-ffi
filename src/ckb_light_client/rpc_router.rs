@@ -405,11 +405,11 @@ impl RpcRouter {
     }
 
     fn get_cells(&self, params: Params) -> Result<Value> {
-        let params = positional(params)?;
-        let search_value = required_param::<Value>(&params, 0, "search_key")?;
-        let order_value = required_param::<Value>(&params, 1, "order")?;
-        let limit = required_param::<Uint32>(&params, 2, "limit")?.value();
-        let after = optional_param::<JsonBytes>(&params, 3)?;
+        let params = PositionalParams::new(params)?;
+        let search_value = params.required::<Value>(0, "search_key")?;
+        let order_value = params.required::<Value>(1, "order")?;
+        let limit = params.required::<Uint32>(2, "limit")?.value();
+        let after = params.optional::<JsonBytes>(3)?;
         validate_limit(limit)?;
 
         let search_mode = search_mode(&search_value);
@@ -461,11 +461,11 @@ impl RpcRouter {
     }
 
     fn get_transactions(&self, params: Params) -> Result<Value> {
-        let params = positional(params)?;
-        let search_value = required_param::<Value>(&params, 0, "search_key")?;
-        let order_value = required_param::<Value>(&params, 1, "order")?;
-        let limit = required_param::<Uint32>(&params, 2, "limit")?.value();
-        let after = optional_param::<JsonBytes>(&params, 3)?;
+        let params = PositionalParams::new(params)?;
+        let search_value = params.required::<Value>(0, "search_key")?;
+        let order_value = params.required::<Value>(1, "order")?;
+        let limit = params.required::<Uint32>(2, "limit")?.value();
+        let after = params.optional::<JsonBytes>(3)?;
         validate_limit(limit)?;
 
         let mode = search_mode(&search_value);
@@ -550,13 +550,13 @@ impl RpcRouter {
     }
 
     fn get_epoch_by_number(&self, params: Params) -> Result<Value> {
-        let params = positional(params)?;
+        let params = PositionalParams::new(params)?;
         if params.len() != 1 {
             return Err(invalid_params(
                 "get_epoch_by_number accepts exactly one epoch number",
             ));
         }
-        let requested = required_param::<EpochNumber>(&params, 0, "epoch_number")?.value();
+        let requested = params.required::<EpochNumber>(0, "epoch_number")?.value();
         let tip = self.chain_service.get_tip_header();
         let mut headers = self.stored_headers()?;
         headers.push(tip.clone());
@@ -605,9 +605,10 @@ impl RpcRouter {
     }
 
     fn get_block_by_number(&self, params: Params) -> Result<Value> {
-        let params = positional(params)?;
-        let number = required_param::<BlockNumber>(&params, 0, "block_number")?.value();
-        let verbosity = optional_param::<Uint32>(&params, 1)?
+        let params = PositionalParams::new(params)?;
+        let number = params.required::<BlockNumber>(0, "block_number")?.value();
+        let verbosity = params
+            .optional::<Uint32>(1)?
             .map(|value| value.value())
             .unwrap_or(2);
         if number != 0 {
@@ -628,9 +629,10 @@ impl RpcRouter {
     }
 
     fn get_header(&self, params: Params) -> Result<Value> {
-        let params = positional(params)?;
-        let hash = required_param::<H256>(&params, 0, "block_hash")?;
-        let verbosity = optional_param::<Uint32>(&params, 1)?
+        let params = PositionalParams::new(params)?;
+        let hash = params.required::<H256>(0, "block_hash")?;
+        let verbosity = params
+            .optional::<Uint32>(1)?
             .map(|value| value.value())
             .unwrap_or(1);
         let header = self.fetch_header(&hash)?;
@@ -646,9 +648,10 @@ impl RpcRouter {
     }
 
     fn get_header_by_number(&self, params: Params) -> Result<Value> {
-        let params = positional(params)?;
-        let number = required_param::<BlockNumber>(&params, 0, "block_number")?.value();
-        let verbosity = optional_param::<Uint32>(&params, 1)?
+        let params = PositionalParams::new(params)?;
+        let number = params.required::<BlockNumber>(0, "block_number")?.value();
+        let verbosity = params
+            .optional::<Uint32>(1)?
             .map(|value| value.value())
             .unwrap_or(1);
         let Some(hash) = self.block_hash_by_number(number) else {
@@ -673,8 +676,8 @@ impl RpcRouter {
     }
 
     fn get_block_median_time(&self, params: Params) -> Result<Value> {
-        let params = positional(params)?;
-        let mut hash = required_param::<H256>(&params, 0, "block_hash")?;
+        let params = PositionalParams::new(params)?;
+        let mut hash = params.required::<H256>(0, "block_hash")?;
         let mut timestamps = Vec::with_capacity(self.consensus.median_time_block_count());
 
         for _ in 0..self.consensus.median_time_block_count() {
@@ -693,12 +696,13 @@ impl RpcRouter {
     }
 
     fn get_transaction(&self, params: Params) -> Result<Value> {
-        let params = positional(params)?;
-        let hash = required_param::<H256>(&params, 0, "tx_hash")?;
-        let verbosity = optional_param::<Uint32>(&params, 1)?
+        let params = PositionalParams::new(params)?;
+        let hash = params.required::<H256>(0, "tx_hash")?;
+        let verbosity = params
+            .optional::<Uint32>(1)?
             .map(|value| value.value())
             .unwrap_or(2);
-        let only_committed = optional_param::<bool>(&params, 2)?.unwrap_or(false);
+        let only_committed = params.optional::<bool>(2)?.unwrap_or(false);
         if verbosity > 2 {
             return Err(invalid_params("verbosity must be 0, 1, or 2"));
         }
@@ -737,15 +741,15 @@ impl RpcRouter {
     }
 
     fn get_live_cell(&self, params: Params) -> Result<Value> {
-        let params = positional(params)?;
+        let params = PositionalParams::new(params)?;
         if !(2..=3).contains(&params.len()) {
             return Err(invalid_params(
                 "get_live_cell accepts out_point, with_data, and optional include_tx_pool",
             ));
         }
-        let out_point = required_param::<JsonOutPoint>(&params, 0, "out_point")?;
-        let with_data = required_param::<bool>(&params, 1, "with_data")?;
-        let include_tx_pool = optional_param::<bool>(&params, 2)?.unwrap_or(false);
+        let out_point = params.required::<JsonOutPoint>(0, "out_point")?;
+        let with_data = params.required::<bool>(1, "with_data")?;
+        let include_tx_pool = params.optional::<bool>(2)?.unwrap_or(false);
         if include_tx_pool {
             return Err(unsupported(
                 "get_live_cell include_tx_pool=true is not supported by the embedded Light Client",
@@ -809,14 +813,14 @@ impl RpcRouter {
     }
 
     fn send_transaction(&self, params: Params) -> Result<Value> {
-        let params = positional(params)?;
+        let params = PositionalParams::new(params)?;
         if params.len() > 2 {
             return Err(invalid_params(
                 "send_transaction accepts transaction and optional outputs_validator",
             ));
         }
-        let transaction = required_param::<Transaction>(&params, 0, "transaction")?;
-        if let Some(outputs_validator) = optional_param::<String>(&params, 1)? {
+        let transaction = params.required::<Transaction>(0, "transaction")?;
+        if let Some(outputs_validator) = params.optional::<String>(1)? {
             if outputs_validator != "passthrough" {
                 return Err(unsupported(format!(
                     "outputs_validator {outputs_validator:?} is not supported by the embedded Light Client"
@@ -1798,30 +1802,40 @@ fn route_method(method: &str) -> Route {
     }
 }
 
-fn positional(params: Params) -> Result<Vec<Value>> {
-    match params {
-        Params::Array(values) => Ok(values),
-        Params::None => Ok(Vec::new()),
-        Params::Map(_) => Err(invalid_params(
-            "only positional CKB RPC parameters are supported",
-        )),
+#[derive(Debug)]
+struct PositionalParams(Vec<Value>);
+
+impl PositionalParams {
+    fn new(params: Params) -> Result<Self> {
+        match params {
+            Params::Array(values) => Ok(Self(values)),
+            Params::None => Ok(Self(Vec::new())),
+            Params::Map(_) => Err(invalid_params(
+                "only positional CKB RPC parameters are supported",
+            )),
+        }
     }
-}
 
-fn required_param<T: DeserializeOwned>(params: &[Value], index: usize, name: &str) -> Result<T> {
-    let value = params
-        .get(index)
-        .cloned()
-        .ok_or_else(|| invalid_params(format!("missing {name}")))?;
-    decode(value, name)
-}
+    fn len(&self) -> usize {
+        self.0.len()
+    }
 
-fn optional_param<T: DeserializeOwned>(params: &[Value], index: usize) -> Result<Option<T>> {
-    match params.get(index) {
-        None | Some(Value::Null) => Ok(None),
-        Some(value) => serde_json::from_value(value.clone())
-            .map(Some)
-            .map_err(|err| invalid_params(err.to_string())),
+    fn required<T: DeserializeOwned>(&self, index: usize, name: &str) -> Result<T> {
+        let value = self
+            .0
+            .get(index)
+            .cloned()
+            .ok_or_else(|| invalid_params(format!("missing {name}")))?;
+        decode(value, name)
+    }
+
+    fn optional<T: DeserializeOwned>(&self, index: usize) -> Result<Option<T>> {
+        match self.0.get(index) {
+            None | Some(Value::Null) => Ok(None),
+            Some(value) => serde_json::from_value(value.clone())
+                .map(Some)
+                .map_err(|err| invalid_params(err.to_string())),
+        }
     }
 }
 
@@ -2176,7 +2190,7 @@ mod tests {
         packed,
         prelude::{Builder, Entity, Pack},
     };
-    use jsonrpc_core::{ErrorCode, IoHandler};
+    use jsonrpc_core::{ErrorCode, IoHandler, Params};
     use jsonrpc_http_server::ServerBuilder;
 
     use super::{
@@ -2184,8 +2198,9 @@ mod tests {
         interpret_external_liveness_status, map_send_transaction_error,
         output_matches_registered_scripts, reconcile_required_scripts,
         resolve_epoch_view_for_fiber, route_method, IndexedScriptType, PeerFundingLivenessRpc,
-        PendingInputReservations, Route, POOL_REJECTED_TRANSACTION_BY_MIN_FEE_RATE,
-        TRANSACTION_FAILED_TO_RESOLVE, TRANSACTION_FAILED_TO_VERIFY,
+        PendingInputReservations, PositionalParams, Route,
+        POOL_REJECTED_TRANSACTION_BY_MIN_FEE_RATE, TRANSACTION_FAILED_TO_RESOLVE,
+        TRANSACTION_FAILED_TO_VERIFY,
     };
 
     fn script(tag: u8) -> Script {
@@ -2226,6 +2241,26 @@ mod tests {
         assert_eq!(route_method("get_live_cell"), Route::Local);
         assert_eq!(route_method("send_transaction"), Route::Local);
         assert_eq!(route_method("set_scripts"), Route::Unsupported);
+    }
+
+    #[test]
+    fn positional_parameters_centralize_required_and_optional_decoding() {
+        let params = PositionalParams::new(Params::Array(vec![
+            serde_json::json!(42),
+            serde_json::Value::Null,
+        ]))
+        .unwrap();
+
+        assert_eq!(params.required::<u64>(0, "height").unwrap(), 42);
+        assert_eq!(params.optional::<u64>(1).unwrap(), None);
+        assert_eq!(params.optional::<u64>(2).unwrap(), None);
+        assert_eq!(
+            params.required::<u64>(2, "missing").unwrap_err().code,
+            ErrorCode::InvalidParams
+        );
+
+        let named = PositionalParams::new(Params::Map(Default::default())).unwrap_err();
+        assert_eq!(named.code, ErrorCode::InvalidParams);
     }
 
     #[test]
