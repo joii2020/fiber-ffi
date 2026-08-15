@@ -671,8 +671,19 @@ public final class FiberRuntime {
     }
 
     private static synchronized void onCkbPrepared(int status, String resultJson) {
-        ckbPreparing = false;
-        ckbReady = status == 0;
+        boolean ready = false;
+        boolean failed = status != 0;
+        try {
+            JSONObject result = new JSONObject(resultJson);
+            ready = result.optBoolean("ready", false);
+            failed = failed || "failed".equals(result.optString("status"));
+        } catch (JSONException ignored) {
+            failed = true;
+        }
+        if (ready || failed) {
+            ckbPreparing = false;
+            ckbReady = status == 0 && ready;
+        }
         for (CkbPrepareListener listener : ckbPrepareListeners) {
             listener.onCkbPrepared(status, resultJson);
         }

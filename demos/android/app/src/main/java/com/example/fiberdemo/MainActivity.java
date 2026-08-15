@@ -44,7 +44,7 @@ public class MainActivity extends AppCompatActivity {
             eventJson -> runOnUiThread(() -> appendLog("event: " + eventJson));
     private final FiberRuntime.CkbPrepareListener ckbPrepareListener =
             (status, resultJson) -> runOnUiThread(() -> {
-                appendLog("CKB preparation completed: " + resultJson);
+                appendLog("CKB preparation update: " + resultJson);
                 updateHomeButtons();
             });
 

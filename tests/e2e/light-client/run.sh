@@ -172,6 +172,7 @@ sed -i.bak '/^ckb:$/a\  rpc_url: http://127.0.0.1:1' "$light_client_config"
     printf '\n# Added by fiber-ffi/tests/e2e/light-client/run.sh.\n'
     printf 'ckb_light_client:\n'
     printf '  history_start_block: "0x0"\n'
+    printf '  peer_funding_liveness_rpc_url: "%s"\n' "$ckb_rpc_url"
     printf '  bootnodes:\n'
     for bootnode in "${bootnodes[@]}"; do
         printf '    - "%s"\n' "$bootnode"
@@ -211,9 +212,15 @@ ckb_pids+=("$!")
 
 echo "Starting fiber-ffi through its C ABI ..."
 ffi_log="$work_dir/fiber-ffi.log"
-FIBER_SECRET_KEY_PASSWORD=password1 "$runner" "$light_client_config" 2>&1 | tee "$ffi_log"
+FIBER_SECRET_KEY_PASSWORD=password1 \
+    "$runner" "$light_client_config" "$ckb_rpc_url" 2>&1 | tee "$ffi_log"
 
 grep -q "embedded CKB Light Client is ready" "$ffi_log"
 grep -q "embedded CKB Light Client RPC gateway started" "$ffi_log"
-grep -q 'fiber_prepare_ckb: {"mode":"light_client","ready":true,"skipped":false}' "$ffi_log"
+grep -q '"status":"initializing"' "$ffi_log"
+grep -Eq '"status":"(connecting|syncing_headers)"' "$ffi_log"
+grep -q '"status":"syncing_scripts"' "$ffi_log"
+grep -q 'fiber_ckb_discover_history_start_block: address=' "$ffi_log"
+grep -q 'fiber_prepare_ckb: {"mode":"light_client","ready":true,"skipped":false,"status":"ready"}' "$ffi_log"
 grep -q "reusing prepared embedded CKB Light Client gateway" "$ffi_log"
+grep -q 'fiber_ckb_balance: .*"mode":"light_client".*"capacity_shannons":"[0-9][0-9]*".*"capacity_ckb":"[0-9][0-9]*\.[0-9][0-9]*"' "$ffi_log"

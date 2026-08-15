@@ -105,6 +105,9 @@ ckb:
 # wallet's earliest relevant block (or use 0x0 for a full recovery scan).
 ckb_light_client:
   history_start_block: "0x125bae1"
+  # Used only as a live/dead reference for untracked peer funding inputs.
+  # Transaction and Cell contents still come from the embedded Light Client.
+  peer_funding_liveness_rpc_url: "https://testnet.ckbapp.dev/"
 
 services:
   - fiber

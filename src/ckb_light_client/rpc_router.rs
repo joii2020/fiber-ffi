@@ -1,6 +1,9 @@
 use std::{
     collections::{HashMap, HashSet},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -20,6 +23,7 @@ use ckb_light_client_lib::{
         StorageBackend, StorageWithChainData,
     },
 };
+use ckb_sdk::CkbRpcClient;
 use ckb_types::{
     bytes::Bytes,
     core::{DepType, EpochNumberWithFraction, TransactionView as CoreTransactionView},
@@ -40,6 +44,11 @@ const TRANSACTION_FAILED_TO_RESOLVE: i64 = -301;
 const TRANSACTION_FAILED_TO_VERIFY: i64 = -302;
 const POOL_REJECTED_TRANSACTION_BY_MIN_FEE_RATE: i64 = -1104;
 const MAX_QUERY_LIMIT: u32 = 1_000;
+// Bump the marker when changing subscription semantics. V2 deliberately drops
+// scripts discovered by the old, unrestricted get_transaction path once, then
+// preserves scripts added by the controlled tracked-transaction expansion.
+const REQUIRED_SCRIPTS_MARKER_KEY: &[u8] = b"FIBER_FFI_REQUIRED_SCRIPTS_V2";
+const SCRIPT_COVERAGE_KEY_PREFIX: &[u8] = b"FIBER_FFI_SCRIPT_COVERAGE_V2";
 
 const LOCAL_METHODS: &[&str] = &[
     "get_cells",
@@ -69,9 +78,105 @@ pub(crate) struct RpcRouter {
     storage: Arc<Storage>,
     chain_service: LightClientChainService,
     consensus: Arc<Consensus>,
-    history_start_block: u64,
     pending_inputs: Arc<Mutex<PendingInputReservations>>,
     indexed_script_starts: Arc<Mutex<HashMap<(packed::Script, IndexedScriptType), u64>>>,
+    pinned_cell_deps: Arc<HashSet<packed::OutPoint>>,
+    peer_funding_liveness_rpc: Option<PeerFundingLivenessRpc>,
+}
+
+#[derive(Clone)]
+struct PeerFundingLivenessRpc {
+    url: String,
+    expected_genesis_hash: H256,
+    chain_verified: Arc<AtomicBool>,
+}
+
+impl PeerFundingLivenessRpc {
+    fn new(url: String, expected_genesis_hash: H256) -> std::result::Result<Self, String> {
+        CkbRpcClient::new_with_timeout(&url, REMOTE_DATA_TIMEOUT)
+            .map_err(|_| "invalid ckb_light_client.peer_funding_liveness_rpc_url".to_string())?;
+        Ok(Self {
+            url,
+            expected_genesis_hash,
+            chain_verified: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    fn cell_is_live(
+        &self,
+        out_point: &packed::OutPoint,
+        deadline: Instant,
+    ) -> std::result::Result<bool, String> {
+        self.verify_chain(deadline)?;
+        let client = self.client(deadline)?;
+        let response = client
+            .get_live_cell(out_point.clone().into(), false)
+            .map_err(|_| "peer funding liveness RPC get_live_cell failed".to_string())?;
+        let is_live = interpret_external_liveness_status(&response.status)?;
+        debug!(
+            ?out_point,
+            status = response.status,
+            "used configured external RPC as peer funding input liveness reference"
+        );
+        Ok(is_live)
+    }
+
+    fn verify_chain(&self, deadline: Instant) -> std::result::Result<(), String> {
+        if self.chain_verified.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let client = self.client(deadline)?;
+        let observed = client
+            .get_block_hash(BlockNumber::from(0u64))
+            .map_err(|_| "peer funding liveness RPC genesis query failed".to_string())?
+            .ok_or_else(|| {
+                "peer funding liveness RPC returned no genesis block hash".to_string()
+            })?;
+        if observed != self.expected_genesis_hash {
+            return Err(format!(
+                "peer funding liveness RPC is on the wrong chain: expected genesis {:#x}, got {observed:#x}",
+                self.expected_genesis_hash
+            ));
+        }
+        self.chain_verified.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    fn client(&self, deadline: Instant) -> std::result::Result<CkbRpcClient, String> {
+        let timeout = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or_else(|| {
+                "peer funding liveness RPC query exceeded the Light Client data deadline"
+                    .to_string()
+            })?;
+        if timeout.is_zero() {
+            return Err(
+                "peer funding liveness RPC query exceeded the Light Client data deadline"
+                    .to_string(),
+            );
+        }
+        CkbRpcClient::new_with_timeout(&self.url, timeout)
+            .map_err(|_| "failed to initialize peer funding liveness RPC".to_string())
+    }
+}
+
+fn interpret_external_liveness_status(status: &str) -> std::result::Result<bool, String> {
+    match status {
+        "live" => Ok(true),
+        // Modern CKB nodes may report a spent cell as unknown instead of dead.
+        // The producing transaction was already verified locally, so neither
+        // response is sufficient to let the funding transaction proceed.
+        "dead" | "unknown" => Ok(false),
+        other => Err(format!(
+            "peer funding liveness RPC returned unsupported cell status {other:?}"
+        )),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum LivenessPolicy {
+    LightClientOnly,
+    AllowPeerFundingRpc,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -123,18 +228,23 @@ impl RpcRouter {
         storage: Storage,
         chain_data: StorageWithChainData,
         consensus: Arc<Consensus>,
-        history_start_block: u64,
+        pinned_cell_deps: HashSet<packed::OutPoint>,
+        peer_funding_liveness_rpc_url: Option<String>,
     ) -> std::result::Result<Self, String> {
         let chain_service =
             LightClientChainService::new(chain_data.clone(), Arc::clone(&consensus));
+        let peer_funding_liveness_rpc = peer_funding_liveness_rpc_url
+            .map(|url| PeerFundingLivenessRpc::new(url, consensus.genesis_hash().unpack()))
+            .transpose()?;
 
         Ok(Self {
             storage: Arc::new(storage),
             chain_service,
             consensus,
-            history_start_block,
             pending_inputs: Arc::new(Mutex::new(PendingInputReservations::default())),
             indexed_script_starts: Arc::new(Mutex::new(HashMap::new())),
+            pinned_cell_deps: Arc::new(pinned_cell_deps),
+            peer_funding_liveness_rpc,
         })
     }
 
@@ -150,23 +260,107 @@ impl RpcRouter {
         self.chain_service.get_scripts()
     }
 
+    pub(crate) fn indexed_tip_number(&self) -> u64 {
+        indexed_tip_number(
+            self.chain_service.get_tip_header().inner.number.value(),
+            &self.chain_service.get_scripts(),
+        )
+    }
+
+    fn operational_tip_header(&self) -> Result<HeaderView> {
+        let block_number = self.indexed_tip_number();
+        let network_tip = self.chain_service.get_tip_header();
+        if network_tip.inner.number.value() == block_number {
+            return Ok(network_tip);
+        }
+
+        let block_hash = self.block_hash_by_number(block_number).ok_or_else(|| {
+            not_ready(format!(
+                "verified header at operational block {block_number} is not ready"
+            ))
+        })?;
+        let block_hash: H256 = block_hash.unpack();
+        self.chain_service.get_header(&block_hash).ok_or_else(|| {
+            not_ready(format!(
+                "verified header at operational block {block_number} is not stored"
+            ))
+        })
+    }
+
     pub(crate) fn register_scripts(
         &self,
         scripts: impl IntoIterator<Item = ScriptStatus>,
     ) -> std::result::Result<(), String> {
-        self.ensure_script_coverage(scripts.into_iter().map(|status| {
-            let script_type = match status.script_type {
-                ScriptType::Lock => IndexedScriptType::Lock,
-                ScriptType::Type => IndexedScriptType::Type,
-            };
-            let status_block = status.block_number.value();
-            let first_indexed_block = if status_block == 0 {
-                0
-            } else {
-                status_block.saturating_add(1)
-            };
-            (status.script, script_type, first_indexed_block)
-        }))
+        let requested = scripts
+            .into_iter()
+            .map(|status| {
+                let script_type = match status.script_type {
+                    ScriptType::Lock => IndexedScriptType::Lock,
+                    ScriptType::Type => IndexedScriptType::Type,
+                };
+                let status_block = status.block_number.value();
+                let first_indexed_block = if status_block == 0 {
+                    0
+                } else {
+                    status_block.saturating_add(1)
+                };
+                (status.script, script_type, first_indexed_block)
+            })
+            .collect::<Vec<_>>();
+        let marker = required_scripts_marker(&requested);
+        let marker_matches = self
+            .storage
+            .get(REQUIRED_SCRIPTS_MARKER_KEY)
+            .map_err(|err| format!("failed to read required script marker: {err}"))?
+            .is_some_and(|stored| stored == marker);
+        let existing = self.chain_service.get_scripts();
+        let (required, set_changed) =
+            reconcile_required_scripts(existing, requested.iter(), marker_matches);
+        let registered_scripts = required
+            .iter()
+            .map(|status| {
+                let script_type = match status.script_type {
+                    ScriptType::Lock => IndexedScriptType::Lock,
+                    ScriptType::Type => IndexedScriptType::Type,
+                };
+                (status.script.clone(), script_type)
+            })
+            .collect::<Vec<_>>();
+
+        // Script progress is persistent. Re-registering a required script with
+        // its original wallet-birthday height would otherwise rewind it on every
+        // process start. A marker records the base script set and original start
+        // heights. A matching cache also retains scripts added by the controlled
+        // tracked-transaction expansion, so channel monitoring survives restart.
+        // A mismatched/old cache gets one safe rescan that removes scripts added
+        // by the former unrestricted get_transaction path.
+        if !marker_matches || set_changed {
+            self.chain_service
+                .set_scripts(required, Some(SetScriptsCommand::All));
+            self.storage
+                .put(REQUIRED_SCRIPTS_MARKER_KEY.to_vec(), marker)
+                .map_err(|err| format!("failed to write required script marker: {err}"))?;
+        }
+
+        let mut starts = self
+            .indexed_script_starts
+            .lock()
+            .map_err(|_| "indexed script coverage lock is poisoned".to_string())?;
+        starts.clear();
+        for (script, script_type) in registered_scripts {
+            if let Some(first_indexed_block) = self.read_script_coverage(&script, script_type)? {
+                starts.insert((script.into(), script_type), first_indexed_block);
+            }
+        }
+        for (script, script_type, first_indexed_block) in requested {
+            self.write_script_coverage(&script, script_type, first_indexed_block)?;
+            let key = (script.into(), script_type);
+            starts
+                .entry(key)
+                .and_modify(|known_start| *known_start = (*known_start).min(first_indexed_block))
+                .or_insert(first_indexed_block);
+        }
+        Ok(())
     }
 
     pub(crate) fn handle(&self, method: &'static str, params: Params) -> Result<Value> {
@@ -192,8 +386,8 @@ impl RpcRouter {
         match method {
             "get_cells" => self.get_cells(params),
             "get_transactions" => self.get_transactions(params),
-            "get_tip_header" => to_value(self.chain_service.get_tip_header()),
-            "get_tip_block_number" => to_value(self.chain_service.get_tip_header().inner.number),
+            "get_tip_header" => to_value(self.operational_tip_header()?),
+            "get_tip_block_number" => to_value(BlockNumber::from(self.indexed_tip_number())),
             "get_indexer_tip" => self.get_indexer_tip(),
             "get_consensus" => to_value(ckb_jsonrpc_types::Consensus::from(
                 (*self.consensus).clone(),
@@ -222,10 +416,10 @@ impl RpcRouter {
         let search_key = decode::<SearchKey>(search_value.clone(), "search_key")?;
         match search_mode {
             SearchMode::Exact => {
-                self.ensure_script_registered(&search_key, self.history_start_block)?;
+                self.require_script_registered(&search_key)?;
                 self.wait_script_ready(&search_key.script, &search_key.script_type)?;
             }
-            SearchMode::Prefix => self.ensure_all_scripts_ready()?,
+            SearchMode::Prefix => self.wait_all_scripts_ready()?,
             SearchMode::Partial => {
                 return Err(unsupported(
                     "partial indexer search is not supported by the embedded Light Client",
@@ -284,10 +478,10 @@ impl RpcRouter {
         });
         match mode {
             SearchMode::Exact => {
-                self.ensure_script_registered(&search_key, self.history_start_block)?;
+                self.require_script_registered(&search_key)?;
                 self.wait_script_ready(&search_key.script, &search_key.script_type)?;
             }
-            SearchMode::Prefix => self.ensure_all_scripts_ready()?,
+            SearchMode::Prefix => self.wait_all_scripts_ready()?,
             SearchMode::Partial => {
                 return Err(unsupported(
                     "partial indexer search is not supported by the embedded Light Client",
@@ -328,19 +522,31 @@ impl RpcRouter {
     }
 
     fn get_indexer_tip(&self) -> Result<Value> {
-        let scripts = self.chain_service.get_scripts();
-        let block_number = scripts
-            .iter()
-            .map(|script| script.block_number.value())
-            .min()
-            .unwrap_or_else(|| self.chain_service.get_tip_header().inner.number.value());
-        let block_hash = self.storage.get_block_hash(block_number).ok_or_else(|| {
+        let block_number = self.indexed_tip_number();
+        let block_hash = self.block_hash_by_number(block_number).ok_or_else(|| {
             not_ready(format!("block hash at height {block_number} is not ready"))
         })?;
         to_value(json!({
             "block_hash": H256::from(block_hash),
             "block_number": BlockNumber::from(block_number),
         }))
+    }
+
+    /// Resolve both matched-block mappings and the verified rolling header
+    /// window maintained by the Light Client protocol. Near the chain tip most
+    /// blocks do not match a watched script, so they intentionally have no
+    /// `BlockNumber` storage entry even though their hashes are already proved.
+    fn block_hash_by_number(&self, block_number: u64) -> Option<packed::Byte32> {
+        if let Some(hash) = self.storage.get_block_hash(block_number) {
+            return Some(hash);
+        }
+
+        let tip = self.chain_service.get_tip_header();
+        if tip.inner.number.value() == block_number {
+            return Some(tip.hash.pack());
+        }
+
+        find_recent_block_hash(block_number, self.storage.get_last_n_headers())
     }
 
     fn get_epoch_by_number(&self, params: Params) -> Result<Value> {
@@ -445,7 +651,7 @@ impl RpcRouter {
         let verbosity = optional_param::<Uint32>(&params, 1)?
             .map(|value| value.value())
             .unwrap_or(1);
-        let Some(hash) = self.storage.get_block_hash(number) else {
+        let Some(hash) = self.block_hash_by_number(number) else {
             return Err(not_ready(format!(
                 "header at block number {number} is not available locally"
             )));
@@ -500,14 +706,23 @@ impl RpcRouter {
         let transaction = self.fetch_transaction(&hash)?;
         if matches!(transaction.tx_status.status, Status::Committed) {
             if let Some(transaction_view) = transaction.transaction.as_ref() {
-                let packed_hash = packed::Byte32::from_slice(hash.as_bytes()).map_err(|err| {
-                    internal_error(format!("invalid transaction hash from Light Client: {err}"))
-                })?;
-                if let Some((block_number, _, _)) = self.storage.get_transaction(&packed_hash) {
-                    self.register_transaction_output_scripts(
-                        &transaction_view.inner,
-                        block_number,
-                    )?;
+                // Follow only descendants of scripts we already track. The old
+                // behavior subscribed to every output of every transaction read
+                // through this RPC (including ancient CellDeps), repeatedly
+                // rewinding the one global block-filter cursor.
+                if self.transaction_extends_tracked_chain(&transaction_view.inner) {
+                    let packed_hash =
+                        packed::Byte32::from_slice(hash.as_bytes()).map_err(|err| {
+                            internal_error(format!(
+                                "invalid transaction hash from Light Client: {err}"
+                            ))
+                        })?;
+                    if let Some((block_number, _, _)) = self.storage.get_transaction(&packed_hash) {
+                        self.register_transaction_output_scripts(
+                            &transaction_view.inner,
+                            block_number,
+                        )?;
+                    }
                 }
             }
         }
@@ -537,6 +752,7 @@ impl RpcRouter {
             ));
         }
 
+        let validation_tip = self.indexed_tip_number();
         let out_point: packed::OutPoint = out_point.into();
         let tx_hash: H256 = out_point.tx_hash().unpack();
         let deadline = Instant::now() + REMOTE_DATA_TIMEOUT;
@@ -566,7 +782,15 @@ impl RpcRouter {
             )));
         };
 
-        if !self.committed_cell_is_live(&out_point, &output, deadline)? {
+        if !self.pinned_cell_deps.contains(&out_point)
+            && !self.committed_cell_is_live(
+                &out_point,
+                &output,
+                validation_tip,
+                deadline,
+                LivenessPolicy::AllowPeerFundingRpc,
+            )?
+        {
             return to_value(cell_with_status("dead", None, None));
         }
 
@@ -669,6 +893,10 @@ impl RpcRouter {
         transaction: &CoreTransactionView,
         deadline: Instant,
     ) -> Result<()> {
+        // Freeze one already indexed and verified height for the whole
+        // validation. Newly verified headers must not keep moving the finish
+        // line while transaction scripts are being prepared.
+        let validation_tip = self.indexed_tip_number();
         for header_hash in transaction.header_deps().into_iter() {
             let header_hash: H256 = header_hash.unpack();
             if self.fetch_header_until(&header_hash, deadline)?.is_none() {
@@ -678,13 +906,48 @@ impl RpcRouter {
             }
         }
 
+        // Without an external liveness reference, inputs and unpinned deps need
+        // complete Light Client script coverage from their creation blocks. If
+        // the explicit peer-funding RPC is configured, only unknown transaction
+        // inputs may use it; CellDeps always retain Light Client-only coverage.
+        let unpinned_deps = || {
+            transaction
+                .cell_deps()
+                .into_iter()
+                .map(|cell_dep| cell_dep.out_point())
+                .filter(|out_point| !self.pinned_cell_deps.contains(out_point))
+        };
+        if self.peer_funding_liveness_rpc.is_some() {
+            self.ensure_out_points_liveness_coverage(unpinned_deps(), deadline)?;
+        } else {
+            self.ensure_out_points_liveness_coverage(
+                transaction.input_pts_iter().chain(unpinned_deps()),
+                deadline,
+            )?;
+        }
+
         let mut prepared = HashMap::<packed::OutPoint, Bytes>::new();
         for input in transaction.input_pts_iter() {
-            self.prepare_out_point(&input, &mut prepared, deadline)?;
+            self.prepare_out_point(
+                &input,
+                &mut prepared,
+                validation_tip,
+                deadline,
+                true,
+                LivenessPolicy::AllowPeerFundingRpc,
+            )?;
         }
         for cell_dep in transaction.cell_deps().into_iter() {
             let out_point = cell_dep.out_point();
-            let data = self.prepare_out_point(&out_point, &mut prepared, deadline)?;
+            let verify_liveness = !self.pinned_cell_deps.contains(&out_point);
+            let data = self.prepare_out_point(
+                &out_point,
+                &mut prepared,
+                validation_tip,
+                deadline,
+                verify_liveness,
+                LivenessPolicy::LightClientOnly,
+            )?;
             if cell_dep.dep_type() == DepType::DepGroup.into() {
                 let dep_group = packed::OutPointVec::from_slice(data.as_ref()).map_err(|err| {
                     transaction_failed_to_resolve(format!(
@@ -696,10 +959,77 @@ impl RpcRouter {
                         "Resolve failed InvalidDepGroup({out_point:?}): dep group is empty"
                     )));
                 }
+                if verify_liveness {
+                    self.ensure_out_points_liveness_coverage(dep_group.clone(), deadline)?;
+                }
                 for dep_out_point in dep_group.into_iter() {
-                    self.prepare_out_point(&dep_out_point, &mut prepared, deadline)?;
+                    // A trusted pinned dep-group commits to its member list, so
+                    // the same explicit trust decision applies transitively.
+                    self.prepare_out_point(
+                        &dep_out_point,
+                        &mut prepared,
+                        validation_tip,
+                        deadline,
+                        verify_liveness,
+                        LivenessPolicy::LightClientOnly,
+                    )?;
                 }
             }
+        }
+        Ok(())
+    }
+
+    fn ensure_out_points_liveness_coverage(
+        &self,
+        out_points: impl IntoIterator<Item = packed::OutPoint>,
+        deadline: Instant,
+    ) -> Result<()> {
+        let mut registered = self
+            .chain_service
+            .get_scripts()
+            .into_iter()
+            .map(|status| {
+                let script_type = match status.script_type {
+                    ScriptType::Lock => IndexedScriptType::Lock,
+                    ScriptType::Type => IndexedScriptType::Type,
+                };
+                (packed::Script::from(status.script), script_type)
+            })
+            .collect::<HashSet<_>>();
+        let mut additions = Vec::new();
+
+        for out_point in out_points {
+            let tx_hash: H256 = out_point.tx_hash().unpack();
+            let fetched = self.fetch_transaction_until(&tx_hash, deadline)?;
+            if !matches!(fetched.tx_status.status, Status::Committed) {
+                continue;
+            }
+            let Some((block_number, _, transaction)) =
+                self.storage.get_transaction(&out_point.tx_hash())
+            else {
+                continue;
+            };
+            let output_index: u32 = out_point.index().unpack();
+            let Some(output) = transaction.raw().outputs().get(output_index as usize) else {
+                continue;
+            };
+
+            if output_matches_registered_scripts(&output, &registered) {
+                continue;
+            }
+            let lock = output.lock();
+            if registered.insert((lock.clone(), IndexedScriptType::Lock)) {
+                additions.push((lock.into(), IndexedScriptType::Lock, block_number));
+            }
+        }
+
+        if !additions.is_empty() {
+            debug!(
+                script_count = additions.len(),
+                "batched Light Client subscriptions needed for transaction liveness proofs"
+            );
+            self.ensure_script_coverage(additions)
+                .map_err(internal_error)?;
         }
         Ok(())
     }
@@ -708,7 +1038,10 @@ impl RpcRouter {
         &self,
         out_point: &packed::OutPoint,
         prepared: &mut HashMap<packed::OutPoint, Bytes>,
+        validation_tip: u64,
         deadline: Instant,
+        verify_liveness: bool,
+        liveness_policy: LivenessPolicy,
     ) -> Result<Bytes> {
         if let Some(data) = prepared.get(out_point) {
             return Ok(data.clone());
@@ -746,7 +1079,16 @@ impl RpcRouter {
 
         match status {
             Status::Pending => {}
-            Status::Committed => self.ensure_committed_cell_live(out_point, &output, deadline)?,
+            Status::Committed if verify_liveness => self.ensure_committed_cell_live(
+                out_point,
+                &output,
+                validation_tip,
+                deadline,
+                liveness_policy,
+            )?,
+            Status::Committed => {
+                debug!(?out_point, "using pinned CellDep liveness assertion");
+            }
             Status::Unknown => {
                 return Err(transaction_failed_to_resolve(format!(
                     "Resolve failed Unknown({out_point:?})"
@@ -761,9 +1103,17 @@ impl RpcRouter {
         &self,
         out_point: &packed::OutPoint,
         output: &packed::CellOutput,
+        validation_tip: u64,
         deadline: Instant,
+        liveness_policy: LivenessPolicy,
     ) -> Result<()> {
-        if self.committed_cell_is_live(out_point, output, deadline)? {
+        if self.committed_cell_is_live(
+            out_point,
+            output,
+            validation_tip,
+            deadline,
+            liveness_policy,
+        )? {
             Ok(())
         } else {
             Err(transaction_failed_to_resolve(format!(
@@ -776,7 +1126,9 @@ impl RpcRouter {
         &self,
         out_point: &packed::OutPoint,
         output: &packed::CellOutput,
+        validation_tip: u64,
         deadline: Instant,
+        liveness_policy: LivenessPolicy,
     ) -> Result<bool> {
         let Some((block_number, _, _)) = self.storage.get_transaction(&out_point.tx_hash()) else {
             return Err(not_ready(format!(
@@ -802,18 +1154,32 @@ impl RpcRouter {
                 type_script.expect("registered type script should exist"),
                 IndexedScriptType::Type,
             )
-        } else {
+        } else if lock_registered {
             (lock_script, IndexedScriptType::Lock)
+        } else {
+            if matches!(liveness_policy, LivenessPolicy::AllowPeerFundingRpc) {
+                if let Some(rpc) = &self.peer_funding_liveness_rpc {
+                    // Only the boolean result crosses this boundary. `output`
+                    // was extracted above from the Light Client-verified
+                    // producing transaction and is never replaced by RPC data.
+                    return rpc.cell_is_live(out_point, deadline).map_err(not_ready);
+                }
+            }
+            return Err(not_ready(format!(
+                "cannot prove liveness for {out_point:?}: neither output script is in the configured or tracked Light Client subscription set"
+            )));
         };
         let script: Script = indexed_script.clone().into();
         let service_script_type = indexed_script_type.service_type();
         let index_covers_creation =
             self.script_index_covers_creation(&indexed_script, indexed_script_type, block_number)?;
         if !index_covers_creation {
-            self.rewind_script(&script, indexed_script_type, block_number)?;
+            return Err(not_ready(format!(
+                "cannot prove liveness for {out_point:?}: its creation at block {block_number} predates the tracked script coverage; lower ckb_light_client.history_start_block and resynchronize"
+            )));
         }
 
-        self.wait_script_ready_until(&script, &service_script_type, deadline)?;
+        self.wait_script_ready_until(&script, &service_script_type, validation_tip, deadline)?;
         self.cell_index_contains_out_point(
             &indexed_script,
             indexed_script_type,
@@ -821,20 +1187,6 @@ impl RpcRouter {
             output_index,
             out_point,
         )
-    }
-
-    fn rewind_script(
-        &self,
-        script: &Script,
-        script_type: IndexedScriptType,
-        first_required_block: u64,
-    ) -> Result<()> {
-        self.ensure_script_coverage(std::iter::once((
-            script.clone(),
-            script_type,
-            first_required_block,
-        )))
-        .map_err(internal_error)
     }
 
     fn script_index_covers_creation(
@@ -929,10 +1281,44 @@ impl RpcRouter {
                 .collect(),
             Some(SetScriptsCommand::Partial),
         );
-        for (key, _, requested_start) in updates {
+        for (key, script, requested_start) in updates {
+            self.write_script_coverage(&script, key.1, requested_start)?;
             starts.insert(key, requested_start);
         }
         Ok(())
+    }
+
+    fn read_script_coverage(
+        &self,
+        script: &Script,
+        script_type: IndexedScriptType,
+    ) -> std::result::Result<Option<u64>, String> {
+        let Some(value) = self
+            .storage
+            .get(script_coverage_key(script, script_type))
+            .map_err(|err| format!("failed to read script coverage: {err}"))?
+        else {
+            return Ok(None);
+        };
+        let bytes: [u8; 8] = value
+            .as_slice()
+            .try_into()
+            .map_err(|_| "stored script coverage has an invalid length".to_string())?;
+        Ok(Some(u64::from_be_bytes(bytes)))
+    }
+
+    fn write_script_coverage(
+        &self,
+        script: &Script,
+        script_type: IndexedScriptType,
+        first_indexed_block: u64,
+    ) -> std::result::Result<(), String> {
+        self.storage
+            .put(
+                script_coverage_key(script, script_type),
+                first_indexed_block.to_be_bytes().to_vec(),
+            )
+            .map_err(|err| format!("failed to persist script coverage: {err}"))
     }
 
     fn cell_index_contains(
@@ -1040,7 +1426,7 @@ impl RpcRouter {
         }
     }
 
-    fn ensure_script_registered(&self, search_key: &SearchKey, start_block: u64) -> Result<()> {
+    fn require_script_registered(&self, search_key: &SearchKey) -> Result<()> {
         let exists = self.chain_service.get_scripts().into_iter().any(|status| {
             status.script == search_key.script
                 && same_script_type(&status.script_type, &search_key.script_type)
@@ -1048,42 +1434,44 @@ impl RpcRouter {
         if exists {
             return Ok(());
         }
-
-        let script_type = match &search_key.script_type {
-            ScriptType::Lock => IndexedScriptType::Lock,
-            ScriptType::Type => IndexedScriptType::Type,
-        };
-        self.ensure_script_coverage(std::iter::once((
-            search_key.script.clone(),
-            script_type,
-            start_block,
+        Err(not_ready(format!(
+            "script 0x{} is not in the Light Client subscription set; register it during startup instead of an indexer query",
+            hex::encode(
+                packed::Script::from(search_key.script.clone())
+                    .calc_script_hash()
+                    .as_slice()
+            )
         )))
-        .map_err(internal_error)
     }
 
     fn wait_script_ready(&self, script: &Script, script_type: &ScriptType) -> Result<()> {
-        self.wait_script_ready_until(script, script_type, Instant::now() + REMOTE_DATA_TIMEOUT)
+        self.wait_script_ready_until(
+            script,
+            script_type,
+            self.indexed_tip_number(),
+            Instant::now() + REMOTE_DATA_TIMEOUT,
+        )
     }
 
     fn wait_script_ready_until(
         &self,
         script: &Script,
         script_type: &ScriptType,
+        target_tip: u64,
         deadline: Instant,
     ) -> Result<()> {
         loop {
-            let tip = self.chain_service.get_tip_header().inner.number.value();
             let ready = self.chain_service.get_scripts().into_iter().any(|status| {
                 status.script == *script
                     && same_script_type(&status.script_type, script_type)
-                    && status.block_number.value() >= tip
+                    && status.block_number.value() >= target_tip
             });
             if ready {
                 return Ok(());
             }
             if Instant::now() >= deadline {
                 return Err(not_ready(format!(
-                    "script 0x{} has not been scanned to the Light Client tip",
+                    "script 0x{} has not been scanned to operational block {target_tip}",
                     hex::encode(
                         packed::Script::from(script.clone())
                             .calc_script_hash()
@@ -1095,24 +1483,31 @@ impl RpcRouter {
         }
     }
 
-    fn ensure_all_scripts_ready(&self) -> Result<()> {
-        let scripts = self.chain_service.get_scripts();
-        if scripts.is_empty() {
-            return Err(not_ready(
-                "prefix queries require previously registered complete scripts",
-            ));
+    fn wait_all_scripts_ready(&self) -> Result<()> {
+        let deadline = Instant::now() + REMOTE_DATA_TIMEOUT;
+        let target_tip = self.indexed_tip_number();
+        loop {
+            let scripts = self.chain_service.get_scripts();
+            if scripts.is_empty() {
+                return Err(not_ready(
+                    "prefix queries require previously registered complete scripts",
+                ));
+            }
+            let slowest_script = scripts
+                .iter()
+                .map(|script| script.block_number.value())
+                .min()
+                .unwrap_or_default();
+            if slowest_script >= target_tip {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(not_ready(format!(
+                    "a required script is only scanned to block {slowest_script}, operational block is {target_tip}"
+                )));
+            }
+            thread::sleep(Duration::from_millis(100));
         }
-        let tip = self.chain_service.get_tip_header().inner.number.value();
-        if let Some(script) = scripts
-            .into_iter()
-            .find(|script| script.block_number.value() < tip)
-        {
-            return Err(not_ready(format!(
-                "a required script is only scanned to block {}, Light Client tip is {tip}",
-                script.block_number.value()
-            )));
-        }
-        Ok(())
     }
 
     fn register_transaction_output_scripts(
@@ -1151,12 +1546,142 @@ impl RpcRouter {
         if !added.is_empty() {
             debug!(
                 script_count = added.len(),
-                first_required_block, "registered scripts discovered in a transaction"
+                first_required_block,
+                "extended Light Client subscriptions along a tracked transaction chain"
             );
             self.ensure_script_coverage(added).map_err(internal_error)?;
         }
         Ok(())
     }
+
+    fn transaction_extends_tracked_chain(&self, transaction: &Transaction) -> bool {
+        let registered = self
+            .chain_service
+            .get_scripts()
+            .into_iter()
+            .map(|status| {
+                let script_type = match status.script_type {
+                    ScriptType::Lock => IndexedScriptType::Lock,
+                    ScriptType::Type => IndexedScriptType::Type,
+                };
+                (packed::Script::from(status.script), script_type)
+            })
+            .collect::<HashSet<_>>();
+        let transaction: packed::Transaction = transaction.clone().into();
+
+        transaction.raw().inputs().into_iter().any(|input| {
+            let previous = input.previous_output();
+            let output_index: u32 = previous.index().unpack();
+            self.storage
+                .get_transaction(&previous.tx_hash())
+                .and_then(|(_, _, transaction)| {
+                    transaction.raw().outputs().get(output_index as usize)
+                })
+                .is_some_and(|output| output_matches_registered_scripts(&output, &registered))
+        })
+    }
+}
+
+fn script_coverage_key(script: &Script, script_type: IndexedScriptType) -> Vec<u8> {
+    let packed: packed::Script = script.clone().into();
+    let mut key = Vec::with_capacity(SCRIPT_COVERAGE_KEY_PREFIX.len() + 33);
+    key.extend_from_slice(SCRIPT_COVERAGE_KEY_PREFIX);
+    key.push(match script_type {
+        IndexedScriptType::Lock => 0,
+        IndexedScriptType::Type => 1,
+    });
+    key.extend_from_slice(packed.calc_script_hash().as_slice());
+    key
+}
+
+fn output_matches_registered_scripts(
+    output: &packed::CellOutput,
+    registered: &HashSet<(packed::Script, IndexedScriptType)>,
+) -> bool {
+    registered.contains(&(output.lock(), IndexedScriptType::Lock))
+        || output
+            .type_()
+            .to_opt()
+            .is_some_and(|script| registered.contains(&(script, IndexedScriptType::Type)))
+}
+
+fn reconcile_required_scripts<'a>(
+    existing: Vec<ScriptStatus>,
+    requested: impl IntoIterator<Item = &'a (Script, IndexedScriptType, u64)>,
+    preserve_progress: bool,
+) -> (Vec<ScriptStatus>, bool) {
+    let mut required: HashMap<(packed::Script, IndexedScriptType), ScriptStatus> =
+        if preserve_progress {
+            existing
+                .iter()
+                .map(|status| {
+                    let script_type = match status.script_type {
+                        ScriptType::Lock => IndexedScriptType::Lock,
+                        ScriptType::Type => IndexedScriptType::Type,
+                    };
+                    let copied = ScriptStatus {
+                        script: status.script.clone(),
+                        script_type: script_type.service_type(),
+                        block_number: BlockNumber::from(status.block_number.value()),
+                    };
+                    ((status.script.clone().into(), script_type), copied)
+                })
+                .collect::<HashMap<_, _>>()
+        } else {
+            HashMap::new()
+        };
+    let mut set_changed = false;
+
+    for (script, script_type, first_indexed_block) in requested {
+        let key = (script.clone().into(), *script_type);
+        required.entry(key).or_insert_with(|| {
+            set_changed = true;
+            ScriptStatus {
+                script: script.clone(),
+                script_type: script_type.service_type(),
+                block_number: BlockNumber::from(first_indexed_block.saturating_sub(1)),
+            }
+        });
+    }
+
+    if !preserve_progress {
+        set_changed = existing.len() != required.len()
+            || existing.iter().any(|status| {
+                let script_type = match status.script_type {
+                    ScriptType::Lock => IndexedScriptType::Lock,
+                    ScriptType::Type => IndexedScriptType::Type,
+                };
+                !required.contains_key(&(status.script.clone().into(), script_type))
+            });
+    }
+    (required.into_values().collect(), set_changed)
+}
+
+fn required_scripts_marker(requested: &[(Script, IndexedScriptType, u64)]) -> Vec<u8> {
+    let mut entries = requested
+        .iter()
+        .map(|(script, script_type, first_indexed_block)| {
+            let packed: packed::Script = script.clone().into();
+            let mut entry = Vec::with_capacity(packed.as_slice().len() + 13);
+            entry.push(match script_type {
+                IndexedScriptType::Lock => 0,
+                IndexedScriptType::Type => 1,
+            });
+            entry.extend_from_slice(&first_indexed_block.to_be_bytes());
+            entry.extend_from_slice(&(packed.as_slice().len() as u32).to_be_bytes());
+            entry.extend_from_slice(packed.as_slice());
+            entry
+        })
+        .collect::<Vec<_>>();
+    entries.sort_unstable();
+    entries.dedup();
+
+    let mut marker = Vec::new();
+    for entry in entries {
+        marker.extend_from_slice(&(entry.len() as u32).to_be_bytes());
+        marker.extend_from_slice(&entry);
+    }
+    marker
 }
 
 /// Resolve the epoch query used by ckb-sdk's `DefaultCellCollector`.
@@ -1558,6 +2083,15 @@ fn invalid_params(message: impl Into<String>) -> Error {
     Error::invalid_params(message.into())
 }
 
+fn find_recent_block_hash(
+    block_number: u64,
+    headers: impl IntoIterator<Item = (u64, packed::Byte32)>,
+) -> Option<packed::Byte32> {
+    headers
+        .into_iter()
+        .find_map(|(number, hash)| (number == block_number).then_some(hash))
+}
+
 fn not_ready(message: impl Into<String>) -> Error {
     Error {
         code: ErrorCode::ServerError(NOT_READY_ERROR),
@@ -1605,6 +2139,15 @@ fn map_send_transaction_error(err: ckb_light_client_lib::error::Error) -> Error 
     }
 }
 
+fn indexed_tip_number(network_tip: u64, scripts: &[ScriptStatus]) -> u64 {
+    scripts
+        .iter()
+        .map(|script| script.block_number.value())
+        .min()
+        .unwrap_or(network_tip)
+        .min(network_tip)
+}
+
 fn transaction_error(code: i64, name: &'static str, message: impl Into<String>) -> Error {
     let message = message.into();
     Error {
@@ -1624,19 +2167,41 @@ fn internal_error(message: impl Into<String>) -> Error {
 
 #[cfg(test)]
 mod tests {
-    use ckb_jsonrpc_types::JsonBytes;
-    use ckb_light_client_lib::service::Pagination;
+    use std::{collections::HashSet, net::SocketAddr, time::Duration};
+
+    use ckb_jsonrpc_types::{BlockNumber, JsonBytes, Script};
+    use ckb_light_client_lib::service::{Pagination, ScriptStatus, ScriptType};
     use ckb_types::{
         core::{EpochNumberWithFraction, HeaderBuilder},
         packed,
+        prelude::{Builder, Entity, Pack},
     };
-    use jsonrpc_core::ErrorCode;
+    use jsonrpc_core::{ErrorCode, IoHandler};
+    use jsonrpc_http_server::ServerBuilder;
 
     use super::{
-        collect_exact_page, map_send_transaction_error, resolve_epoch_view_for_fiber, route_method,
+        collect_exact_page, find_recent_block_hash, indexed_tip_number,
+        interpret_external_liveness_status, map_send_transaction_error,
+        output_matches_registered_scripts, reconcile_required_scripts,
+        resolve_epoch_view_for_fiber, route_method, IndexedScriptType, PeerFundingLivenessRpc,
         PendingInputReservations, Route, POOL_REJECTED_TRANSACTION_BY_MIN_FEE_RATE,
         TRANSACTION_FAILED_TO_RESOLVE, TRANSACTION_FAILED_TO_VERIFY,
     };
+
+    fn script(tag: u8) -> Script {
+        packed::Script::new_builder()
+            .code_hash(packed::Byte32::new([tag; 32]))
+            .build()
+            .into()
+    }
+
+    fn status(script: Script, block_number: u64) -> ScriptStatus {
+        ScriptStatus {
+            script,
+            script_type: ScriptType::Lock,
+            block_number: BlockNumber::from(block_number),
+        }
+    }
 
     fn header(
         number: u64,
@@ -1661,6 +2226,178 @@ mod tests {
         assert_eq!(route_method("get_live_cell"), Route::Local);
         assert_eq!(route_method("send_transaction"), Route::Local);
         assert_eq!(route_method("set_scripts"), Route::Unsupported);
+    }
+
+    #[test]
+    fn external_liveness_reference_only_accepts_live() {
+        assert_eq!(interpret_external_liveness_status("live"), Ok(true));
+        assert_eq!(interpret_external_liveness_status("dead"), Ok(false));
+        assert_eq!(interpret_external_liveness_status("unknown"), Ok(false));
+        assert!(interpret_external_liveness_status("pending").is_err());
+    }
+
+    #[test]
+    fn peer_funding_liveness_rpc_checks_chain_and_only_uses_status() {
+        let genesis_hash = ckb_types::H256::from([7u8; 32]);
+        let mut handler = IoHandler::new();
+        let returned_genesis_hash = genesis_hash.clone();
+        handler.add_sync_method("get_block_hash", move |_| {
+            Ok(serde_json::json!(returned_genesis_hash))
+        });
+        handler.add_sync_method("get_live_cell", |_| {
+            // A live status without Cell contents is deliberately enough: the
+            // production path obtains those contents from the Light Client.
+            Ok(serde_json::json!({
+                "cell": null,
+                "status": "live",
+                "block_hash": null
+            }))
+        });
+        let server = ServerBuilder::new(handler)
+            .threads(1)
+            .start_http(&"127.0.0.1:0".parse::<SocketAddr>().unwrap())
+            .unwrap();
+        let rpc = PeerFundingLivenessRpc::new(format!("http://{}", server.address()), genesis_hash)
+            .unwrap();
+        let out_point = packed::OutPoint::new_builder()
+            .tx_hash(packed::Byte32::new([9u8; 32]))
+            .index(0u32)
+            .build();
+
+        assert!(rpc
+            .cell_is_live(
+                &out_point,
+                std::time::Instant::now() + Duration::from_secs(2)
+            )
+            .unwrap());
+
+        let wrong_chain_rpc = PeerFundingLivenessRpc::new(
+            format!("http://{}", server.address()),
+            ckb_types::H256::from([8u8; 32]),
+        )
+        .unwrap();
+        assert!(wrong_chain_rpc
+            .cell_is_live(
+                &out_point,
+                std::time::Instant::now() + Duration::from_secs(2)
+            )
+            .unwrap_err()
+            .contains("wrong chain"));
+        server.close();
+    }
+
+    #[test]
+    fn recent_verified_headers_resolve_unmatched_block_numbers() {
+        let expected = packed::Byte32::new([2; 32]);
+        let headers = vec![
+            (100, packed::Byte32::new([1; 32])),
+            (101, expected.clone()),
+            (102, packed::Byte32::new([3; 32])),
+        ];
+
+        assert_eq!(find_recent_block_hash(101, headers.clone()), Some(expected));
+        assert_eq!(find_recent_block_hash(99, headers), None);
+    }
+
+    #[test]
+    fn operational_tip_is_the_slowest_complete_script_height() {
+        let scripts = vec![status(script(1), 120), status(script(2), 114)];
+
+        assert_eq!(indexed_tip_number(121, &scripts), 114);
+        assert_eq!(indexed_tip_number(121, &[]), 121);
+        assert_eq!(indexed_tip_number(121, &[status(script(3), 130)]), 121);
+    }
+
+    #[test]
+    fn required_script_reconciliation_keeps_persisted_progress() {
+        let required = script(1);
+        let requested = [(required.clone(), IndexedScriptType::Lock, 1_000)];
+        let (reconciled, replace) =
+            reconcile_required_scripts(vec![status(required, 2_000)], requested.iter(), true);
+
+        assert!(!replace);
+        assert_eq!(reconciled.len(), 1);
+        assert_eq!(reconciled[0].block_number.value(), 2_000);
+    }
+
+    #[test]
+    fn matching_required_marker_preserves_controlled_discovered_scripts() {
+        let required = script(1);
+        let discovered = script(2);
+        let requested = [(required.clone(), IndexedScriptType::Lock, 1_000)];
+        let (reconciled, replace) = reconcile_required_scripts(
+            vec![
+                status(required.clone(), 2_000),
+                status(discovered.clone(), 500),
+            ],
+            requested.iter(),
+            true,
+        );
+
+        assert!(!replace);
+        assert_eq!(reconciled.len(), 2);
+        assert!(reconciled.iter().any(|status| status.script == required));
+        assert!(reconciled.iter().any(|status| status.script == discovered));
+    }
+
+    #[test]
+    fn mismatched_required_marker_discards_old_discovered_scripts() {
+        let required = script(1);
+        let stale = script(2);
+        let requested = [(required.clone(), IndexedScriptType::Lock, 1_000)];
+        let (reconciled, replace) = reconcile_required_scripts(
+            vec![status(required.clone(), 2_000), status(stale, 500)],
+            requested.iter(),
+            false,
+        );
+
+        assert!(replace);
+        assert_eq!(reconciled.len(), 1);
+        assert_eq!(reconciled[0].script, required);
+        assert_eq!(reconciled[0].block_number.value(), 999);
+    }
+
+    #[test]
+    fn required_script_reconciliation_adds_missing_scripts_at_requested_start() {
+        let required = script(1);
+        let requested = [(required.clone(), IndexedScriptType::Lock, 1_000)];
+        let (reconciled, replace) = reconcile_required_scripts(Vec::new(), requested.iter(), false);
+
+        assert!(replace);
+        assert_eq!(reconciled.len(), 1);
+        assert_eq!(reconciled[0].script, required);
+        assert_eq!(reconciled[0].block_number.value(), 999);
+    }
+
+    #[test]
+    fn required_script_reconciliation_rescans_an_unmarked_cache() {
+        let required = script(1);
+        let requested = [(required.clone(), IndexedScriptType::Lock, 1_000)];
+        let (reconciled, replace) =
+            reconcile_required_scripts(vec![status(required, 2_000)], requested.iter(), false);
+
+        assert!(!replace);
+        assert_eq!(reconciled[0].block_number.value(), 999);
+    }
+
+    #[test]
+    fn tracked_output_match_accepts_registered_lock_or_type_only() {
+        let lock = packed::Script::from(script(1));
+        let type_ = packed::Script::from(script(2));
+        let output = packed::CellOutput::new_builder()
+            .lock(lock.clone())
+            .type_(Some(type_.clone()).pack())
+            .build();
+
+        assert!(output_matches_registered_scripts(
+            &output,
+            &HashSet::from([(lock, IndexedScriptType::Lock)])
+        ));
+        assert!(output_matches_registered_scripts(
+            &output,
+            &HashSet::from([(type_, IndexedScriptType::Type)])
+        ));
+        assert!(!output_matches_registered_scripts(&output, &HashSet::new()));
     }
 
     #[test]

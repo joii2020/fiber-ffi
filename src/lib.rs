@@ -1,7 +1,7 @@
 use std::{
     cell::RefCell,
     ffi::{CStr, CString},
-    fs::File,
+    fs::{File, OpenOptions},
     io::BufReader,
     os::raw::{c_char, c_void},
     panic::{catch_unwind, AssertUnwindSafe},
@@ -9,14 +9,26 @@ use std::{
     ptr,
     sync::{mpsc as std_mpsc, Mutex, Once},
     thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
 
 #[cfg(feature = "disable-ckb-rpc")]
+use std::io::Write;
+#[cfg(feature = "disable-ckb-rpc")]
 use std::sync::atomic::{AtomicU64, Ordering};
+
+#[cfg(all(feature = "disable-ckb-rpc", unix))]
+use std::os::unix::fs::PermissionsExt;
 
 use ckb_chain_spec::ChainSpec;
 use ckb_resource::Resource;
+use ckb_sdk::rpc::ckb_indexer::{
+    Order as CkbIndexerOrder, ScriptType as CkbIndexerScriptType, SearchKey as CkbIndexerSearchKey,
+    SearchKeyFilter as CkbIndexerSearchKeyFilter, SearchMode as CkbIndexerSearchMode,
+};
+use ckb_sdk::{Address as CkbAddress, AddressPayload as CkbAddressPayload, NetworkType};
 use clap_serde_derive::ClapSerde;
+use fnn::ckb::client::CkbChainClient;
 use fnn::{
     actors::RootActor,
     ckb::{
@@ -47,9 +59,6 @@ mod ckb_light_client;
 use fnn::watchtower::{
     WatchtowerActor, WatchtowerMessage, DEFAULT_WATCHTOWER_CHECK_INTERVAL_SECONDS,
 };
-#[cfg(feature = "watchtower")]
-use std::time::Duration;
-
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum FiberFfiStatus {
@@ -59,6 +68,7 @@ pub enum FiberFfiStatus {
     StartupFailed = 3,
     AlreadyStopped = 4,
     Panic = 5,
+    NotReady = 6,
 }
 
 pub type FiberEventCallback = unsafe extern "C" fn(*const c_char, *mut c_void);
@@ -71,6 +81,20 @@ pub struct FiberStartOptions {
     pub log_level: *const c_char,
     pub event_callback: Option<FiberEventCallback>,
     pub event_callback_user_data: *mut c_void,
+}
+
+#[repr(C)]
+pub struct FiberCkbDiscoverHistoryStartBlockOptions {
+    pub struct_size: u32,
+    pub flags: u32,
+    pub rpc_url: *const c_char,
+    pub lock_args: *const c_char,
+    pub pubkey: *const c_char,
+    pub address: *const c_char,
+    pub safety_blocks: u64,
+    pub has_safety_blocks: i32,
+    pub max_indexer_lag: u64,
+    pub has_max_indexer_lag: i32,
 }
 
 #[repr(C)]
@@ -348,6 +372,10 @@ pub struct FiberHandle {
     network_actor: ActorRef<NetworkActorMessage>,
     store: fnn::store::Store,
     fiber_config: FiberConfig,
+    ckb_config: CkbConfig,
+    #[cfg(feature = "disable-ckb-rpc")]
+    ckb_monitor: Option<ckb_light_client::LocalCkbMonitor>,
+    ckb_sync_estimator: Mutex<CkbSyncEstimator>,
 }
 
 enum StartupMessage {
@@ -356,8 +384,732 @@ enum StartupMessage {
         network_actor: ActorRef<NetworkActorMessage>,
         store: fnn::store::Store,
         fiber_config: Box<FiberConfig>,
+        ckb_config: Box<CkbConfig>,
+        #[cfg(feature = "disable-ckb-rpc")]
+        ckb_monitor: Option<ckb_light_client::LocalCkbMonitor>,
     },
     Failed(String),
+}
+
+const CKB_READINESS_MAX_TIP_AGE_MILLIS: u64 = 2 * 60 * 60 * 1_000;
+// Prefix cell queries made by Fiber's funding collector need every required
+// script to be scanned through the current Light Client tip. Even a one-block
+// gap can therefore abort channel funding after the opening handshake.
+const CKB_READINESS_MAX_INDEXER_LAG: u64 = 0;
+const CKB_READINESS_RETRY_SECONDS: u64 = 3;
+const CKB_FILTER_BATCH_SIZE: u64 = 1_000;
+const CKB_PEER_REQUEST_TIMEOUT_SECONDS: u64 = 60;
+const CKB_BALANCE_PAGE_SIZE: u32 = 1_000;
+const DEFAULT_CKB_HISTORY_DISCOVERY_SAFETY_BLOCKS: u64 = 1_000;
+const DEFAULT_CKB_HISTORY_DISCOVERY_MAX_INDEXER_LAG: u64 = 100;
+#[cfg(feature = "disable-ckb-rpc")]
+const CKB_WALLET_BIRTHDAY_VERSION: u32 = 1;
+// Filter synchronization advances in bursts and one peer request is allowed to
+// take this long. Treating the quiet time between batches as a stall makes the
+// estimate oscillate between measured and stalled even while indexing normally.
+const CKB_SYNC_STALL_THRESHOLD: Duration = Duration::from_secs(CKB_PEER_REQUEST_TIMEOUT_SECONDS);
+const CKB_SYNC_SAMPLE_RESET_THRESHOLD: Duration =
+    Duration::from_secs(2 * CKB_PEER_REQUEST_TIMEOUT_SECONDS);
+
+#[derive(Clone, Debug, Serialize)]
+struct CkbWaitEstimate {
+    lower_seconds: u64,
+    upper_seconds: u64,
+    retry_after_seconds: u64,
+    confidence: &'static str,
+}
+
+#[derive(Default)]
+struct CkbSyncEstimator {
+    last_sample: Option<(Instant, u64)>,
+    lag_started_at: Option<Instant>,
+    last_progress_at: Option<Instant>,
+    smoothed_blocks_per_second: Option<f64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct CkbReadiness {
+    ready: bool,
+    mode: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tip_block_number: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    indexed_block_number: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lag: Option<u64>,
+    max_acceptable_lag: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wait_estimate: Option<CkbWaitEstimate>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct CkbBalance {
+    ready: bool,
+    mode: &'static str,
+    address: String,
+    lock_args: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tip_block_number: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    indexed_block_number: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lag: Option<u64>,
+    cell_count: u64,
+    capacity_shannons: String,
+    capacity_ckb: String,
+    scope: &'static str,
+}
+
+#[cfg(feature = "disable-ckb-rpc")]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct WalletBirthdayMetadata {
+    version: u32,
+    network: String,
+    genesis_hash: String,
+    address: String,
+    lock_args: String,
+    history_start_block: u64,
+    source: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct WalletHistoryDiscovery {
+    indexer_tip: u64,
+    earliest_base_ckb_cell_block: Option<u64>,
+}
+
+impl CkbSyncEstimator {
+    fn observe(&mut self, readiness: &CkbReadiness, now: Instant) -> Option<CkbWaitEstimate> {
+        if readiness.reason.as_deref() == Some("CKB chain tip is not current") {
+            self.reset_unavailable();
+            return None;
+        }
+        let (Some(indexed_block_number), Some(lag)) =
+            (readiness.indexed_block_number, readiness.lag)
+        else {
+            self.reset_unavailable();
+            return None;
+        };
+
+        if let Some((last_at, last_indexed)) = self.last_sample {
+            let elapsed = now.saturating_duration_since(last_at);
+            if indexed_block_number < last_indexed || elapsed > CKB_SYNC_SAMPLE_RESET_THRESHOLD {
+                self.smoothed_blocks_per_second = None;
+                self.last_progress_at = None;
+                self.lag_started_at = Some(now);
+            } else if indexed_block_number > last_indexed && elapsed >= Duration::from_millis(500) {
+                let sample_rate =
+                    (indexed_block_number - last_indexed) as f64 / elapsed.as_secs_f64();
+                self.smoothed_blocks_per_second = Some(
+                    self.smoothed_blocks_per_second
+                        .map(|rate| rate * 0.5 + sample_rate * 0.5)
+                        .unwrap_or(sample_rate),
+                );
+                self.last_progress_at = Some(now);
+            }
+        }
+        self.last_sample = Some((now, indexed_block_number));
+
+        if readiness.ready || lag == 0 {
+            self.lag_started_at = None;
+            return None;
+        }
+
+        self.lag_started_at.get_or_insert(now);
+
+        if let Some(rate) = self.smoothed_blocks_per_second.filter(|rate| *rate > 0.0) {
+            if self.last_progress_at.is_some_and(|last_progress| {
+                now.saturating_duration_since(last_progress) < CKB_SYNC_STALL_THRESHOLD
+            }) {
+                let expected = ((lag as f64 / rate).ceil() as u64).max(1);
+                return Some(CkbWaitEstimate {
+                    lower_seconds: (expected / 2).max(1),
+                    upper_seconds: expected
+                        .saturating_mul(2)
+                        .saturating_add(CKB_READINESS_RETRY_SECONDS),
+                    retry_after_seconds: CKB_READINESS_RETRY_SECONDS,
+                    confidence: "measured",
+                });
+            }
+        }
+
+        let batches = lag.div_ceil(CKB_FILTER_BATCH_SIZE).max(1);
+        let lag_started_at = self.lag_started_at.unwrap_or(now);
+        let stalled = now.saturating_duration_since(lag_started_at) >= CKB_SYNC_STALL_THRESHOLD;
+        Some(CkbWaitEstimate {
+            lower_seconds: batches.saturating_mul(CKB_READINESS_RETRY_SECONDS),
+            upper_seconds: batches
+                .saturating_mul(CKB_PEER_REQUEST_TIMEOUT_SECONDS)
+                .clamp(
+                    CKB_PEER_REQUEST_TIMEOUT_SECONDS,
+                    30 * CKB_PEER_REQUEST_TIMEOUT_SECONDS,
+                )
+                .max(if stalled {
+                    2 * CKB_PEER_REQUEST_TIMEOUT_SECONDS
+                } else {
+                    0
+                }),
+            retry_after_seconds: CKB_READINESS_RETRY_SECONDS,
+            confidence: if stalled { "stalled" } else { "low" },
+        })
+    }
+
+    fn reset_unavailable(&mut self) {
+        self.last_sample = None;
+        self.lag_started_at = None;
+        self.last_progress_at = None;
+        self.smoothed_blocks_per_second = None;
+    }
+}
+
+fn ckb_readiness_mode() -> &'static str {
+    if cfg!(feature = "disable-ckb-rpc") {
+        "light_client"
+    } else {
+        "external_rpc"
+    }
+}
+
+fn evaluate_ckb_readiness(
+    tip_block_number: u64,
+    tip_timestamp_millis: u64,
+    indexed_block_number: u64,
+    now_millis: u64,
+) -> CkbReadiness {
+    evaluate_ckb_readiness_with_lag_tolerance(
+        tip_block_number,
+        tip_timestamp_millis,
+        indexed_block_number,
+        now_millis,
+        CKB_READINESS_MAX_INDEXER_LAG,
+    )
+}
+
+fn evaluate_ckb_readiness_with_lag_tolerance(
+    tip_block_number: u64,
+    tip_timestamp_millis: u64,
+    indexed_block_number: u64,
+    now_millis: u64,
+    max_acceptable_lag: u64,
+) -> CkbReadiness {
+    let lag = tip_block_number.saturating_sub(indexed_block_number);
+    let tip_is_current = tip_block_number > 0
+        && now_millis.abs_diff(tip_timestamp_millis) <= CKB_READINESS_MAX_TIP_AGE_MILLIS;
+    let reason = if !tip_is_current {
+        Some("CKB chain tip is not current".to_string())
+    } else if lag > max_acceptable_lag {
+        Some(format!(
+            "CKB indexer is {lag} block(s) behind the chain tip; maximum acceptable lag is {max_acceptable_lag}"
+        ))
+    } else {
+        None
+    };
+
+    CkbReadiness {
+        ready: reason.is_none(),
+        mode: ckb_readiness_mode(),
+        tip_block_number: Some(tip_block_number),
+        indexed_block_number: Some(indexed_block_number),
+        lag: Some(lag),
+        max_acceptable_lag,
+        wait_estimate: None,
+        reason,
+    }
+}
+
+async fn query_ckb_readiness(ckb_config: &CkbConfig) -> CkbReadiness {
+    let client = ckb_config.ckb_rpc_client();
+    let tip = match client.get_tip_header().await {
+        Ok(tip) => tip,
+        Err(err) => {
+            return CkbReadiness {
+                ready: false,
+                mode: ckb_readiness_mode(),
+                tip_block_number: None,
+                indexed_block_number: None,
+                lag: None,
+                max_acceptable_lag: CKB_READINESS_MAX_INDEXER_LAG,
+                wait_estimate: None,
+                reason: Some(format!("failed to query CKB chain tip: {err}")),
+            };
+        }
+    };
+    let tip_block_number = tip.inner.number.value();
+    let tip_timestamp_millis = tip.inner.timestamp.value();
+    let indexed_tip = match client.get_indexer_tip().await {
+        Ok(Some(indexed_tip)) => indexed_tip,
+        Ok(None) => {
+            return CkbReadiness {
+                ready: false,
+                mode: ckb_readiness_mode(),
+                tip_block_number: Some(tip_block_number),
+                indexed_block_number: None,
+                lag: None,
+                max_acceptable_lag: CKB_READINESS_MAX_INDEXER_LAG,
+                wait_estimate: None,
+                reason: Some("CKB indexer tip is not available".to_string()),
+            };
+        }
+        Err(err) => {
+            return CkbReadiness {
+                ready: false,
+                mode: ckb_readiness_mode(),
+                tip_block_number: Some(tip_block_number),
+                indexed_block_number: None,
+                lag: None,
+                max_acceptable_lag: CKB_READINESS_MAX_INDEXER_LAG,
+                wait_estimate: None,
+                reason: Some(format!("failed to query CKB indexer tip: {err}")),
+            };
+        }
+    };
+    let now_millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    evaluate_ckb_readiness(
+        tip_block_number,
+        tip_timestamp_millis,
+        indexed_tip.block_number.value(),
+        now_millis,
+    )
+}
+
+fn current_ckb_readiness(handle: &FiberHandle) -> CkbReadiness {
+    #[cfg(feature = "disable-ckb-rpc")]
+    let mut readiness = if let Some(local_ckb) = handle.ckb_monitor.as_ref() {
+        let (tip_block_number, tip_timestamp_millis, indexed_block_number) =
+            local_ckb.sync_snapshot();
+        let now_millis = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        evaluate_ckb_readiness_with_lag_tolerance(
+            tip_block_number,
+            tip_timestamp_millis,
+            indexed_block_number,
+            now_millis,
+            local_ckb.operational_lag_tolerance(),
+        )
+    } else {
+        handle
+            .runtime_handle
+            .block_on(query_ckb_readiness(&handle.ckb_config))
+    };
+    #[cfg(not(feature = "disable-ckb-rpc"))]
+    let mut readiness = handle
+        .runtime_handle
+        .block_on(query_ckb_readiness(&handle.ckb_config));
+    if let Ok(mut estimator) = handle.ckb_sync_estimator.lock() {
+        readiness.wait_estimate = estimator.observe(&readiness, Instant::now());
+    }
+    readiness
+}
+
+fn ensure_ckb_ready(handle: &FiberHandle) -> FfiCallResult<()> {
+    let readiness = current_ckb_readiness(handle);
+    if readiness.ready {
+        return Ok(());
+    }
+
+    let detail = serde_json::to_string(&readiness)
+        .unwrap_or_else(|_| "CKB readiness details are unavailable".to_string());
+    Err(ffi_error(
+        FiberFfiStatus::NotReady,
+        format!("CKB backend is not ready: {detail}"),
+    ))
+}
+
+fn format_ckb_capacity(shannons: u64) -> String {
+    const SHANNONS_PER_CKB: u64 = 100_000_000;
+    format!(
+        "{}.{:08}",
+        shannons / SHANNONS_PER_CKB,
+        shannons % SHANNONS_PER_CKB
+    )
+}
+
+fn ckb_address_network(chain: &str) -> NetworkType {
+    match chain {
+        "mainnet" | "ckb" => NetworkType::Mainnet,
+        "testnet" | "ckb_testnet" => NetworkType::Testnet,
+        "staging" | "ckb_staging" => NetworkType::Staging,
+        "preview" | "ckb_preview" => NetworkType::Preview,
+        "dev" | "ckb_dev" => NetworkType::Dev,
+        _ => NetworkType::Dev,
+    }
+}
+
+fn load_chain_genesis_block(
+    chain: &str,
+    base_dir: &Path,
+) -> std::result::Result<ckb_types::core::BlockView, String> {
+    let chain_spec = ChainSpec::load_from(&match chain {
+        "mainnet" => Resource::bundled("specs/mainnet.toml".to_string()),
+        "testnet" => Resource::bundled("specs/testnet.toml".to_string()),
+        path => Resource::file_system(base_dir.join(path)),
+    })
+    .map_err(|err| format!("failed to load chain spec: {err}"))?;
+    chain_spec
+        .build_genesis()
+        .map_err(|err| format!("failed to build ckb genesis block: {err}"))
+}
+
+fn funding_lock_from_genesis(
+    ckb_config: &CkbConfig,
+    genesis_block: &ckb_types::core::BlockView,
+) -> std::result::Result<ckb_types::packed::Script, String> {
+    use ckb_types::{core::ScriptHashType, prelude::*};
+
+    let secp256k1_type_script = genesis_block
+        .transaction(0)
+        .and_then(|transaction| transaction.output(1))
+        .and_then(|output| output.type_().to_opt())
+        .ok_or_else(|| {
+            "failed to derive the CKB funding lock script from the genesis block".to_string()
+        })?;
+    let secret_key = ckb_config
+        .read_secret_key()
+        .map_err(|err| format!("failed to read the CKB funding key: {err}"))?;
+    let address_payload =
+        CkbAddressPayload::from_pubkey(&secret_key.public_key(secp256k1::SECP256K1));
+    Ok(ckb_types::packed::Script::new_builder()
+        .code_hash(secp256k1_type_script.calc_script_hash())
+        .hash_type(ScriptHashType::Type)
+        .args(address_payload.args().pack())
+        .build())
+}
+
+#[cfg(feature = "disable-ckb-rpc")]
+fn read_wallet_birthday_metadata(
+    path: &Path,
+) -> std::result::Result<Option<WalletBirthdayMetadata>, String> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(format!(
+                "failed to read wallet birthday {}: {err}",
+                path.display()
+            ))
+        }
+    };
+    serde_json::from_reader(BufReader::new(file))
+        .map(Some)
+        .map_err(|err| format!("failed to parse wallet birthday {}: {err}", path.display()))
+}
+
+#[cfg(feature = "disable-ckb-rpc")]
+fn write_wallet_birthday_metadata(
+    path: &Path,
+    metadata: &WalletBirthdayMetadata,
+) -> std::result::Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("wallet birthday path {} has no parent", path.display()))?;
+    std::fs::create_dir_all(parent).map_err(|err| {
+        format!(
+            "failed to create wallet birthday directory {}: {err}",
+            parent.display()
+        )
+    })?;
+    #[cfg(unix)]
+    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).map_err(|err| {
+        format!(
+            "failed to secure wallet birthday directory {}: {err}",
+            parent.display()
+        )
+    })?;
+
+    let temp_id = NEXT_WALLET_BIRTHDAY_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+    let temp_path = parent.join(format!(
+        ".{}.{}.{}.tmp",
+        ckb_light_client::config::WALLET_BIRTHDAY_FILE,
+        std::process::id(),
+        temp_id
+    ));
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .map_err(|err| {
+                format!(
+                    "failed to create temporary wallet birthday {}: {err}",
+                    temp_path.display()
+                )
+            })?;
+        #[cfg(unix)]
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|err| {
+                format!(
+                    "failed to secure temporary wallet birthday {}: {err}",
+                    temp_path.display()
+                )
+            })?;
+        serde_json::to_writer_pretty(&mut file, metadata).map_err(|err| {
+            format!(
+                "failed to serialize wallet birthday {}: {err}",
+                temp_path.display()
+            )
+        })?;
+        file.write_all(b"\n").map_err(|err| {
+            format!(
+                "failed to finish wallet birthday {}: {err}",
+                temp_path.display()
+            )
+        })?;
+        file.sync_all().map_err(|err| {
+            format!(
+                "failed to flush wallet birthday {}: {err}",
+                temp_path.display()
+            )
+        })?;
+        std::fs::rename(&temp_path, path).map_err(|err| {
+            format!(
+                "failed to install wallet birthday {}: {err}",
+                path.display()
+            )
+        })?;
+        if let Ok(directory) = File::open(parent) {
+            let _ = directory.sync_all();
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    result
+}
+
+#[cfg(feature = "disable-ckb-rpc")]
+fn read_legacy_history_start_block(path: &Path) -> std::result::Result<Option<u64>, String> {
+    let value = match std::fs::read_to_string(path) {
+        Ok(value) => value,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(format!(
+                "failed to read legacy wallet birthday {}: {err}",
+                path.display()
+            ))
+        }
+    };
+    let value = value.trim();
+    let digits = value.strip_prefix("0x").ok_or_else(|| {
+        format!(
+            "legacy wallet birthday {} must be a 0x-prefixed hexadecimal height",
+            path.display()
+        )
+    })?;
+    if digits.is_empty() {
+        return Err(format!(
+            "legacy wallet birthday {} has an empty height",
+            path.display()
+        ));
+    }
+    u64::from_str_radix(digits, 16)
+        .map(Some)
+        .map_err(|err| format!("invalid legacy wallet birthday {}: {err}", path.display()))
+}
+
+fn select_wallet_history_start_block(
+    discovery: &WalletHistoryDiscovery,
+    safety_blocks: u64,
+) -> u64 {
+    discovery
+        .earliest_base_ckb_cell_block
+        .unwrap_or(discovery.indexer_tip)
+        .saturating_sub(safety_blocks)
+}
+
+fn select_earliest_history_start_block(
+    configured: Option<u64>,
+    persisted: Option<u64>,
+    discovered: Option<u64>,
+    legacy: Option<u64>,
+) -> u64 {
+    [configured, persisted, discovered, legacy]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or_default()
+}
+
+#[cfg(feature = "disable-ckb-rpc")]
+fn validate_wallet_birthday_metadata(
+    metadata: &WalletBirthdayMetadata,
+    network: &str,
+    genesis_hash: &str,
+    address: &str,
+    lock_args: &str,
+    path: &Path,
+) -> std::result::Result<(), String> {
+    if metadata.version != CKB_WALLET_BIRTHDAY_VERSION {
+        return Err(format!(
+            "wallet birthday {} has unsupported version {}",
+            path.display(),
+            metadata.version
+        ));
+    }
+    for (field, actual, expected) in [
+        ("network", metadata.network.as_str(), network),
+        ("genesis_hash", metadata.genesis_hash.as_str(), genesis_hash),
+        ("address", metadata.address.as_str(), address),
+        ("lock_args", metadata.lock_args.as_str(), lock_args),
+    ] {
+        if actual != expected {
+            return Err(format!(
+                "wallet birthday {} belongs to a different {field}: expected {expected}, found {actual}",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn discover_wallet_history(
+    rpc_url: &str,
+    funding_lock: ckb_types::packed::Script,
+    max_indexer_lag: u64,
+) -> std::result::Result<WalletHistoryDiscovery, String> {
+    let rpc = ckb_sdk::CkbRpcAsyncClient::new_with_timeout(rpc_url, Duration::from_secs(30))
+        .map_err(|err| format!("failed to create wallet discovery RPC client: {err}"))?;
+    let node_tip = rpc
+        .get_tip_block_number()
+        .await
+        .map_err(|err| format!("wallet history discovery RPC get_tip_block_number failed: {err}"))?
+        .value();
+    let indexer_tip = rpc
+        .get_indexer_tip()
+        .await
+        .map_err(|err| format!("wallet history discovery RPC get_indexer_tip failed: {err}"))?
+        .ok_or_else(|| "wallet history discovery RPC has no CKB Indexer enabled".to_string())?
+        .block_number
+        .value();
+    if indexer_tip > node_tip {
+        return Err(format!(
+            "wallet history discovery Indexer tip {indexer_tip} is above its node tip {node_tip}"
+        ));
+    }
+    let indexer_lag = node_tip.saturating_sub(indexer_tip);
+    if indexer_lag > max_indexer_lag {
+        return Err(format!(
+            "wallet history discovery Indexer is {indexer_lag} blocks behind its node; maximum acceptable lag is {max_indexer_lag}"
+        ));
+    }
+
+    let search_key = CkbIndexerSearchKey {
+        script: funding_lock.into(),
+        script_type: CkbIndexerScriptType::Lock,
+        script_search_mode: Some(CkbIndexerSearchMode::Exact),
+        filter: Some(CkbIndexerSearchKeyFilter {
+            script: None,
+            script_len_range: Some([0u64.into(), 1u64.into()]),
+            output_data: None,
+            output_data_filter_mode: None,
+            output_data_len_range: Some([0u64.into(), 1u64.into()]),
+            output_capacity_range: None,
+            block_range: None,
+        }),
+        with_data: Some(false),
+        group_by_transaction: Some(false),
+    };
+    let earliest_base_ckb_cell_block = rpc
+        .get_cells(search_key, CkbIndexerOrder::Asc, 1u32.into(), None)
+        .await
+        .map_err(|err| format!("wallet history discovery RPC get_cells failed: {err}"))?
+        .objects
+        .first()
+        .map(|cell| cell.block_number.value());
+    if earliest_base_ckb_cell_block.is_some_and(|height| height > indexer_tip) {
+        return Err(
+            "wallet history discovery Indexer returned a Cell above its own tip".to_string(),
+        );
+    }
+    Ok(WalletHistoryDiscovery {
+        indexer_tip,
+        earliest_base_ckb_cell_block,
+    })
+}
+
+async fn query_ckb_balance(
+    ckb_config: &CkbConfig,
+    chain: &str,
+    readiness: CkbReadiness,
+) -> std::result::Result<CkbBalance, String> {
+    let funding_lock = ckb_config
+        .get_default_funding_lock_script()
+        .map_err(|err| format!("failed to derive the CKB funding lock script: {err}"))?;
+    let address_payload = CkbAddressPayload::from(funding_lock.clone());
+    let lock_args = format!("0x{}", hex::encode(address_payload.args()));
+    let address = CkbAddress::new(ckb_address_network(chain), address_payload, true).to_string();
+    let search_key = CkbIndexerSearchKey {
+        script: funding_lock.into(),
+        script_type: CkbIndexerScriptType::Lock,
+        script_search_mode: Some(CkbIndexerSearchMode::Exact),
+        filter: Some(CkbIndexerSearchKeyFilter {
+            script: None,
+            script_len_range: Some([0u64.into(), 1u64.into()]),
+            output_data: None,
+            output_data_filter_mode: None,
+            output_data_len_range: Some([0u64.into(), 1u64.into()]),
+            output_capacity_range: None,
+            block_range: None,
+        }),
+        with_data: Some(false),
+        group_by_transaction: Some(false),
+    };
+    let client = CkbRpcClient::new(ckb_config);
+    let mut after = None;
+    let mut cell_count = 0u64;
+    let mut capacity_shannons = 0u64;
+
+    loop {
+        let page = client
+            .get_cells(
+                search_key.clone(),
+                CkbIndexerOrder::Asc,
+                CKB_BALANCE_PAGE_SIZE,
+                after.clone(),
+            )
+            .await
+            .map_err(|err| format!("failed to query CKB wallet cells: {err}"))?;
+        let page_len = page.objects.len();
+
+        for cell in page.objects {
+            cell_count = cell_count
+                .checked_add(1)
+                .ok_or_else(|| "CKB wallet cell count overflowed u64".to_string())?;
+            capacity_shannons = capacity_shannons
+                .checked_add(cell.output.capacity.value())
+                .ok_or_else(|| "CKB wallet capacity overflowed u64".to_string())?;
+        }
+
+        if page_len < CKB_BALANCE_PAGE_SIZE as usize {
+            break;
+        }
+        if after.as_ref() == Some(&page.last_cursor) {
+            return Err("CKB wallet cell pagination cursor did not advance".to_string());
+        }
+        after = Some(page.last_cursor);
+    }
+
+    Ok(CkbBalance {
+        ready: readiness.ready,
+        mode: readiness.mode,
+        address,
+        lock_args,
+        tip_block_number: readiness.tip_block_number,
+        indexed_block_number: readiness.indexed_block_number,
+        lag: readiness.lag,
+        cell_count,
+        capacity_shannons: capacity_shannons.to_string(),
+        capacity_ckb: format_ckb_capacity(capacity_shannons),
+        scope: "base_ckb_only",
+    })
 }
 
 #[cfg(feature = "disable-ckb-rpc")]
@@ -367,6 +1119,7 @@ struct CkbPreparationKey {
     database_prefix: Option<String>,
     config_contents_hash: String,
     funding_pubkey_hash: String,
+    history_start_block: u64,
 }
 
 #[cfg(feature = "disable-ckb-rpc")]
@@ -404,6 +1157,8 @@ static CHAIN_HASH_STATE: Mutex<Option<String>> = Mutex::new(None);
 static CKB_PREPARATION_STATE: Mutex<CkbPreparationState> = Mutex::new(CkbPreparationState::Idle);
 #[cfg(feature = "disable-ckb-rpc")]
 static NEXT_CKB_PREPARATION_ID: AtomicU64 = AtomicU64::new(1);
+#[cfg(feature = "disable-ckb-rpc")]
+static NEXT_WALLET_BIRTHDAY_TEMP_ID: AtomicU64 = AtomicU64::new(1);
 
 thread_local! {
     static LAST_ERROR: RefCell<Option<String>> = const { RefCell::new(None) };
@@ -414,19 +1169,171 @@ pub extern "C" fn fiber_version() -> *const c_char {
     concat!(env!("CARGO_PKG_VERSION"), "\0").as_ptr() as *const c_char
 }
 
+/// Derive the configured CKB funding address without starting Fiber or using RPC.
+///
+/// # Safety
+///
+/// `options` and its referenced strings must be valid for this call. `out_address`
+/// must point to writable storage for one owned C string pointer.
+#[no_mangle]
+pub unsafe extern "C" fn fiber_ckb_funding_address(
+    options: *const FiberStartOptions,
+    out_address: *mut *mut c_char,
+) -> FiberFfiStatus {
+    ffi_boundary(|| {
+        let options = checked_options(options)?;
+        prepare_out_string(out_address)?;
+        let config_path = required_string(options.config_path, "config_path")?;
+        let database_prefix = optional_string(options.database_prefix)?;
+        let parsed_config = parse_config_from_path(&config_path, database_prefix)
+            .map_err(|err| ffi_error(FiberFfiStatus::InvalidArgument, err))?;
+        let fiber_config = parsed_config.fiber.fiber.as_ref().ok_or_else(|| {
+            ffi_error(
+                FiberFfiStatus::InvalidArgument,
+                "fiber service must be enabled in config services",
+            )
+        })?;
+        let ckb_config = parsed_config.fiber.ckb.as_ref().ok_or_else(|| {
+            ffi_error(
+                FiberFfiStatus::InvalidArgument,
+                "service fiber requires service ckb to be enabled",
+            )
+        })?;
+        let genesis_block = load_chain_genesis_block(
+            &fiber_config.chain,
+            Path::new(&parsed_config.fiber.base_dir),
+        )
+        .map_err(|err| ffi_error(FiberFfiStatus::InvalidArgument, err))?;
+        let funding_lock = funding_lock_from_genesis(ckb_config, &genesis_block)
+            .map_err(|err| ffi_error(FiberFfiStatus::InvalidArgument, err))?;
+        let address = CkbAddress::new(
+            ckb_address_network(&fiber_config.chain),
+            CkbAddressPayload::from(funding_lock),
+            true,
+        )
+        .to_string();
+        write_string_out(out_address, &address)?;
+        Ok(FiberFfiStatus::Ok)
+    })
+}
+
+/// Query an explicitly supplied external CKB RPC/Indexer for a conservative
+/// history start block. This function does not read or mutate Light Client state.
+///
+/// Exactly one of `lock_args`, `pubkey`, and `address` must be supplied.
+///
+/// # Safety
+///
+/// `options` and its referenced strings must be valid for this call. `out_height`
+/// must point to writable `u64` storage.
+#[no_mangle]
+pub unsafe extern "C" fn fiber_ckb_discover_history_start_block(
+    options: *const FiberCkbDiscoverHistoryStartBlockOptions,
+    out_height: *mut u64,
+) -> FiberFfiStatus {
+    ffi_boundary(|| {
+        let options = checked_options(options)?;
+        if out_height.is_null() {
+            return Err(ffi_error(
+                FiberFfiStatus::NullPointer,
+                "out_height must be non-null",
+            ));
+        }
+        *out_height = 0;
+        validate_options_struct::<FiberCkbDiscoverHistoryStartBlockOptions>(
+            options.struct_size,
+            options.flags,
+            "FiberCkbDiscoverHistoryStartBlockOptions",
+        )?;
+        let rpc_url = required_string(options.rpc_url, "rpc_url")?;
+        if !rpc_url.starts_with("https://") && !rpc_url.starts_with("http://") {
+            return Err(ffi_error(
+                FiberFfiStatus::InvalidArgument,
+                "rpc_url must use http:// or https://",
+            ));
+        }
+        let funding_lock = funding_lock_from_discovery_options(options)?;
+        let safety_blocks = optional_u64(
+            options.has_safety_blocks,
+            options.safety_blocks,
+            "has_safety_blocks",
+        )?
+        .unwrap_or(DEFAULT_CKB_HISTORY_DISCOVERY_SAFETY_BLOCKS);
+        let max_indexer_lag = optional_u64(
+            options.has_max_indexer_lag,
+            options.max_indexer_lag,
+            "has_max_indexer_lag",
+        )?
+        .unwrap_or(DEFAULT_CKB_HISTORY_DISCOVERY_MAX_INDEXER_LAG);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|err| {
+                ffi_error(
+                    FiberFfiStatus::StartupFailed,
+                    format!("failed to create wallet discovery runtime: {err}"),
+                )
+            })?;
+        let discovery = runtime
+            .block_on(discover_wallet_history(
+                &rpc_url,
+                funding_lock,
+                max_indexer_lag,
+            ))
+            .map_err(|err| ffi_error(FiberFfiStatus::StartupFailed, err))?;
+        *out_height = select_wallet_history_start_block(&discovery, safety_blocks);
+        Ok(FiberFfiStatus::Ok)
+    })
+}
+
 /// Prepare the CKB backend used by the next `fiber_start` call.
 ///
-/// The completion callback is never invoked inline. Its JSON string is borrowed
-/// and is only valid for the duration of the callback.
+/// The progress callback is never invoked inline. Its JSON string is borrowed
+/// and is only valid for the duration of each callback.
 ///
 /// # Safety
 ///
 /// `options` and its referenced strings must remain valid for this call.
-/// `completion_callback_user_data` must remain valid until the callback returns,
-/// according to the ownership rules chosen by the caller.
+/// `completion_callback_user_data` must remain valid until the terminal
+/// `ready` or `failed` callback returns, according to the ownership rules
+/// chosen by the caller.
 #[no_mangle]
 pub unsafe extern "C" fn fiber_prepare_ckb(
     options: *const FiberStartOptions,
+    completion_callback: Option<FiberCkbPrepareCallback>,
+    completion_callback_user_data: *mut c_void,
+) -> FiberFfiStatus {
+    fiber_prepare_ckb_inner(
+        options,
+        None,
+        completion_callback,
+        completion_callback_user_data,
+    )
+}
+
+/// Prepare the CKB backend using a caller-discovered history start block.
+///
+/// # Safety
+///
+/// The safety requirements are identical to `fiber_prepare_ckb`.
+#[no_mangle]
+pub unsafe extern "C" fn fiber_prepare_ckb_with_history_start_block(
+    options: *const FiberStartOptions,
+    history_start_block: u64,
+    completion_callback: Option<FiberCkbPrepareCallback>,
+    completion_callback_user_data: *mut c_void,
+) -> FiberFfiStatus {
+    fiber_prepare_ckb_inner(
+        options,
+        Some(history_start_block),
+        completion_callback,
+        completion_callback_user_data,
+    )
+}
+
+unsafe fn fiber_prepare_ckb_inner(
+    options: *const FiberStartOptions,
+    discovered_history_start_block: Option<u64>,
     completion_callback: Option<FiberCkbPrepareCallback>,
     completion_callback_user_data: *mut c_void,
 ) -> FiberFfiStatus {
@@ -449,10 +1356,19 @@ pub unsafe extern "C" fn fiber_prepare_ckb(
         init_logging(&log_level);
 
         #[cfg(not(feature = "disable-ckb-rpc"))]
-        let _ = (&config_path, &database_prefix);
+        let _ = (
+            &config_path,
+            &database_prefix,
+            discovered_history_start_block,
+        );
 
         #[cfg(feature = "disable-ckb-rpc")]
-        schedule_embedded_ckb_preparation(config_path, database_prefix, callback)?;
+        schedule_embedded_ckb_preparation(
+            config_path,
+            database_prefix,
+            discovered_history_start_block,
+            callback,
+        )?;
 
         #[cfg(not(feature = "disable-ckb-rpc"))]
         thread::Builder::new()
@@ -465,6 +1381,7 @@ pub unsafe extern "C" fn fiber_prepare_ckb(
                         "ready": true,
                         "mode": "external_rpc",
                         "skipped": true,
+                        "status": "ready",
                     }),
                 );
             })
@@ -550,6 +1467,9 @@ pub unsafe extern "C" fn fiber_start(
                 network_actor,
                 store,
                 fiber_config,
+                ckb_config,
+                #[cfg(feature = "disable-ckb-rpc")]
+                ckb_monitor,
             }) => {
                 let handle = Box::new(FiberHandle {
                     stop_tx: Mutex::new(Some(stop_tx)),
@@ -558,6 +1478,10 @@ pub unsafe extern "C" fn fiber_start(
                     network_actor,
                     store,
                     fiber_config: *fiber_config,
+                    ckb_config: *ckb_config,
+                    #[cfg(feature = "disable-ckb-rpc")]
+                    ckb_monitor,
+                    ckb_sync_estimator: Mutex::new(CkbSyncEstimator::default()),
                 });
                 *out_handle = Box::into_raw(handle);
                 Ok(FiberFfiStatus::Ok)
@@ -637,11 +1561,20 @@ async fn run_fiber_node(
             let network_actor = node.network_actor.clone();
             let store = node.store.clone();
             let fiber_config = node.fiber_config.clone();
+            let ckb_config = node.ckb_config.clone();
+            #[cfg(feature = "disable-ckb-rpc")]
+            let ckb_monitor = node
+                .local_ckb
+                .as_ref()
+                .map(ckb_light_client::LocalCkbNodeHandle::monitor);
             let _ = startup_tx.send(StartupMessage::Started {
                 runtime_handle,
                 network_actor,
                 store,
                 fiber_config: Box::new(fiber_config),
+                ckb_config: Box::new(ckb_config),
+                #[cfg(feature = "disable-ckb-rpc")]
+                ckb_monitor,
             });
             stop_node_on_signal(node, stop_rx).await;
         }
@@ -665,9 +1598,14 @@ fn panic_message(err: Box<dyn std::any::Any + Send>) -> String {
 fn schedule_embedded_ckb_preparation(
     config_path: String,
     database_prefix: Option<String>,
+    discovered_history_start_block: Option<u64>,
     callback: CkbPrepareCallback,
 ) -> FfiCallResult<()> {
-    let key = ckb_preparation_key(config_path.clone(), database_prefix.clone())?;
+    let key = ckb_preparation_key_with_history_floor(
+        config_path.clone(),
+        database_prefix.clone(),
+        discovered_history_start_block,
+    )?;
     let mut state = CKB_PREPARATION_STATE
         .lock()
         .map_err(|_| ffi_error(FiberFfiStatus::Panic, "CKB preparation mutex poisoned"))?;
@@ -706,7 +1644,6 @@ fn schedule_embedded_ckb_preparation(
     let id = NEXT_CKB_PREPARATION_ID.fetch_add(1, Ordering::Relaxed);
     let (start_tx, start_rx) = oneshot::channel();
     let (begin_tx, begin_rx) = std_mpsc::sync_channel(0);
-    let worker_key = key.clone();
     let thread = thread::Builder::new()
         .name("fiber-ffi-prepare-ckb".to_string())
         .spawn(move || {
@@ -715,9 +1652,9 @@ fn schedule_embedded_ckb_preparation(
             }
             run_embedded_ckb_preparation(
                 id,
-                worker_key,
                 config_path,
                 database_prefix,
+                discovered_history_start_block,
                 callback,
                 start_rx,
             );
@@ -743,9 +1680,9 @@ fn schedule_embedded_ckb_preparation(
 #[cfg(feature = "disable-ckb-rpc")]
 fn run_embedded_ckb_preparation(
     id: u64,
-    key: CkbPreparationKey,
     config_path: String,
     database_prefix: Option<String>,
+    discovered_history_start_block: Option<u64>,
     callback: CkbPrepareCallback,
     start_rx: oneshot::Receiver<PreparedCkbStartCommand>,
 ) {
@@ -765,9 +1702,28 @@ fn run_embedded_ckb_preparation(
     let runtime_handle = runtime.handle().clone();
     let result = catch_unwind(AssertUnwindSafe(|| {
         runtime.block_on(async move {
-            match prepare_local_ckb(&config_path, database_prefix.clone()).await {
+            let report_status = |status| emit_embedded_ckb_progress(callback, status);
+            match prepare_local_ckb(
+                &config_path,
+                database_prefix.clone(),
+                discovered_history_start_block,
+                &report_status,
+            )
+            .await
+            {
                 Ok(local_ckb) => {
-                    if !mark_ckb_preparation_ready(id) {
+                    let resolved_key =
+                        match ckb_preparation_key(config_path.clone(), database_prefix.clone()) {
+                            Ok(key) => key,
+                            Err(err) => {
+                                clear_ckb_preparation(id);
+                                local_ckb.shutdown().await;
+                                completion_sent_in_runtime.store(true, Ordering::Release);
+                                emit_ckb_prepare_failure(callback, err.message);
+                                return;
+                            }
+                        };
+                    if !mark_ckb_preparation_ready(id, resolved_key.clone()) {
                         local_ckb.shutdown().await;
                         return;
                     }
@@ -796,7 +1752,7 @@ fn run_embedded_ckb_preparation(
                                 },
                             )
                             .await;
-                            clear_ckb_in_use(&key);
+                            clear_ckb_in_use(&resolved_key);
                         }
                         Err(_) => {
                             local_ckb.shutdown().await;
@@ -825,13 +1781,14 @@ fn run_embedded_ckb_preparation(
 }
 
 #[cfg(feature = "disable-ckb-rpc")]
-fn mark_ckb_preparation_ready(id: u64) -> bool {
+fn mark_ckb_preparation_ready(id: u64, resolved_key: CkbPreparationKey) -> bool {
     let Ok(mut state) = CKB_PREPARATION_STATE.lock() else {
         return false;
     };
     let current = std::mem::replace(&mut *state, CkbPreparationState::Idle);
     match current {
-        CkbPreparationState::Preparing(worker) if worker.id == id => {
+        CkbPreparationState::Preparing(mut worker) if worker.id == id => {
+            worker.key = resolved_key;
             *state = CkbPreparationState::Ready(worker);
             true
         }
@@ -908,6 +1865,15 @@ fn ckb_preparation_key(
     config_path: String,
     database_prefix: Option<String>,
 ) -> FfiCallResult<CkbPreparationKey> {
+    ckb_preparation_key_with_history_floor(config_path, database_prefix, None)
+}
+
+#[cfg(feature = "disable-ckb-rpc")]
+fn ckb_preparation_key_with_history_floor(
+    config_path: String,
+    database_prefix: Option<String>,
+    history_start_block_floor: Option<u64>,
+) -> FfiCallResult<CkbPreparationKey> {
     let config_contents = std::fs::read(&config_path).map_err(|err| {
         ffi_error(
             FiberFfiStatus::InvalidArgument,
@@ -931,12 +1897,31 @@ fn ckb_preparation_key(
     let funding_pubkey_hash = hex::encode(ckb_hash::blake2b_256(
         secret_key.public_key(secp256k1::SECP256K1).serialize(),
     ));
+    let configured_height = parsed_config
+        .light_client
+        .history_start_block_is_explicit
+        .then_some(parsed_config.light_client.history_start_block);
+    let persisted_height =
+        read_wallet_birthday_metadata(&parsed_config.light_client.wallet_birthday_path)
+            .map_err(|err| ffi_error(FiberFfiStatus::InvalidArgument, err))?
+            .map(|metadata| metadata.history_start_block);
+    let legacy_height = read_legacy_history_start_block(
+        &parsed_config.light_client.legacy_history_start_block_path,
+    )
+    .map_err(|err| ffi_error(FiberFfiStatus::InvalidArgument, err))?;
+    let history_start_block = select_earliest_history_start_block(
+        configured_height,
+        persisted_height,
+        history_start_block_floor,
+        legacy_height,
+    );
 
     Ok(CkbPreparationKey {
         config_path,
         database_prefix,
         config_contents_hash: hex::encode(ckb_hash::blake2b_256(&config_contents)),
         funding_pubkey_hash,
+        history_start_block,
     })
 }
 
@@ -949,6 +1934,7 @@ fn emit_embedded_ckb_ready(callback: CkbPrepareCallback) {
             "ready": true,
             "mode": "light_client",
             "skipped": false,
+            "status": "ready",
         }),
     );
 }
@@ -971,9 +1957,84 @@ fn emit_ckb_prepare_failure(callback: CkbPrepareCallback, error: impl Into<Strin
         json!({
             "ready": false,
             "mode": "light_client",
+            "status": "failed",
             "error": error,
         }),
     );
+}
+
+#[cfg(feature = "disable-ckb-rpc")]
+fn emit_embedded_ckb_progress(
+    callback: CkbPrepareCallback,
+    status: ckb_light_client::CkbPrepareStatus,
+) {
+    let result = embedded_ckb_progress_result(status);
+    emit_ckb_prepare_completion(callback, FiberFfiStatus::Ok, result);
+}
+
+#[cfg(feature = "disable-ckb-rpc")]
+fn embedded_ckb_progress_result(status: ckb_light_client::CkbPrepareStatus) -> serde_json::Value {
+    use ckb_light_client::CkbPrepareStatus;
+
+    match status {
+        CkbPrepareStatus::Initializing => json!({
+            "ready": false,
+            "mode": "light_client",
+            "status": "initializing",
+        }),
+        CkbPrepareStatus::WalletBirthday {
+            address,
+            history_start_block,
+            source,
+        } => json!({
+            "ready": false,
+            "mode": "light_client",
+            "status": "wallet_birthday",
+            "address": address,
+            "history_start_block": history_start_block,
+            "source": source,
+        }),
+        CkbPrepareStatus::Connecting {
+            connected_peers,
+            required_peers,
+            tip_block_number,
+            tip_is_current,
+        } => json!({
+            "ready": false,
+            "mode": "light_client",
+            "status": "connecting",
+            "connected_peers": connected_peers,
+            "required_peers": required_peers,
+            "tip_block_number": tip_block_number,
+            "tip_is_current": tip_is_current,
+        }),
+        CkbPrepareStatus::SyncingHeaders {
+            connected_peers,
+            required_peers,
+            tip_block_number,
+            tip_is_current,
+        } => json!({
+            "ready": false,
+            "mode": "light_client",
+            "status": "syncing_headers",
+            "connected_peers": connected_peers,
+            "required_peers": required_peers,
+            "tip_block_number": tip_block_number,
+            "tip_is_current": tip_is_current,
+        }),
+        CkbPrepareStatus::SyncingScripts {
+            tip_block_number,
+            slowest_script_block_number,
+            script_count,
+        } => json!({
+            "ready": false,
+            "mode": "light_client",
+            "status": "syncing_scripts",
+            "tip_block_number": tip_block_number,
+            "slowest_script_block_number": slowest_script_block_number,
+            "script_count": script_count,
+        }),
+    }
 }
 
 fn emit_ckb_prepare_completion(
@@ -981,8 +2042,9 @@ fn emit_ckb_prepare_completion(
     status: FiberFfiStatus,
     result: serde_json::Value,
 ) {
-    let result = serde_json::to_string(&result)
-        .unwrap_or_else(|_| "{\"ready\":false,\"error\":\"serialization failed\"}".to_string());
+    let result = serde_json::to_string(&result).unwrap_or_else(|_| {
+        "{\"ready\":false,\"status\":\"failed\",\"error\":\"serialization failed\"}".to_string()
+    });
     let result = CString::new(result)
         .expect("CKB preparation completion JSON cannot contain an interior NUL");
     unsafe {
@@ -1044,6 +2106,49 @@ pub unsafe extern "C" fn fiber_node_info(
             .block_on(call_node_info(handle.network_actor.clone()))
             .map_err(|err| ffi_error(FiberFfiStatus::InvalidArgument, err))?;
         write_json_out(out_json, node_info_to_json(response))?;
+
+        Ok(FiberFfiStatus::Ok)
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn fiber_ckb_readiness(
+    handle: *mut FiberHandle,
+    out_json: *mut *mut c_char,
+) -> FiberFfiStatus {
+    ffi_boundary(|| {
+        let handle = checked_handle(handle)?;
+        prepare_out_string(out_json)?;
+
+        let readiness = current_ckb_readiness(handle);
+        write_serializable_out(out_json, &readiness)?;
+
+        Ok(FiberFfiStatus::Ok)
+    })
+}
+
+/// Returns the indexed base-CKB capacity controlled by the configured funding
+/// key. The result is a Light Client/indexer snapshot and can include cells
+/// that an in-flight transaction has already reserved.
+#[no_mangle]
+pub unsafe extern "C" fn fiber_ckb_balance(
+    handle: *mut FiberHandle,
+    out_json: *mut *mut c_char,
+) -> FiberFfiStatus {
+    ffi_boundary(|| {
+        let handle = checked_handle(handle)?;
+        prepare_out_string(out_json)?;
+
+        let readiness = current_ckb_readiness(handle);
+        let balance = handle
+            .runtime_handle
+            .block_on(query_ckb_balance(
+                &handle.ckb_config,
+                &handle.fiber_config.chain,
+                readiness,
+            ))
+            .map_err(|err| ffi_error(FiberFfiStatus::InvalidArgument, err))?;
+        write_serializable_out(out_json, &balance)?;
 
         Ok(FiberFfiStatus::Ok)
     })
@@ -1159,6 +2264,7 @@ pub unsafe extern "C" fn fiber_open_channel(
         prepare_out_string(out_temporary_channel_id)?;
 
         let params = open_channel_params_from_options(options)?;
+        ensure_ckb_ready(handle)?;
         let response = handle
             .runtime_handle
             .block_on(call_open_channel(handle, params))?;
@@ -1539,6 +2645,7 @@ struct RunningNode {
     network_actor: ActorRef<NetworkActorMessage>,
     store: fnn::store::Store,
     fiber_config: FiberConfig,
+    ckb_config: CkbConfig,
     #[cfg(feature = "disable-ckb-rpc")]
     local_ckb: Option<ckb_light_client::LocalCkbNodeHandle>,
 }
@@ -1670,17 +2777,160 @@ fn set_base_dir(value: &mut serde_yaml::Value, section: &str, base_dir: &Path) {
 }
 
 #[cfg(feature = "disable-ckb-rpc")]
+fn resolve_wallet_birthday(
+    parsed_config: &mut ParsedFfiConfig,
+    genesis_block: &ckb_types::core::BlockView,
+    discovered_history_start_block: Option<u64>,
+    status_reporter: ckb_light_client::CkbPrepareStatusReporter<'_>,
+) -> std::result::Result<(), String> {
+    use ckb_types::prelude::Unpack;
+
+    let fiber_config = parsed_config
+        .fiber
+        .fiber
+        .as_ref()
+        .ok_or_else(|| "fiber service must be enabled in config services".to_string())?;
+    let ckb_config = parsed_config
+        .fiber
+        .ckb
+        .as_ref()
+        .ok_or_else(|| "service fiber requires service ckb to be enabled".to_string())?;
+    let funding_lock = funding_lock_from_genesis(ckb_config, genesis_block)?;
+    let address_payload = CkbAddressPayload::from(funding_lock.clone());
+    let lock_args = format!("0x{}", hex::encode(address_payload.args()));
+    let address = CkbAddress::new(
+        ckb_address_network(&fiber_config.chain),
+        address_payload,
+        true,
+    )
+    .to_string();
+    let expected_genesis_hash: ckb_types::H256 = genesis_block.hash().unpack();
+    let genesis_hash = format!("{expected_genesis_hash:#x}");
+
+    let birthday_path = parsed_config.light_client.wallet_birthday_path.clone();
+    let legacy_start = read_legacy_history_start_block(
+        &parsed_config.light_client.legacy_history_start_block_path,
+    )?;
+
+    let persisted = read_wallet_birthday_metadata(&birthday_path)?;
+    if let Some(metadata) = persisted.as_ref() {
+        validate_wallet_birthday_metadata(
+            metadata,
+            &fiber_config.chain,
+            &genesis_hash,
+            &address,
+            &lock_args,
+            &birthday_path,
+        )?;
+    }
+
+    let persisted_height = persisted
+        .as_ref()
+        .map(|metadata| metadata.history_start_block);
+    let configured_height = parsed_config
+        .light_client
+        .history_start_block_is_explicit
+        .then_some(parsed_config.light_client.history_start_block);
+    let has_history_start_block = [
+        configured_height,
+        persisted_height,
+        discovered_history_start_block,
+        legacy_start,
+    ]
+    .into_iter()
+    .any(|height| height.is_some());
+    if !has_history_start_block {
+        parsed_config.light_client.history_start_block = 0;
+        status_reporter(ckb_light_client::CkbPrepareStatus::WalletBirthday {
+            address,
+            history_start_block: 0,
+            source: "default_genesis".to_string(),
+        });
+        return Ok(());
+    }
+    let history_start_block = select_earliest_history_start_block(
+        configured_height,
+        persisted_height,
+        discovered_history_start_block,
+        legacy_start,
+    );
+
+    let source = if persisted_height == Some(history_start_block) {
+        "persisted"
+    } else if legacy_start == Some(history_start_block)
+        && persisted_height != Some(history_start_block)
+        && discovered_history_start_block != Some(history_start_block)
+    {
+        "legacy_floor"
+    } else if discovered_history_start_block == Some(history_start_block)
+        && persisted_height != Some(history_start_block)
+    {
+        "external_discovery"
+    } else if configured_height == Some(history_start_block) {
+        "configured"
+    } else {
+        "earliest_safe_height"
+    };
+    if persisted_height != Some(history_start_block) {
+        let metadata = WalletBirthdayMetadata {
+            version: CKB_WALLET_BIRTHDAY_VERSION,
+            network: fiber_config.chain.clone(),
+            genesis_hash,
+            address: address.clone(),
+            lock_args,
+            history_start_block,
+            source: source.to_string(),
+        };
+        write_wallet_birthday_metadata(&birthday_path, &metadata)?;
+    }
+    parsed_config.light_client.history_start_block = history_start_block;
+    status_reporter(ckb_light_client::CkbPrepareStatus::WalletBirthday {
+        address,
+        history_start_block,
+        source: source.to_string(),
+    });
+    Ok(())
+}
+
+#[cfg(feature = "disable-ckb-rpc")]
 async fn prepare_local_ckb(
     config_path: &str,
     database_prefix: Option<String>,
+    discovered_history_start_block: Option<u64>,
+    status_reporter: ckb_light_client::CkbPrepareStatusReporter<'_>,
 ) -> std::result::Result<ckb_light_client::LocalCkbNodeHandle, String> {
-    let parsed_config = parse_config_from_path(config_path, database_prefix)?;
+    status_reporter(ckb_light_client::CkbPrepareStatus::Initializing);
+    let mut parsed_config = parse_config_from_path(config_path, database_prefix)?;
+    let fiber_config = parsed_config
+        .fiber
+        .fiber
+        .as_ref()
+        .ok_or_else(|| "fiber service must be enabled in config services".to_string())?;
+    let genesis_block = load_chain_genesis_block(
+        &fiber_config.chain,
+        Path::new(&parsed_config.fiber.base_dir),
+    )?;
+    resolve_wallet_birthday(
+        &mut parsed_config,
+        &genesis_block,
+        discovered_history_start_block,
+        status_reporter,
+    )?;
     debug!(
         chain = %parsed_config.light_client.chain_label(),
         store_path = %parsed_config.light_client.store_path.display(),
         network_path = %parsed_config.light_client.network_path.display(),
         history_start_block = parsed_config.light_client.history_start_block,
+        peer_funding_liveness_rpc_configured = parsed_config.light_client.peer_funding_liveness_rpc_url.is_some(),
+        startup_min_peers = parsed_config.light_client.startup_min_peers,
+        startup_script_lag_tolerance = parsed_config.light_client.startup_script_lag_tolerance,
+        operational_lag_tolerance = parsed_config.light_client.operational_lag_tolerance,
         bootnodes = parsed_config.light_client.bootnodes.len(),
+        preferred_peers = parsed_config.light_client.preferred_peers.len(),
+        filter_preferred_peer_chance_percent = parsed_config.light_client.filter_preferred_peer_chance_percent,
+        filter_request_timeout_seconds = parsed_config.light_client.filter_request_timeout_seconds,
+        filter_peer_failure_threshold = parsed_config.light_client.filter_peer_failure_threshold,
+        filter_peer_cooldown_seconds = parsed_config.light_client.filter_peer_cooldown_seconds,
         local_rpc_listen_address = %ckb_light_client::config::LocalLightClientConfig::local_rpc_listen_address(),
         max_outbound_peers = ckb_light_client::config::MAX_OUTBOUND_PEERS,
         header_ready_timeout_seconds = ckb_light_client::config::HEADER_READY_TIMEOUT.as_secs(),
@@ -1688,6 +2938,9 @@ async fn prepare_local_ckb(
         "validated embedded CKB Light Client configuration"
     );
 
+    let history_start_block = parsed_config.light_client.history_start_block;
+    let trust_pinned_cell_deps = parsed_config.light_client.trust_pinned_cell_deps;
+    let light_client_config = parsed_config.light_client;
     let config = parsed_config.fiber;
     let fiber_config = config
         .fiber
@@ -1697,23 +2950,21 @@ async fn prepare_local_ckb(
         .ckb
         .as_ref()
         .ok_or_else(|| "service fiber requires service ckb to be enabled".to_string())?;
-    let chain_spec = ChainSpec::load_from(&match fiber_config.chain.as_str() {
-        "mainnet" => Resource::bundled("specs/mainnet.toml".to_string()),
-        "testnet" => Resource::bundled("specs/testnet.toml".to_string()),
-        path => Resource::file_system(Path::new(&config.base_dir).join(path)),
-    })
-    .map_err(|err| format!("failed to load chain spec: {err}"))?;
-    let genesis_block = chain_spec
-        .build_genesis()
-        .map_err(|err| format!("failed to build ckb genesis block: {err}"))?;
-    let required_scripts = required_light_client_scripts(
+    let (required_scripts, pinned_cell_deps) = required_light_client_dependencies(
         fiber_config,
         ckb_config,
         &genesis_block,
-        parsed_config.light_client.history_start_block,
+        history_start_block,
+        trust_pinned_cell_deps,
     )?;
 
-    ckb_light_client::LocalCkbNodeHandle::start(parsed_config.light_client, required_scripts).await
+    ckb_light_client::LocalCkbNodeHandle::start(
+        light_client_config,
+        required_scripts,
+        pinned_cell_deps,
+        Some(status_reporter),
+    )
+    .await
 }
 
 async fn start_node(
@@ -1730,12 +2981,34 @@ async fn start_node(
 
     let parsed_config = parse_config_from_path(&config_path, database_prefix)?;
     #[cfg(feature = "disable-ckb-rpc")]
+    let mut parsed_config = parsed_config;
+    let fiber_config_for_chain = parsed_config
+        .fiber
+        .fiber
+        .as_ref()
+        .ok_or_else(|| "fiber service must be enabled in config services".to_string())?;
+    let genesis_block = load_chain_genesis_block(
+        &fiber_config_for_chain.chain,
+        Path::new(&parsed_config.fiber.base_dir),
+    )?;
+    #[cfg(feature = "disable-ckb-rpc")]
+    resolve_wallet_birthday(&mut parsed_config, &genesis_block, None, &|_| {})?;
+    #[cfg(feature = "disable-ckb-rpc")]
     debug!(
         chain = %parsed_config.light_client.chain_label(),
         store_path = %parsed_config.light_client.store_path.display(),
         network_path = %parsed_config.light_client.network_path.display(),
         history_start_block = parsed_config.light_client.history_start_block,
+        peer_funding_liveness_rpc_configured = parsed_config.light_client.peer_funding_liveness_rpc_url.is_some(),
+        startup_min_peers = parsed_config.light_client.startup_min_peers,
+        startup_script_lag_tolerance = parsed_config.light_client.startup_script_lag_tolerance,
+        operational_lag_tolerance = parsed_config.light_client.operational_lag_tolerance,
         bootnodes = parsed_config.light_client.bootnodes.len(),
+        preferred_peers = parsed_config.light_client.preferred_peers.len(),
+        filter_preferred_peer_chance_percent = parsed_config.light_client.filter_preferred_peer_chance_percent,
+        filter_request_timeout_seconds = parsed_config.light_client.filter_request_timeout_seconds,
+        filter_peer_failure_threshold = parsed_config.light_client.filter_peer_failure_threshold,
+        filter_peer_cooldown_seconds = parsed_config.light_client.filter_peer_cooldown_seconds,
         local_rpc_listen_address = %ckb_light_client::config::LocalLightClientConfig::local_rpc_listen_address(),
         max_outbound_peers = ckb_light_client::config::MAX_OUTBOUND_PEERS,
         header_ready_timeout_seconds = ckb_light_client::config::HEADER_READY_TIMEOUT.as_secs(),
@@ -1754,16 +3027,6 @@ async fn start_node(
         .clone()
         .ok_or_else(|| "service fiber requires service ckb to be enabled".to_string())?;
 
-    let chain_spec = ChainSpec::load_from(&match fiber_config.chain.as_str() {
-        "mainnet" => Resource::bundled("specs/mainnet.toml".to_string()),
-        "testnet" => Resource::bundled("specs/testnet.toml".to_string()),
-        path => Resource::file_system(Path::new(&config.base_dir).join(path)),
-    })
-    .map_err(|err| format!("failed to load chain spec: {err}"))?;
-    let genesis_block = chain_spec
-        .build_genesis()
-        .map_err(|err| format!("failed to build ckb genesis block: {err}"))?;
-
     #[cfg(feature = "disable-ckb-rpc")]
     let (ckb_config, local_ckb) = if let Some(local_ckb) = prepared_ckb.local_ckb {
         let mut ckb_config = ckb_config;
@@ -1775,15 +3038,20 @@ async fn start_node(
         (ckb_config, Some(local_ckb))
     } else {
         let mut ckb_config = ckb_config;
-        let required_scripts = required_light_client_scripts(
+        let (required_scripts, pinned_cell_deps) = required_light_client_dependencies(
             &fiber_config,
             &ckb_config,
             &genesis_block,
             light_client_config.history_start_block,
+            light_client_config.trust_pinned_cell_deps,
         )?;
-        let local_ckb =
-            ckb_light_client::LocalCkbNodeHandle::start(light_client_config, required_scripts)
-                .await?;
+        let local_ckb = ckb_light_client::LocalCkbNodeHandle::start(
+            light_client_config,
+            required_scripts,
+            pinned_cell_deps,
+            None,
+        )
+        .await?;
         ckb_config.rpc_url = local_ckb.rpc_url().to_string();
         info!(
             rpc_url = %ckb_config.rpc_url,
@@ -1888,6 +3156,7 @@ async fn start_node(
         default_shutdown_script,
     )
     .await;
+    let ckb_config_for_handle = ckb_config.clone();
 
     #[cfg(feature = "watchtower")]
     let watchtower_actor = if fiber_config.disable_built_in_watchtower.unwrap_or_default() {
@@ -1931,6 +3200,7 @@ async fn start_node(
         network_actor,
         store,
         fiber_config,
+        ckb_config: ckb_config_for_handle,
         #[cfg(feature = "disable-ckb-rpc")]
         local_ckb,
     })
@@ -1951,34 +3221,24 @@ async fn stop_node_on_signal(node: RunningNode, stop_rx: oneshot::Receiver<()>) 
 }
 
 #[cfg(feature = "disable-ckb-rpc")]
-fn required_light_client_scripts(
+fn required_light_client_dependencies(
     fiber_config: &FiberConfig,
     ckb_config: &CkbConfig,
     genesis_block: &ckb_types::core::BlockView,
     history_start_block: u64,
-) -> std::result::Result<Vec<ckb_light_client::runtime::RequiredScript>, String> {
+    trust_configured_cell_deps: bool,
+) -> std::result::Result<
+    (
+        Vec<ckb_light_client::runtime::RequiredScript>,
+        std::collections::HashSet<ckb_types::packed::OutPoint>,
+    ),
+    String,
+> {
     use ckb_light_client::runtime::RequiredScript;
-    use ckb_types::{core::ScriptHashType, packed, prelude::*};
+    use ckb_types::{packed, prelude::*};
 
     let mut scripts = Vec::new();
-    let secp256k1_type_script = genesis_block
-        .transaction(0)
-        .and_then(|transaction| transaction.output(1))
-        .and_then(|output| output.type_().to_opt())
-        .ok_or_else(|| {
-            "failed to derive the Light Client funding lock script from the genesis block"
-                .to_string()
-        })?;
-    let secret_key = ckb_config
-        .read_secret_key()
-        .map_err(|err| format!("failed to read the CKB funding key for the Light Client: {err}"))?;
-    let pubkey_hash =
-        ckb_hash::blake2b_256(secret_key.public_key(secp256k1::SECP256K1).serialize());
-    let funding_lock = packed::Script::new_builder()
-        .code_hash(secp256k1_type_script.calc_script_hash())
-        .hash_type(ScriptHashType::Type)
-        .args(pubkey_hash[..20].pack())
-        .build();
+    let funding_lock = funding_lock_from_genesis(ckb_config, genesis_block)?;
     scripts.push(RequiredScript::lock(
         funding_lock.into(),
         history_start_block,
@@ -2004,7 +3264,44 @@ fn required_light_client_scripts(
         scripts.push(RequiredScript::type_(type_id, history_start_block));
     }
 
-    Ok(scripts)
+    // The secp256k1 dep-group is committed by the selected chain's genesis
+    // block, which the Light Client consensus already trusts. Treating it and
+    // its members as pinned avoids a pointless scan back to genesis whenever a
+    // normal funding transaction is verified.
+    let secp256k1_dep_group_tx_hash = genesis_block
+        .transaction(1)
+        .ok_or_else(|| "CKB genesis block has no secp256k1 dep-group transaction".to_string())?
+        .hash();
+    let mut pinned_cell_deps = std::collections::HashSet::from([packed::OutPoint::new_builder()
+        .tx_hash(secp256k1_dep_group_tx_hash)
+        .index(0u32)
+        .build()]);
+
+    if trust_configured_cell_deps {
+        pinned_cell_deps.extend(
+            fiber_config
+                .scripts
+                .iter()
+                .flat_map(|script| script.cell_deps.iter())
+                .filter_map(|dependency| dependency.cell_dep.clone())
+                .map(|cell_dep| {
+                    let cell_dep: packed::CellDep = cell_dep.into();
+                    cell_dep.out_point()
+                })
+                .chain(
+                    ckb_config
+                        .udt_whitelist
+                        .as_ref()
+                        .into_iter()
+                        .flat_map(|whitelist| whitelist.0.iter())
+                        .flat_map(|udt| udt.cell_deps.iter())
+                        .filter_map(|dependency| dependency.cell_dep.as_ref())
+                        .map(|cell_dep| cell_dep.out_point.clone().into()),
+                ),
+        );
+    }
+
+    Ok((scripts, pinned_cell_deps))
 }
 
 enum ConnectPeerCommand {
@@ -3259,6 +4556,76 @@ fn validate_options_struct<T>(struct_size: u32, flags: u32, name: &str) -> FfiCa
     Ok(())
 }
 
+fn funding_lock_from_discovery_options(
+    options: &FiberCkbDiscoverHistoryStartBlockOptions,
+) -> FfiCallResult<ckb_types::packed::Script> {
+    let lock_args = optional_string(options.lock_args)?.filter(|value| !value.trim().is_empty());
+    let pubkey = optional_string(options.pubkey)?.filter(|value| !value.trim().is_empty());
+    let address = optional_string(options.address)?.filter(|value| !value.trim().is_empty());
+    let supplied = usize::from(lock_args.is_some())
+        + usize::from(pubkey.is_some())
+        + usize::from(address.is_some());
+    if supplied != 1 {
+        return Err(ffi_error(
+            FiberFfiStatus::InvalidArgument,
+            "exactly one of lock_args, pubkey, and address must be supplied",
+        ));
+    }
+
+    let payload = if let Some(lock_args) = lock_args {
+        let value = lock_args.strip_prefix("0x").unwrap_or(&lock_args);
+        let bytes = hex::decode(value).map_err(|err| {
+            ffi_error(
+                FiberFfiStatus::InvalidArgument,
+                format!("invalid lock_args hex: {err}"),
+            )
+        })?;
+        let hash = ckb_types::H160::from_slice(&bytes).map_err(|err| {
+            ffi_error(
+                FiberFfiStatus::InvalidArgument,
+                format!("lock_args must be exactly 20 bytes: {err}"),
+            )
+        })?;
+        CkbAddressPayload::from_pubkey_hash(hash)
+    } else if let Some(pubkey) = pubkey {
+        let value = pubkey.strip_prefix("0x").unwrap_or(&pubkey);
+        let bytes = hex::decode(value).map_err(|err| {
+            ffi_error(
+                FiberFfiStatus::InvalidArgument,
+                format!("invalid CKB pubkey hex: {err}"),
+            )
+        })?;
+        let pubkey = secp256k1::PublicKey::from_slice(&bytes).map_err(|err| {
+            ffi_error(
+                FiberFfiStatus::InvalidArgument,
+                format!("invalid CKB secp256k1 pubkey: {err}"),
+            )
+        })?;
+        CkbAddressPayload::from_pubkey(&pubkey)
+    } else {
+        let address = address.expect("one identity was validated above");
+        let address = address.parse::<CkbAddress>().map_err(|err| {
+            ffi_error(
+                FiberFfiStatus::InvalidArgument,
+                format!("invalid CKB address: {err}"),
+            )
+        })?;
+        address.payload().clone()
+    };
+    Ok((&payload).into())
+}
+
+fn optional_u64(has_value: i32, value: u64, field: &str) -> FfiCallResult<Option<u64>> {
+    match has_value {
+        0 => Ok(None),
+        1 => Ok(Some(value)),
+        _ => Err(ffi_error(
+            FiberFfiStatus::InvalidArgument,
+            format!("{field} must be 0 or 1"),
+        )),
+    }
+}
+
 fn parse_pubkey(value: &str) -> FfiCallResult<fnn::fiber_types::Pubkey> {
     let value = value.strip_prefix("0x").unwrap_or(value);
     let bytes = hex::decode(value).map_err(|err| {
@@ -3333,6 +4700,19 @@ fn prepare_out_string(out_string: *mut *mut c_char) -> FfiCallResult<()> {
     Ok(())
 }
 
+fn write_string_out(out_string: *mut *mut c_char, value: &str) -> FfiCallResult<()> {
+    let string = CString::new(value).map_err(|err| {
+        ffi_error(
+            FiberFfiStatus::InvalidArgument,
+            format!("failed to allocate string: {err}"),
+        )
+    })?;
+    unsafe {
+        *out_string = string.into_raw();
+    }
+    Ok(())
+}
+
 fn write_json_out(out_json: *mut *mut c_char, value: serde_json::Value) -> FfiCallResult<()> {
     let json = serde_json::to_string(&value).map_err(|err| {
         ffi_error(
@@ -3403,7 +4783,23 @@ fn write_serializable_field_out<T: Serialize>(
 fn init_logging(log_level: &str) {
     let filter = EnvFilter::try_new(log_level).unwrap_or_else(|_| EnvFilter::new("info"));
     INIT_LOGGING.call_once(|| {
-        let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+        let builder = tracing_subscriber::fmt().with_env_filter(filter);
+        if let Some(path) = std::env::var_os("FIBER_FFI_LOG_FILE") {
+            match OpenOptions::new().create(true).append(true).open(path) {
+                Ok(file) => {
+                    let _ = builder
+                        .with_ansi(false)
+                        .with_writer(Mutex::new(file))
+                        .try_init();
+                }
+                Err(_) => {
+                    let _ = builder.try_init();
+                }
+            }
+        } else {
+            let _ = builder.try_init();
+        }
+        debug!("fiber ffi logging initialized");
     });
 }
 
@@ -3455,6 +4851,251 @@ fn sanitize_error_message(message: String) -> String {
     message.replace('\0', "\\0")
 }
 
+#[cfg(test)]
+mod ckb_readiness_tests {
+    use super::*;
+
+    fn discovery_options() -> FiberCkbDiscoverHistoryStartBlockOptions {
+        FiberCkbDiscoverHistoryStartBlockOptions {
+            struct_size: std::mem::size_of::<FiberCkbDiscoverHistoryStartBlockOptions>() as u32,
+            flags: 0,
+            rpc_url: ptr::null(),
+            lock_args: ptr::null(),
+            pubkey: ptr::null(),
+            address: ptr::null(),
+            safety_blocks: 0,
+            has_safety_blocks: 0,
+            max_indexer_lag: 0,
+            has_max_indexer_lag: 0,
+        }
+    }
+
+    #[test]
+    fn discovery_wallet_identity_accepts_lock_args_pubkey_or_address() {
+        let secret_key = secp256k1::SecretKey::from_slice(&[1u8; 32]).unwrap();
+        let pubkey = secret_key.public_key(secp256k1::SECP256K1);
+        let payload = CkbAddressPayload::from_pubkey(&pubkey);
+        let lock_args = CString::new(format!("0x{}", hex::encode(payload.args()))).unwrap();
+        let pubkey = CString::new(hex::encode(pubkey.serialize())).unwrap();
+        let address =
+            CString::new(CkbAddress::new(NetworkType::Testnet, payload, true).to_string()).unwrap();
+
+        let mut by_lock_args = discovery_options();
+        by_lock_args.lock_args = lock_args.as_ptr();
+        let mut by_pubkey = discovery_options();
+        by_pubkey.pubkey = pubkey.as_ptr();
+        let mut by_address = discovery_options();
+        by_address.address = address.as_ptr();
+
+        let expected = funding_lock_from_discovery_options(&by_lock_args)
+            .unwrap_or_else(|err| panic!("{}", err.message));
+        assert_eq!(
+            funding_lock_from_discovery_options(&by_pubkey)
+                .unwrap_or_else(|err| panic!("{}", err.message)),
+            expected
+        );
+        assert_eq!(
+            funding_lock_from_discovery_options(&by_address)
+                .unwrap_or_else(|err| panic!("{}", err.message)),
+            expected
+        );
+    }
+
+    #[test]
+    fn discovery_wallet_identity_requires_exactly_one_input() {
+        let mut options = discovery_options();
+        assert!(funding_lock_from_discovery_options(&options).is_err());
+
+        let lock_args = CString::new("0x0000000000000000000000000000000000000000").unwrap();
+        let address = CString::new("ckt1qyqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqgp8n6a").unwrap();
+        options.lock_args = lock_args.as_ptr();
+        options.address = address.as_ptr();
+        assert!(funding_lock_from_discovery_options(&options).is_err());
+    }
+
+    #[test]
+    fn preparation_never_advances_any_known_history_height() {
+        assert_eq!(
+            select_earliest_history_start_block(Some(80), Some(70), Some(50), Some(60)),
+            50
+        );
+        assert_eq!(
+            select_earliest_history_start_block(None, Some(40), Some(90), None),
+            40
+        );
+        assert_eq!(
+            select_earliest_history_start_block(None, None, None, None),
+            0
+        );
+    }
+
+    #[test]
+    fn ckb_capacity_uses_eight_decimal_places() {
+        assert_eq!(format_ckb_capacity(0), "0.00000000");
+        assert_eq!(format_ckb_capacity(50_000_000_274), "500.00000274");
+    }
+
+    #[test]
+    fn ckb_address_network_uses_the_chain_prefix() {
+        assert_eq!(ckb_address_network("mainnet"), NetworkType::Mainnet);
+        assert_eq!(ckb_address_network("testnet"), NetworkType::Testnet);
+        assert_eq!(ckb_address_network("ckb_preview"), NetworkType::Preview);
+        assert_eq!(
+            ckb_address_network("/tmp/custom-dev.toml"),
+            NetworkType::Dev
+        );
+    }
+
+    #[test]
+    fn readiness_rejects_indexer_lag_above_the_operational_limit() {
+        let readiness = evaluate_ckb_readiness(120, 10_000, 110, 10_000);
+
+        assert!(!readiness.ready);
+        assert_eq!(readiness.tip_block_number, Some(120));
+        assert_eq!(readiness.indexed_block_number, Some(110));
+        assert_eq!(readiness.lag, Some(10));
+        assert_eq!(
+            readiness.reason.as_deref(),
+            Some("CKB indexer is 10 block(s) behind the chain tip; maximum acceptable lag is 0")
+        );
+    }
+
+    #[test]
+    fn readiness_rejects_one_block_script_index_drift() {
+        let readiness = evaluate_ckb_readiness(120, 10_000, 119, 10_000);
+
+        assert!(!readiness.ready);
+        assert_eq!(readiness.lag, Some(1));
+        assert_eq!(readiness.max_acceptable_lag, 0);
+        assert_eq!(
+            readiness.reason.as_deref(),
+            Some("CKB indexer is 1 block(s) behind the chain tip; maximum acceptable lag is 0")
+        );
+    }
+
+    #[test]
+    fn operational_snapshot_accepts_lag_within_its_explicit_limit() {
+        let readiness = evaluate_ckb_readiness_with_lag_tolerance(120, 10_000, 114, 10_000, 6);
+
+        assert!(readiness.ready);
+        assert_eq!(readiness.lag, Some(6));
+        assert_eq!(readiness.max_acceptable_lag, 6);
+        assert_eq!(readiness.reason, None);
+    }
+
+    #[test]
+    fn readiness_rejects_a_stale_chain_tip() {
+        let now = CKB_READINESS_MAX_TIP_AGE_MILLIS + 20_000;
+        let readiness = evaluate_ckb_readiness(120, 10_000, 120, now);
+
+        assert!(!readiness.ready);
+        assert_eq!(
+            readiness.reason.as_deref(),
+            Some("CKB chain tip is not current")
+        );
+        assert!(CkbSyncEstimator::default()
+            .observe(&readiness, Instant::now())
+            .is_none());
+    }
+
+    #[test]
+    fn readiness_accepts_a_current_fully_indexed_tip() {
+        let readiness = evaluate_ckb_readiness(120, 10_000, 120, 10_000);
+
+        assert!(readiness.ready);
+        assert_eq!(readiness.lag, Some(0));
+        assert!(readiness.wait_estimate.is_none());
+        assert_eq!(readiness.reason, None);
+    }
+
+    #[test]
+    fn first_lag_sample_returns_a_conservative_protocol_based_range() {
+        let readiness = evaluate_ckb_readiness(120, 10_000, 114, 10_000);
+        let mut estimator = CkbSyncEstimator::default();
+        let estimate = estimator.observe(&readiness, Instant::now()).unwrap();
+
+        assert_eq!(estimate.lower_seconds, 3);
+        assert_eq!(estimate.upper_seconds, 60);
+        assert_eq!(estimate.retry_after_seconds, 3);
+        assert_eq!(estimate.confidence, "low");
+    }
+
+    #[test]
+    fn repeated_samples_use_observed_indexing_speed() {
+        let started = Instant::now();
+        let mut estimator = CkbSyncEstimator::default();
+        let first = evaluate_ckb_readiness(120, 10_000, 110, 10_000);
+        let second = evaluate_ckb_readiness(120, 10_000, 113, 10_000);
+
+        estimator.observe(&first, started).unwrap();
+        let estimate = estimator
+            .observe(&second, started + Duration::from_secs(3))
+            .unwrap();
+
+        assert_eq!(estimate.lower_seconds, 3);
+        assert_eq!(estimate.upper_seconds, 17);
+        assert_eq!(estimate.confidence, "measured");
+    }
+
+    #[test]
+    fn catch_up_to_zero_preserves_the_measured_rate_for_the_next_block() {
+        let started = Instant::now();
+        let mut estimator = CkbSyncEstimator::default();
+        let behind = evaluate_ckb_readiness(120, 10_000, 110, 10_000);
+        let caught_up = evaluate_ckb_readiness(120, 10_000, 120, 10_000);
+        let next_block = evaluate_ckb_readiness(121, 10_000, 120, 10_000);
+
+        estimator.observe(&behind, started).unwrap();
+        assert!(estimator
+            .observe(&caught_up, started + Duration::from_secs(10))
+            .is_none());
+        let estimate = estimator
+            .observe(&next_block, started + Duration::from_secs(13))
+            .unwrap();
+
+        assert_eq!(estimate.confidence, "measured");
+        assert_eq!(estimate.lower_seconds, 1);
+        assert_eq!(estimate.upper_seconds, 5);
+    }
+
+    #[test]
+    fn normal_filter_batch_pause_keeps_the_measured_rate() {
+        let started = Instant::now();
+        let mut estimator = CkbSyncEstimator::default();
+        let first = evaluate_ckb_readiness(120, 10_000, 110, 10_000);
+        let progressed = evaluate_ckb_readiness(120, 10_000, 115, 10_000);
+        let waiting_for_batch = evaluate_ckb_readiness(121, 10_000, 115, 10_000);
+
+        estimator.observe(&first, started).unwrap();
+        estimator
+            .observe(&progressed, started + Duration::from_secs(5))
+            .unwrap();
+        let estimate = estimator
+            .observe(&waiting_for_batch, started + Duration::from_secs(45))
+            .unwrap();
+
+        assert_eq!(estimate.confidence, "measured");
+    }
+
+    #[test]
+    fn unchanged_progress_is_reported_as_stalled_after_threshold() {
+        let started = Instant::now();
+        let mut estimator = CkbSyncEstimator::default();
+        let readiness = evaluate_ckb_readiness(120, 10_000, 114, 10_000);
+
+        estimator.observe(&readiness, started).unwrap();
+        let estimate = estimator
+            .observe(
+                &readiness,
+                started + CKB_SYNC_STALL_THRESHOLD + Duration::from_secs(1),
+            )
+            .unwrap();
+
+        assert_eq!(estimate.upper_seconds, 120);
+        assert_eq!(estimate.confidence, "stalled");
+    }
+}
+
 #[cfg(all(test, not(feature = "disable-ckb-rpc")))]
 mod tests {
     use super::*;
@@ -3504,7 +5145,119 @@ mod tests {
                 "ready": true,
                 "mode": "external_rpc",
                 "skipped": true,
+                "status": "ready",
             })
         );
+    }
+}
+
+#[cfg(all(test, feature = "disable-ckb-rpc"))]
+mod embedded_prepare_tests {
+    use super::*;
+    use ckb_light_client::CkbPrepareStatus;
+
+    #[test]
+    fn prepare_progress_exposes_distinct_light_client_statuses() {
+        let initializing = embedded_ckb_progress_result(CkbPrepareStatus::Initializing);
+        assert_eq!(initializing["status"], "initializing");
+        assert_eq!(initializing["ready"], false);
+
+        let birthday = embedded_ckb_progress_result(CkbPrepareStatus::WalletBirthday {
+            address: "ckt1example".to_string(),
+            history_start_block: 900,
+            source: "external_discovery".to_string(),
+        });
+        assert_eq!(birthday["status"], "wallet_birthday");
+        assert_eq!(birthday["history_start_block"], 900);
+        assert_eq!(birthday["source"], "external_discovery");
+
+        let connecting = embedded_ckb_progress_result(CkbPrepareStatus::Connecting {
+            connected_peers: 1,
+            required_peers: 2,
+            tip_block_number: 42,
+            tip_is_current: false,
+        });
+        assert_eq!(connecting["status"], "connecting");
+        assert_eq!(connecting["connected_peers"], 1);
+        assert_eq!(connecting["required_peers"], 2);
+
+        let syncing_headers = embedded_ckb_progress_result(CkbPrepareStatus::SyncingHeaders {
+            connected_peers: 2,
+            required_peers: 2,
+            tip_block_number: 43,
+            tip_is_current: false,
+        });
+        assert_eq!(syncing_headers["status"], "syncing_headers");
+        assert_eq!(syncing_headers["tip_block_number"], 43);
+
+        let syncing_scripts = embedded_ckb_progress_result(CkbPrepareStatus::SyncingScripts {
+            tip_block_number: 50,
+            slowest_script_block_number: 47,
+            script_count: 3,
+        });
+        assert_eq!(syncing_scripts["status"], "syncing_scripts");
+        assert_eq!(syncing_scripts["slowest_script_block_number"], 47);
+        assert_eq!(syncing_scripts["script_count"], 3);
+    }
+
+    #[test]
+    fn wallet_history_selection_uses_earliest_cell() {
+        let funded = WalletHistoryDiscovery {
+            indexer_tip: 9_998,
+            earliest_base_ckb_cell_block: Some(7_000),
+        };
+        assert_eq!(select_wallet_history_start_block(&funded, 1_000), 6_000);
+
+        let empty = WalletHistoryDiscovery {
+            indexer_tip: 9_998,
+            earliest_base_ckb_cell_block: None,
+        };
+        assert_eq!(select_wallet_history_start_block(&empty, 1_000), 8_998);
+    }
+
+    #[test]
+    fn wallet_birthday_metadata_round_trips_and_rejects_another_wallet() {
+        let directory = std::env::temp_dir().join(format!(
+            "fiber-ffi-wallet-birthday-test-{}-{}",
+            std::process::id(),
+            NEXT_WALLET_BIRTHDAY_TEMP_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let path = directory.join("wallet-birthday.json");
+        let metadata = WalletBirthdayMetadata {
+            version: CKB_WALLET_BIRTHDAY_VERSION,
+            network: "testnet".to_string(),
+            genesis_hash: "0xgenesis".to_string(),
+            address: "ckt1wallet".to_string(),
+            lock_args: "0x1234".to_string(),
+            history_start_block: 42,
+            source: "external_discovery".to_string(),
+        };
+
+        write_wallet_birthday_metadata(&path, &metadata).unwrap();
+        assert_eq!(
+            read_wallet_birthday_metadata(&path).unwrap(),
+            Some(metadata.clone())
+        );
+        validate_wallet_birthday_metadata(
+            &metadata,
+            "testnet",
+            "0xgenesis",
+            "ckt1wallet",
+            "0x1234",
+            &path,
+        )
+        .unwrap();
+        let error = validate_wallet_birthday_metadata(
+            &metadata,
+            "testnet",
+            "0xgenesis",
+            "ckt1another",
+            "0x1234",
+            &path,
+        )
+        .unwrap_err();
+        assert!(error.contains("different address"));
+
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

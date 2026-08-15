@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     fs,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -12,8 +13,8 @@ use ckb_chain_spec::{consensus::Consensus, ChainSpec};
 use ckb_jsonrpc_types::{BlockNumber, Script};
 use ckb_light_client_lib::{
     protocols::{
-        FilterProtocol, LightClientProtocol, Peers, PendingTxs, RelayProtocol, SyncProtocol,
-        BAD_MESSAGE_ALLOWED_EACH_HOUR, CHECK_POINT_INTERVAL,
+        FilterPeerSelectionConfig, FilterProtocol, LightClientProtocol, Peers, PendingTxs,
+        RelayProtocol, SyncProtocol, BAD_MESSAGE_ALLOWED_EACH_HOUR, CHECK_POINT_INTERVAL,
     },
     service::{ScriptStatus, ScriptType},
     storage::{LightClientStorage, Storage, StorageWithChainData},
@@ -24,12 +25,13 @@ use ckb_network::{
 };
 use ckb_resource::Resource;
 use ckb_stop_handler::{broadcast_exit_signals, has_received_stop_signal};
+use ckb_types::packed;
 use jsonrpc_http_server::Server;
 use tokio::sync::mpsc;
 use tracing::{debug, info};
 
 use super::{
-    config::{LocalChain, LocalLightClientConfig, HEADER_READY_TIMEOUT, MAX_OUTBOUND_PEERS},
+    config::{LocalChain, LocalLightClientConfig, HEADER_READY_TIMEOUT},
     rpc_router::RpcRouter,
     rpc_server,
 };
@@ -37,6 +39,35 @@ use super::{
 static LOCAL_LIGHT_CLIENT_ACTIVE: AtomicBool = AtomicBool::new(false);
 const MAX_TIP_AGE: Duration = Duration::from_secs(2 * 60 * 60);
 const READINESS_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum CkbPrepareStatus {
+    Initializing,
+    WalletBirthday {
+        address: String,
+        history_start_block: u64,
+        source: String,
+    },
+    Connecting {
+        connected_peers: usize,
+        required_peers: usize,
+        tip_block_number: u64,
+        tip_is_current: bool,
+    },
+    SyncingHeaders {
+        connected_peers: usize,
+        required_peers: usize,
+        tip_block_number: u64,
+        tip_is_current: bool,
+    },
+    SyncingScripts {
+        tip_block_number: u64,
+        slowest_script_block_number: u64,
+        script_count: usize,
+    },
+}
+
+pub(crate) type CkbPrepareStatusReporter<'a> = &'a (dyn Fn(CkbPrepareStatus) + Send + Sync);
 
 #[derive(Debug)]
 pub(crate) struct RequiredScript {
@@ -74,15 +105,39 @@ impl RequiredScript {
 pub(crate) struct LocalCkbNodeHandle {
     rpc_url: String,
     rpc_server: Option<Server>,
+    monitor: LocalCkbMonitor,
     runtime_handle: CkbRuntimeHandle,
     runtime_stop_rx: mpsc::Receiver<()>,
     _network_controller: NetworkController,
+}
+
+#[derive(Clone)]
+pub(crate) struct LocalCkbMonitor {
+    router: RpcRouter,
+    operational_lag_tolerance: u64,
+}
+
+impl LocalCkbMonitor {
+    pub(crate) fn sync_snapshot(&self) -> (u64, u64, u64) {
+        let tip = self.router.tip_header();
+        (
+            tip.inner.number.value(),
+            tip.inner.timestamp.value(),
+            self.router.indexed_tip_number(),
+        )
+    }
+
+    pub(crate) fn operational_lag_tolerance(&self) -> u64 {
+        self.operational_lag_tolerance
+    }
 }
 
 impl LocalCkbNodeHandle {
     pub(crate) async fn start(
         config: LocalLightClientConfig,
         required_scripts: Vec<RequiredScript>,
+        pinned_cell_deps: HashSet<packed::OutPoint>,
+        status_reporter: Option<CkbPrepareStatusReporter<'_>>,
     ) -> Result<Self, String> {
         if has_received_stop_signal() {
             return Err(
@@ -97,7 +152,7 @@ impl LocalCkbNodeHandle {
             return Err("only one embedded CKB Light Client can run in this process".to_string());
         }
 
-        match Self::start_inner(config, required_scripts).await {
+        match Self::start_inner(config, required_scripts, pinned_cell_deps, status_reporter).await {
             Ok(handle) => Ok(handle),
             Err(err) => {
                 LOCAL_LIGHT_CLIENT_ACTIVE.store(false, Ordering::SeqCst);
@@ -109,6 +164,8 @@ impl LocalCkbNodeHandle {
     async fn start_inner(
         config: LocalLightClientConfig,
         required_scripts: Vec<RequiredScript>,
+        pinned_cell_deps: HashSet<packed::OutPoint>,
+        status_reporter: Option<CkbPrepareStatusReporter<'_>>,
     ) -> Result<Self, String> {
         fs::create_dir_all(&config.store_path).map_err(|err| {
             format!(
@@ -129,6 +186,12 @@ impl LocalCkbNodeHandle {
         storage.cleanup_invalid_matched_blocks();
 
         let pending_txs = Arc::new(RwLock::new(PendingTxs::default()));
+        let filter_peer_selection = FilterPeerSelectionConfig {
+            preferred_peer_chance_percent: config.filter_preferred_peer_chance_percent,
+            request_timeout: Duration::from_secs(config.filter_request_timeout_seconds),
+            consecutive_failures_before_cooldown: config.filter_peer_failure_threshold,
+            failure_cooldown: Duration::from_secs(config.filter_peer_cooldown_seconds),
+        };
         let peers = Arc::new(Peers::new(
             config.network_config()?.max_outbound_peers,
             CHECK_POINT_INTERVAL,
@@ -153,6 +216,7 @@ impl LocalCkbNodeHandle {
             Arc::clone(&peers),
             Arc::clone(&pending_txs),
             Arc::clone(&consensus),
+            filter_peer_selection,
         );
         let required_protocol_ids = vec![
             SupportProtocols::Sync.protocol_id(),
@@ -169,8 +233,12 @@ impl LocalCkbNodeHandle {
             storage,
             chain_data,
             Arc::clone(&consensus),
-            config.history_start_block,
+            pinned_cell_deps,
+            config.peer_funding_liveness_rpc_url.clone(),
         )?;
+        let startup_script_lag_tolerance = config.startup_script_lag_tolerance;
+        let operational_lag_tolerance = config.operational_lag_tolerance;
+        let startup_min_peers = config.startup_min_peers;
         router.register_scripts(
             required_scripts
                 .into_iter()
@@ -205,7 +273,15 @@ impl LocalCkbNodeHandle {
             }
         };
 
-        if let Err(err) = wait_until_ready(&router, &network_controller).await {
+        if let Err(err) = wait_until_ready(
+            &router,
+            &network_controller,
+            startup_min_peers,
+            startup_script_lag_tolerance,
+            status_reporter,
+        )
+        .await
+        {
             close_rpc_server(rpc_server);
             broadcast_exit_signals();
             runtime_handle.drop_guard();
@@ -219,6 +295,10 @@ impl LocalCkbNodeHandle {
         Ok(Self {
             rpc_url,
             rpc_server: Some(rpc_server),
+            monitor: LocalCkbMonitor {
+                router,
+                operational_lag_tolerance,
+            },
             runtime_handle,
             runtime_stop_rx,
             _network_controller: network_controller,
@@ -227,6 +307,10 @@ impl LocalCkbNodeHandle {
 
     pub(crate) fn rpc_url(&self) -> &str {
         &self.rpc_url
+    }
+
+    pub(crate) fn monitor(&self) -> LocalCkbMonitor {
+        self.monitor.clone()
     }
 
     pub(crate) async fn shutdown(mut self) {
@@ -247,18 +331,34 @@ impl LocalCkbNodeHandle {
 async fn wait_until_ready(
     router: &RpcRouter,
     network_controller: &NetworkController,
+    startup_min_peers: usize,
+    startup_script_lag_tolerance: u64,
+    status_reporter: Option<CkbPrepareStatusReporter<'_>>,
 ) -> Result<(), String> {
-    wait_chain_ready(router, network_controller).await?;
-    wait_required_scripts(router).await;
+    let target_tip = wait_chain_ready(
+        router,
+        network_controller,
+        startup_min_peers,
+        status_reporter,
+    )
+    .await?;
+    wait_required_scripts(
+        router,
+        target_tip,
+        startup_script_lag_tolerance,
+        status_reporter,
+    )
+    .await;
     Ok(())
 }
 
 async fn wait_chain_ready(
     router: &RpcRouter,
     network_controller: &NetworkController,
-) -> Result<(), String> {
+    required_peers: usize,
+    status_reporter: Option<CkbPrepareStatusReporter<'_>>,
+) -> Result<u64, String> {
     let deadline = tokio::time::Instant::now() + HEADER_READY_TIMEOUT;
-    let required_peers = (MAX_OUTBOUND_PEERS / 2) as usize;
     let mut last_progress_log = tokio::time::Instant::now() - Duration::from_secs(5);
 
     loop {
@@ -272,7 +372,7 @@ async fn wait_chain_ready(
                 connected_peers,
                 tip_number, "embedded CKB Light Client chain is ready"
             );
-            return Ok(());
+            return Ok(tip_number);
         }
 
         if tokio::time::Instant::now() >= deadline {
@@ -283,6 +383,24 @@ async fn wait_chain_ready(
         }
 
         if last_progress_log.elapsed() >= Duration::from_secs(5) {
+            if let Some(report_status) = status_reporter {
+                let status = if connected_peers < required_peers {
+                    CkbPrepareStatus::Connecting {
+                        connected_peers,
+                        required_peers,
+                        tip_block_number: tip_number,
+                        tip_is_current,
+                    }
+                } else {
+                    CkbPrepareStatus::SyncingHeaders {
+                        connected_peers,
+                        required_peers,
+                        tip_block_number: tip_number,
+                        tip_is_current,
+                    }
+                };
+                report_status(status);
+            }
             info!(
                 connected_peers,
                 required_peers,
@@ -296,22 +414,30 @@ async fn wait_chain_ready(
     }
 }
 
-async fn wait_required_scripts(router: &RpcRouter) {
+async fn wait_required_scripts(
+    router: &RpcRouter,
+    target_tip: u64,
+    startup_script_lag_tolerance: u64,
+    status_reporter: Option<CkbPrepareStatusReporter<'_>>,
+) {
     let mut last_progress_log = tokio::time::Instant::now() - Duration::from_secs(5);
 
     loop {
-        let tip_number = router.tip_header().inner.number.value();
         let scripts = router.script_statuses();
         let slowest_script = scripts
             .iter()
             .map(|status| status.block_number.value())
             .min()
             .unwrap_or_default();
-        let scripts_are_ready = !scripts.is_empty() && slowest_script >= tip_number;
+        let required_height =
+            startup_required_script_height(target_tip, startup_script_lag_tolerance);
+        let scripts_are_ready = !scripts.is_empty() && slowest_script >= required_height;
 
         if scripts_are_ready {
             info!(
-                tip_number,
+                target_tip,
+                slowest_script,
+                startup_script_lag_tolerance,
                 script_count = scripts.len(),
                 "embedded CKB Light Client is ready"
             );
@@ -319,8 +445,15 @@ async fn wait_required_scripts(router: &RpcRouter) {
         }
 
         if last_progress_log.elapsed() >= Duration::from_secs(5) {
+            if let Some(report_status) = status_reporter {
+                report_status(CkbPrepareStatus::SyncingScripts {
+                    tip_block_number: target_tip,
+                    slowest_script_block_number: slowest_script,
+                    script_count: scripts.len(),
+                });
+            }
             info!(
-                tip_number,
+                target_tip,
                 slowest_script,
                 script_count = scripts.len(),
                 "waiting for embedded CKB Light Client required scripts"
@@ -329,6 +462,10 @@ async fn wait_required_scripts(router: &RpcRouter) {
         }
         tokio::time::sleep(READINESS_POLL_INTERVAL).await;
     }
+}
+
+fn startup_required_script_height(target_tip: u64, lag_tolerance: u64) -> u64 {
+    target_tip.saturating_sub(lag_tolerance)
 }
 
 fn header_is_current(timestamp_millis: u64) -> bool {
@@ -382,6 +519,7 @@ fn build_protocols(
     peers: Arc<Peers>,
     pending_txs: Arc<RwLock<PendingTxs>>,
     consensus: Arc<Consensus>,
+    filter_peer_selection: FilterPeerSelectionConfig,
 ) -> Vec<CKBProtocol> {
     let sync = SyncProtocol::new(storage.clone(), Arc::clone(&peers));
     let relay = RelayProtocol::new(pending_txs, Arc::clone(&peers), storage.clone());
@@ -390,7 +528,7 @@ fn build_protocols(
         Arc::clone(&peers),
         (*consensus).clone(),
     ));
-    let filter = FilterProtocol::new(storage, peers);
+    let filter = FilterProtocol::new_with_peer_selection(storage, peers, filter_peer_selection);
 
     vec![
         CKBProtocol::new_with_support_protocol(
@@ -418,12 +556,19 @@ fn build_protocols(
 
 #[cfg(test)]
 mod tests {
-    use super::registration_height;
+    use super::{registration_height, startup_required_script_height};
 
     #[test]
     fn registration_includes_first_required_block() {
         assert_eq!(registration_height(0), 0);
         assert_eq!(registration_height(1), 0);
         assert_eq!(registration_height(42), 41);
+    }
+
+    #[test]
+    fn startup_script_lag_tolerance_has_an_inclusive_saturating_boundary() {
+        assert_eq!(startup_required_script_height(1_000, 100), 900);
+        assert_eq!(startup_required_script_height(52, 100), 0);
+        assert_eq!(startup_required_script_height(0, 100), 0);
     }
 }

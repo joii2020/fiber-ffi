@@ -20,6 +20,20 @@ typedef struct FiberStartOptions {
   void *event_callback_user_data;
 } FiberStartOptions;
 
+typedef struct FiberCkbDiscoverHistoryStartBlockOptions {
+  uint32_t struct_size;
+  uint32_t flags;
+  const char *rpc_url;
+  /* Exactly one of lock_args, pubkey, and address must be non-NULL. */
+  const char *lock_args;
+  const char *pubkey;
+  const char *address;
+  uint64_t safety_blocks;
+  int has_safety_blocks;
+  uint64_t max_indexer_lag;
+  int has_max_indexer_lag;
+} FiberCkbDiscoverHistoryStartBlockOptions;
+
 typedef struct FiberConnectPeerOptions {
   const char *address;
   const char *pubkey;
@@ -259,6 +273,9 @@ typedef struct FiberNewInvoiceOptions {
 
 #define FIBER_OPEN_CHANNEL_OPTIONS_INIT                                       \
   { sizeof(FiberOpenChannelOptions), 0 }
+#define FIBER_CKB_DISCOVER_HISTORY_START_BLOCK_OPTIONS_INIT                   \
+  { sizeof(FiberCkbDiscoverHistoryStartBlockOptions), 0, NULL, NULL, NULL,     \
+    NULL, 0, 0, 0, 0 }
 #define FIBER_ACCEPT_CHANNEL_OPTIONS_INIT                                     \
   { sizeof(FiberAcceptChannelOptions), 0 }
 #define FIBER_OPEN_CHANNEL_WITH_EXTERNAL_FUNDING_OPTIONS_INIT                 \
@@ -289,9 +306,16 @@ typedef enum FiberFfiStatus {
   FIBER_FFI_STATUS_STARTUP_FAILED = 3,
   FIBER_FFI_STATUS_ALREADY_STOPPED = 4,
   FIBER_FFI_STATUS_PANIC = 5,
+  FIBER_FFI_STATUS_NOT_READY = 6,
 } FiberFfiStatus;
 
-/* result_json is borrowed and is valid only for the duration of the callback. */
+/*
+ * result_json is borrowed and is valid only for the duration of the callback.
+ * The status field is initializing, wallet_birthday, connecting,
+ * syncing_headers, or syncing_scripts while work is in progress; ready and
+ * failed are terminal. Keep user_data valid until the terminal callback
+ * returns.
+ */
 typedef void (*fiber_ckb_prepare_callback)(FiberFfiStatus status,
                                            const char *result_json,
                                            void *user_data);
@@ -299,17 +323,46 @@ typedef void (*fiber_ckb_prepare_callback)(FiberFfiStatus status,
 const char *fiber_version(void);
 
 /*
+ * Derives the funding address selected by FiberStartOptions without network
+ * access. On success, *out_address must be released with fiber_string_free.
+ */
+FiberFfiStatus fiber_ckb_funding_address(const FiberStartOptions *options,
+                                         char **out_address);
+
+/*
+ * Queries only the supplied external CKB RPC/Indexer and returns a conservative
+ * history start height. It does not read or mutate Light Client state. Exactly
+ * one wallet identity field must be supplied. Defaults are a 1000-block safety
+ * window and a maximum Indexer lag of 100 blocks.
+ */
+FiberFfiStatus fiber_ckb_discover_history_start_block(
+    const FiberCkbDiscoverHistoryStartBlockOptions *options,
+    uint64_t *out_height);
+
+/*
  * Asynchronously prepares the CKB backend used by the next fiber_start call.
- * A return value of OK means the request was accepted; completion is reported
- * exactly once through callback. The callback is never invoked inline.
+ * A return value of OK means the request was accepted. Progress and completion
+ * are reported through callback; ready and failed are terminal statuses. The
+ * callback is never invoked inline.
  *
  * With disable-ckb-rpc, this starts and synchronizes the embedded Light Client
  * and keeps it alive for a matching fiber_start call. Without that feature, it
- * asynchronously reports {"ready":true,"mode":"external_rpc","skipped":true}.
+ * asynchronously reports
+ * {"ready":true,"mode":"external_rpc","skipped":true,"status":"ready"}.
  */
 FiberFfiStatus fiber_prepare_ckb(const FiberStartOptions *options,
                                  fiber_ckb_prepare_callback callback,
                                  void *callback_user_data);
+
+/*
+ * Same as fiber_prepare_ckb, but supplies a height previously returned by
+ * fiber_ckb_discover_history_start_block. The embedded Light Client preparation
+ * performs no external RPC request; it persists and uses the safest (earliest)
+ * applicable height.
+ */
+FiberFfiStatus fiber_prepare_ckb_with_history_start_block(
+    const FiberStartOptions *options, uint64_t history_start_block,
+    fiber_ckb_prepare_callback callback, void *callback_user_data);
 
 FiberFfiStatus fiber_start(const FiberStartOptions *options,
                            FiberHandle **out_handle);
@@ -317,6 +370,21 @@ FiberFfiStatus fiber_start(const FiberStartOptions *options,
 FiberFfiStatus fiber_stop(FiberHandle *handle);
 
 FiberFfiStatus fiber_node_info(FiberHandle *handle, char **out_json);
+
+/*
+ * Returns the current CKB chain/indexer synchronization state as JSON.
+ * A successful query returns OK even when the JSON field `ready` is false.
+ */
+FiberFfiStatus fiber_ckb_readiness(FiberHandle *handle, char **out_json);
+
+/*
+ * Returns the funding wallet's indexed base-CKB capacity as JSON. The query
+ * uses the configured funding key and only counts cells with no type script
+ * and empty data. The result also contains the chain-aware CKB `address` and
+ * hexadecimal `lock_args`. The snapshot can still include cells reserved by
+ * an in-flight transaction, so applications must retain a fee/change reserve.
+ */
+FiberFfiStatus fiber_ckb_balance(FiberHandle *handle, char **out_json);
 
 FiberFfiStatus fiber_list_peers(FiberHandle *handle, char **out_json);
 

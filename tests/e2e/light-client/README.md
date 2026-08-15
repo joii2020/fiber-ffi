@@ -7,7 +7,9 @@ IDs, adds the custom-chain `ckb_light_client.bootnodes` entries, and exercises t
 shared library through the public C ABI:
 
 ```text
-fiber_prepare_ckb -> callback -> fiber_start -> fiber_node_info -> fiber_stop
+fiber_ckb_funding_address -> fiber_ckb_discover_history_start_block ->
+fiber_prepare_ckb_with_history_start_block -> callback -> fiber_start -> fiber_node_info ->
+fiber_ckb_readiness -> fiber_ckb_balance -> fiber_stop
 ```
 
 The Fiber checkout is never modified. Its fixtures are copied before the

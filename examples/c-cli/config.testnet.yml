@@ -1,0 +1,107 @@
+# Testnet configuration for the C CLI example.
+# rpc_url is deliberately unreachable: with disable-ckb-rpc Fiber replaces it
+# in memory with the embedded Light Client's loopback RPC gateway.
+fiber:
+  listening_addr: "/ip4/0.0.0.0/tcp/8228"
+  bootnode_addrs: []
+  min_outbound_peers: 0
+  sync_network_graph: false
+  announce_listening_addr: true
+  announce_private_addr: true
+  announced_addrs: []
+  chain: testnet
+
+  # Pinned testnet Fiber deployment. The embedded gateway verifies each
+  # producing transaction, while this trusted release config asserts that the
+  # explicitly listed CellDeps are still live so it need not scan from their
+  # deployment blocks.
+  # https://github.com/nervosnetwork/fiber-scripts/blob/main/deployment/testnet/migrations/2025-02-28-111246.json
+  scripts:
+    - name: FundingLock
+      script:
+        code_hash: "0x6c67887fe201ee0c7853f1682c0b77c0e6214044c156c7558269390a8afa6d7c"
+        hash_type: type
+        args: "0x"
+      cell_deps:
+        - cell_dep:
+            out_point:
+              tx_hash: "0x12c569a258dd9c5bd99f632bb8314b1263b90921ba31496467580d6b79dd14a7"
+              index: "0x1"
+            dep_type: code
+        - cell_dep:
+            out_point:
+              tx_hash: "0x12c569a258dd9c5bd99f632bb8314b1263b90921ba31496467580d6b79dd14a7"
+              index: "0x0"
+            dep_type: code
+    - name: CommitmentLock
+      script:
+        code_hash: "0x740dee83f87c6f309824d8fd3fbdd3c8380ee6fc9acc90b1a748438afcdf81d8"
+        hash_type: type
+        args: "0x"
+      cell_deps:
+        - cell_dep:
+            out_point:
+              tx_hash: "0x12c569a258dd9c5bd99f632bb8314b1263b90921ba31496467580d6b79dd14a7"
+              index: "0x2"
+            dep_type: code
+        - cell_dep:
+            out_point:
+              tx_hash: "0x12c569a258dd9c5bd99f632bb8314b1263b90921ba31496467580d6b79dd14a7"
+              index: "0x0"
+            dep_type: code
+
+rpc:
+  listening_addr: "127.0.0.1:8227"
+
+ckb:
+  rpc_url: "http://127.0.0.1:1"
+  udt_whitelist:
+    - name: RUSD
+      script:
+        code_hash: "0x1142755a044bf2ee358cba9f2da187ce928c91cd4dc8692ded0337efa677d21a"
+        hash_type: type
+        args: "0x878fcc6f1f08d48e87bb1c3b3d5083f23f8a39c5d5c764f253b55b998526439b"
+      cell_deps:
+        - cell_dep:
+            out_point:
+              tx_hash: "0xed7d65b9ad3d99657e37c4285d585fea8a5fcaf58165d54dacf90243f911548b"
+              index: "0x0"
+            dep_type: code
+      auto_accept_amount: 1000000000
+
+ckb_light_client:
+  # A full-node RPC is used only as a semi-trusted live/dead reference for
+  # peer-added funding inputs whose exact scripts are not tracked locally.
+  # Cell contents and the producing transaction remain Light-Client verified.
+  peer_funding_liveness_rpc_url: "https://testnet.ckbapp.dev/"
+  trust_pinned_cell_deps: true
+  startup_min_peers: 2
+  # Prefer regional P2P endpoints over randomly discovered public peers.
+  # These connections are maintained in addition to public discovery.
+  preferred_peers:
+    # Hong Kong
+    - "/dns4/diadem.ckb.guide/tcp/443/p2p/QmQMjFrNGaphzfHin3mbYybbJcFMDUihKAcknquYvm9J3W"
+    # Japan
+    - "/dns4/dagon.ckb.guide/tcp/443/p2p/QmX5D6aJiAQ5Fxn4BfVqSn6zrgyuQM1oXVC9yvmzLuHXnx"
+    # Korea
+    - "/dns4/javelin.ckb.guide/tcp/443/p2p/QmPcJY2gZLUm66szYA9QaG1P3rzwseWCMgbj6AyNCyW4G2"
+  # Among peers that have proved the current Light Client tip, use regional
+  # preferred peers for 90% of filter batches and sample public peers for 10%.
+  filter_preferred_peer_chance_percent: 90
+  # Retry a stalled filter range through another healthy peer after 6 seconds.
+  filter_request_timeout_seconds: 6
+  # Cool down a peer for 60 seconds after two consecutive filter timeouts.
+  filter_peer_failure_threshold: 2
+  filter_peer_cooldown_seconds: 60
+  # Test-only startup optimization. If the persisted wallet index trails the
+  # verified Light Client tip by at most this many blocks, enter the menu while
+  # background filter synchronization continues.
+  startup_script_lag_tolerance: 0
+  # Fiber reads a consistent, fully indexed Light Client snapshot. Allow that
+  # snapshot to trail the newest verified header by at most about one minute.
+  operational_lag_tolerance: 6
+
+services:
+  - fiber
+  - rpc
+  - ckb
