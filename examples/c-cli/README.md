@@ -191,13 +191,14 @@ performs setup, builds the project, and injects the test password:
 make -C examples/c-cli run
 ```
 
-Dynamic library logs and asynchronous events are appended to `fiber-ffi.log` in
-the startup working directory by default. The terminal shows only menus and
-operation results so scrolling logs do not interrupt the interactive interface.
-To select another log file:
+Dynamic library logs and asynchronous events are appended to `fiber-ffi.log`
+under the selected data directory by default (`examples/c-cli/data/fiber-ffi.log`
+with the defaults). The terminal shows only menus and operation results so
+scrolling logs do not interrupt the interactive interface. To select another
+log file:
 
 ```bash
-make -C examples/c-cli run CLI_ARGS='--log-file ./node-a.log'
+make -C examples/c-cli run CLI_ARGS='--log-file ./examples/c-cli/data/node-a.log'
 ```
 
 To select another configuration, data directory, or log level:
@@ -207,7 +208,7 @@ target/c-cli/fiber-ffi-c-cli \
   --config examples/c-cli/config.testnet.yml \
   --data examples/c-cli/data \
   --log-level 'info,fiber_ffi=debug' \
-  --log-file ./fiber-ffi.log
+  --log-file ./examples/c-cli/data/fiber-ffi.log
 ```
 
 Initial discovery uses testnet `https://testnet.ckbapp.dev/` by default. You can

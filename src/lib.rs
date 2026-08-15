@@ -43,7 +43,7 @@ use fnn::{
     Config, FiberConfig, NetworkServiceEvent,
 };
 use ractor::{Actor, ActorRef};
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tentacle::utils::TransportType;
 use tokio::runtime::Handle as TokioHandle;
@@ -52,6 +52,21 @@ use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tracing::{debug, info, trace};
 use tracing_subscriber::EnvFilter;
 
+mod ffi_params;
+mod ffi_types;
+
+use ffi_params::{
+    accept_channel_params_from_options, build_router_params_from_options, deserialize_object,
+    deserialize_value, funding_lock_from_discovery_options, list_channels_params_from_options,
+    list_payments_params_from_options, new_invoice_params_from_options,
+    open_channel_params_from_options, open_channel_with_external_funding_params_from_options,
+    optional_u64, parse_addr_type, parse_pubkey, required_hash_param,
+    send_payment_params_from_options, send_payment_with_router_params_from_options,
+    shutdown_channel_params_from_options, string_field,
+    submit_signed_funding_tx_params_from_options, update_channel_params_from_options,
+    validate_options_struct,
+};
+
 #[cfg(feature = "disable-ckb-rpc")]
 mod ckb_light_client;
 
@@ -59,293 +74,8 @@ mod ckb_light_client;
 use fnn::watchtower::{
     WatchtowerActor, WatchtowerMessage, DEFAULT_WATCHTOWER_CHECK_INTERVAL_SECONDS,
 };
-#[repr(C)]
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum FiberFfiStatus {
-    Ok = 0,
-    NullPointer = 1,
-    InvalidArgument = 2,
-    StartupFailed = 3,
-    AlreadyStopped = 4,
-    Panic = 5,
-    NotReady = 6,
-}
 
-pub type FiberEventCallback = unsafe extern "C" fn(*const c_char, *mut c_void);
-pub type FiberCkbPrepareCallback = unsafe extern "C" fn(FiberFfiStatus, *const c_char, *mut c_void);
-
-#[repr(C)]
-pub struct FiberStartOptions {
-    pub config_path: *const c_char,
-    pub database_prefix: *const c_char,
-    pub log_level: *const c_char,
-    pub event_callback: Option<FiberEventCallback>,
-    pub event_callback_user_data: *mut c_void,
-}
-
-#[repr(C)]
-pub struct FiberCkbDiscoverHistoryStartBlockOptions {
-    pub struct_size: u32,
-    pub flags: u32,
-    pub rpc_url: *const c_char,
-    pub lock_args: *const c_char,
-    pub pubkey: *const c_char,
-    pub address: *const c_char,
-    pub safety_blocks: u64,
-    pub has_safety_blocks: i32,
-    pub max_indexer_lag: u64,
-    pub has_max_indexer_lag: i32,
-}
-
-#[repr(C)]
-pub struct FiberConnectPeerOptions {
-    pub address: *const c_char,
-    pub pubkey: *const c_char,
-    pub addr_type: *const c_char,
-    pub save: i32,
-}
-
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct FiberU128 {
-    pub low: u64,
-    pub high: u64,
-}
-
-pub type FiberInvoiceCurrency = i32;
-const FIBER_INVOICE_CURRENCY_DEFAULT: FiberInvoiceCurrency = 0;
-const FIBER_INVOICE_CURRENCY_FIBB: FiberInvoiceCurrency = 1;
-const FIBER_INVOICE_CURRENCY_FIBT: FiberInvoiceCurrency = 2;
-const FIBER_INVOICE_CURRENCY_FIBD: FiberInvoiceCurrency = 3;
-
-pub type FiberHashAlgorithm = i32;
-const FIBER_HASH_ALGORITHM_DEFAULT: FiberHashAlgorithm = 0;
-const FIBER_HASH_ALGORITHM_CKB_HASH: FiberHashAlgorithm = 1;
-const FIBER_HASH_ALGORITHM_SHA256: FiberHashAlgorithm = 2;
-
-pub type FiberPaymentStatusFilter = i32;
-const FIBER_PAYMENT_STATUS_FILTER_ALL: FiberPaymentStatusFilter = 0;
-const FIBER_PAYMENT_STATUS_FILTER_CREATED: FiberPaymentStatusFilter = 1;
-const FIBER_PAYMENT_STATUS_FILTER_INFLIGHT: FiberPaymentStatusFilter = 2;
-const FIBER_PAYMENT_STATUS_FILTER_SUCCESS: FiberPaymentStatusFilter = 3;
-const FIBER_PAYMENT_STATUS_FILTER_FAILED: FiberPaymentStatusFilter = 4;
-
-#[repr(C)]
-pub struct FiberOpenChannelOptions {
-    pub struct_size: u32,
-    pub flags: u32,
-    pub pubkey: *const c_char,
-    pub funding_amount: FiberU128,
-    pub has_public: i32,
-    pub public_: i32,
-    pub has_one_way: i32,
-    pub one_way: i32,
-    pub funding_udt_type_script_json: *const c_char,
-    pub shutdown_script_json: *const c_char,
-    pub commitment_delay_epoch: u64,
-    pub has_commitment_delay_epoch: i32,
-    pub commitment_fee_rate: u64,
-    pub has_commitment_fee_rate: i32,
-    pub funding_fee_rate: u64,
-    pub has_funding_fee_rate: i32,
-    pub tlc_expiry_delta: u64,
-    pub has_tlc_expiry_delta: i32,
-    pub tlc_min_value: FiberU128,
-    pub has_tlc_min_value: i32,
-    pub tlc_fee_proportional_millionths: FiberU128,
-    pub has_tlc_fee_proportional_millionths: i32,
-    pub max_tlc_value_in_flight: FiberU128,
-    pub has_max_tlc_value_in_flight: i32,
-    pub max_tlc_number_in_flight: u64,
-    pub has_max_tlc_number_in_flight: i32,
-}
-
-#[repr(C)]
-pub struct FiberAcceptChannelOptions {
-    pub struct_size: u32,
-    pub flags: u32,
-    pub temporary_channel_id: *const c_char,
-    pub funding_amount: FiberU128,
-    pub shutdown_script_json: *const c_char,
-    pub max_tlc_value_in_flight: FiberU128,
-    pub has_max_tlc_value_in_flight: i32,
-    pub max_tlc_number_in_flight: u64,
-    pub has_max_tlc_number_in_flight: i32,
-    pub tlc_min_value: FiberU128,
-    pub has_tlc_min_value: i32,
-    pub tlc_fee_proportional_millionths: FiberU128,
-    pub has_tlc_fee_proportional_millionths: i32,
-    pub tlc_expiry_delta: u64,
-    pub has_tlc_expiry_delta: i32,
-}
-
-#[repr(C)]
-pub struct FiberOpenChannelWithExternalFundingOptions {
-    pub struct_size: u32,
-    pub flags: u32,
-    pub pubkey: *const c_char,
-    pub funding_amount: FiberU128,
-    pub has_public: i32,
-    pub public_: i32,
-    pub funding_udt_type_script_json: *const c_char,
-    pub shutdown_script_json: *const c_char,
-    pub funding_lock_script_json: *const c_char,
-    pub funding_lock_script_cell_deps_json: *const c_char,
-    pub commitment_delay_epoch: u64,
-    pub has_commitment_delay_epoch: i32,
-    pub commitment_fee_rate: u64,
-    pub has_commitment_fee_rate: i32,
-    pub funding_fee_rate: u64,
-    pub has_funding_fee_rate: i32,
-    pub tlc_expiry_delta: u64,
-    pub has_tlc_expiry_delta: i32,
-    pub tlc_min_value: FiberU128,
-    pub has_tlc_min_value: i32,
-    pub tlc_fee_proportional_millionths: FiberU128,
-    pub has_tlc_fee_proportional_millionths: i32,
-    pub max_tlc_value_in_flight: FiberU128,
-    pub has_max_tlc_value_in_flight: i32,
-    pub max_tlc_number_in_flight: u64,
-    pub has_max_tlc_number_in_flight: i32,
-}
-
-#[repr(C)]
-pub struct FiberSubmitSignedFundingTxOptions {
-    pub struct_size: u32,
-    pub flags: u32,
-    pub channel_id: *const c_char,
-    pub signed_funding_tx_json: *const c_char,
-}
-
-#[repr(C)]
-pub struct FiberListChannelsOptions {
-    pub struct_size: u32,
-    pub flags: u32,
-    pub pubkey: *const c_char,
-    pub has_include_closed: i32,
-    pub include_closed: i32,
-    pub has_only_pending: i32,
-    pub only_pending: i32,
-}
-
-#[repr(C)]
-pub struct FiberShutdownChannelOptions {
-    pub struct_size: u32,
-    pub flags: u32,
-    pub channel_id: *const c_char,
-    pub close_script_json: *const c_char,
-    pub fee_rate: u64,
-    pub has_fee_rate: i32,
-    pub has_force: i32,
-    pub force: i32,
-}
-
-#[repr(C)]
-pub struct FiberUpdateChannelOptions {
-    pub struct_size: u32,
-    pub flags: u32,
-    pub channel_id: *const c_char,
-    pub has_enabled: i32,
-    pub enabled: i32,
-    pub tlc_expiry_delta: u64,
-    pub has_tlc_expiry_delta: i32,
-    pub tlc_minimum_value: FiberU128,
-    pub has_tlc_minimum_value: i32,
-    pub tlc_fee_proportional_millionths: FiberU128,
-    pub has_tlc_fee_proportional_millionths: i32,
-}
-
-#[repr(C)]
-pub struct FiberSendPaymentOptions {
-    pub struct_size: u32,
-    pub flags: u32,
-    pub target_pubkey: *const c_char,
-    pub amount: FiberU128,
-    pub has_amount: i32,
-    pub payment_hash: *const c_char,
-    pub final_tlc_expiry_delta: u64,
-    pub has_final_tlc_expiry_delta: i32,
-    pub tlc_expiry_limit: u64,
-    pub has_tlc_expiry_limit: i32,
-    pub invoice: *const c_char,
-    pub timeout: u64,
-    pub has_timeout: i32,
-    pub max_fee_amount: FiberU128,
-    pub has_max_fee_amount: i32,
-    pub max_fee_rate: u64,
-    pub has_max_fee_rate: i32,
-    pub max_parts: u64,
-    pub has_max_parts: i32,
-    pub trampoline_hops_json: *const c_char,
-    pub has_keysend: i32,
-    pub keysend: i32,
-    pub udt_type_script_json: *const c_char,
-    pub has_allow_self_payment: i32,
-    pub allow_self_payment: i32,
-    pub custom_records_json: *const c_char,
-    pub hop_hints_json: *const c_char,
-    pub has_dry_run: i32,
-    pub dry_run: i32,
-}
-
-#[repr(C)]
-pub struct FiberBuildRouterOptions {
-    pub struct_size: u32,
-    pub flags: u32,
-    pub amount: FiberU128,
-    pub has_amount: i32,
-    pub udt_type_script_json: *const c_char,
-    pub hops_info_json: *const c_char,
-    pub final_tlc_expiry_delta: u64,
-    pub has_final_tlc_expiry_delta: i32,
-}
-
-#[repr(C)]
-pub struct FiberSendPaymentWithRouterOptions {
-    pub struct_size: u32,
-    pub flags: u32,
-    pub payment_hash: *const c_char,
-    pub router_json: *const c_char,
-    pub invoice: *const c_char,
-    pub custom_records_json: *const c_char,
-    pub has_keysend: i32,
-    pub keysend: i32,
-    pub udt_type_script_json: *const c_char,
-    pub has_dry_run: i32,
-    pub dry_run: i32,
-}
-
-#[repr(C)]
-pub struct FiberListPaymentsOptions {
-    pub struct_size: u32,
-    pub flags: u32,
-    pub status: FiberPaymentStatusFilter,
-    pub limit: u64,
-    pub has_limit: i32,
-    pub after: *const c_char,
-}
-
-#[repr(C)]
-pub struct FiberNewInvoiceOptions {
-    pub struct_size: u32,
-    pub flags: u32,
-    pub amount: FiberU128,
-    pub description: *const c_char,
-    pub currency: FiberInvoiceCurrency,
-    pub payment_preimage: *const c_char,
-    pub payment_hash: *const c_char,
-    pub expiry: u64,
-    pub has_expiry: i32,
-    pub fallback_address: *const c_char,
-    pub final_expiry_delta: u64,
-    pub has_final_expiry_delta: i32,
-    pub udt_type_script_json: *const c_char,
-    pub hash_algorithm: FiberHashAlgorithm,
-    pub has_allow_mpp: i32,
-    pub allow_mpp: i32,
-    pub has_allow_trampoline_routing: i32,
-    pub allow_trampoline_routing: i32,
-}
+pub use ffi_types::*;
 
 #[derive(Copy, Clone)]
 struct EventCallback {
@@ -353,6 +83,8 @@ struct EventCallback {
     user_data: usize,
 }
 
+// SAFETY: the wrapper stores only a function pointer and an opaque address. It
+// never dereferences `user_data`; the foreign caller owns its synchronization.
 unsafe impl Send for EventCallback {}
 unsafe impl Sync for EventCallback {}
 
@@ -362,6 +94,8 @@ struct CkbPrepareCallback {
     user_data: usize,
 }
 
+// SAFETY: as with `EventCallback`, moving or sharing this value never accesses
+// the pointee behind `user_data`; its lifetime is part of the callback contract.
 unsafe impl Send for CkbPrepareCallback {}
 unsafe impl Sync for CkbPrepareCallback {}
 
@@ -1384,6 +1118,12 @@ unsafe fn fiber_prepare_ckb_inner(
     })
 }
 
+/// Starts a Fiber node and returns an owning handle.
+///
+/// # Safety
+///
+/// `options` and its strings must be valid for this call. `out_handle` must
+/// be writable. On success, pass the returned handle to `fiber_stop` exactly once.
 #[no_mangle]
 pub unsafe extern "C" fn fiber_start(
     options: *const FiberStartOptions,
@@ -2045,6 +1785,12 @@ fn emit_ckb_prepare_completion(
     }
 }
 
+/// Stops a Fiber node and releases its handle.
+///
+/// # Safety
+///
+/// `handle` must be a live pointer returned by `fiber_start`. Prevent concurrent
+/// use of the handle, and do not use it after this call.
 #[no_mangle]
 pub unsafe extern "C" fn fiber_stop(handle: *mut FiberHandle) -> FiberFfiStatus {
     ffi_boundary(|| {
@@ -2085,6 +1831,12 @@ pub unsafe extern "C" fn fiber_stop(handle: *mut FiberHandle) -> FiberFfiStatus 
     })
 }
 
+/// Returns information about the running Fiber node as JSON.
+///
+/// # Safety
+///
+/// `handle` must be live and `out_json` must be writable. Free the returned
+/// string with `fiber_string_free`.
 #[no_mangle]
 pub unsafe extern "C" fn fiber_node_info(
     handle: *mut FiberHandle,
@@ -2104,6 +1856,12 @@ pub unsafe extern "C" fn fiber_node_info(
     })
 }
 
+/// Returns the current CKB synchronization readiness as JSON.
+///
+/// # Safety
+///
+/// `handle` must be live and `out_json` must be writable. Free the returned
+/// string with `fiber_string_free`.
 #[no_mangle]
 pub unsafe extern "C" fn fiber_ckb_readiness(
     handle: *mut FiberHandle,
@@ -2123,6 +1881,11 @@ pub unsafe extern "C" fn fiber_ckb_readiness(
 /// Returns the indexed base-CKB capacity controlled by the configured funding
 /// key. The result is a Light Client/indexer snapshot and can include cells
 /// that an in-flight transaction has already reserved.
+///
+/// # Safety
+///
+/// `handle` must be live and `out_json` must be writable. Free the returned
+/// string with `fiber_string_free`.
 #[no_mangle]
 pub unsafe extern "C" fn fiber_ckb_balance(
     handle: *mut FiberHandle,
@@ -2147,6 +1910,12 @@ pub unsafe extern "C" fn fiber_ckb_balance(
     })
 }
 
+/// Returns the connected peers as JSON.
+///
+/// # Safety
+///
+/// `handle` must be live and `out_json` must be writable. Free the returned
+/// string with `fiber_string_free`.
 #[no_mangle]
 pub unsafe extern "C" fn fiber_list_peers(
     handle: *mut FiberHandle,
@@ -2166,6 +1935,12 @@ pub unsafe extern "C" fn fiber_list_peers(
     })
 }
 
+/// Connects the running node to a peer.
+///
+/// # Safety
+///
+/// `handle` must be live. `options` and every non-null string it references
+/// must remain valid for this call.
 #[no_mangle]
 pub unsafe extern "C" fn fiber_connect_peer(
     handle: *mut FiberHandle,
@@ -2227,6 +2002,12 @@ pub unsafe extern "C" fn fiber_connect_peer(
     })
 }
 
+/// Disconnects a peer by public key.
+///
+/// # Safety
+///
+/// `handle` must be live. `pubkey` must be a valid, NUL-terminated C string
+/// for the duration of this call.
 #[no_mangle]
 pub unsafe extern "C" fn fiber_disconnect_peer(
     handle: *mut FiberHandle,
@@ -2245,6 +2026,12 @@ pub unsafe extern "C" fn fiber_disconnect_peer(
     })
 }
 
+/// Opens a channel and returns its temporary channel ID.
+///
+/// # Safety
+///
+/// `handle` must be live. `options` and its strings must remain valid for this
+/// call. The output must be writable; free its string with `fiber_string_free`.
 #[no_mangle]
 pub unsafe extern "C" fn fiber_open_channel(
     handle: *mut FiberHandle,
@@ -2266,6 +2053,12 @@ pub unsafe extern "C" fn fiber_open_channel(
     })
 }
 
+/// Accepts a pending channel and returns its channel ID.
+///
+/// # Safety
+///
+/// `handle` must be live. `options` and its strings must remain valid for this
+/// call. The output must be writable; free its string with `fiber_string_free`.
 #[no_mangle]
 pub unsafe extern "C" fn fiber_accept_channel(
     handle: *mut FiberHandle,
@@ -2286,6 +2079,12 @@ pub unsafe extern "C" fn fiber_accept_channel(
     })
 }
 
+/// Opens a channel whose funding transaction is signed externally.
+///
+/// # Safety
+///
+/// `handle` must be live. `options` and its strings must remain valid for this
+/// call. `out_json` must be writable; free it with `fiber_string_free`.
 #[no_mangle]
 pub unsafe extern "C" fn fiber_open_channel_with_external_funding(
     handle: *mut FiberHandle,
@@ -2306,6 +2105,12 @@ pub unsafe extern "C" fn fiber_open_channel_with_external_funding(
     })
 }
 
+/// Submits an externally signed funding transaction.
+///
+/// # Safety
+///
+/// `handle` must be live. `options` and its strings must remain valid for this
+/// call. `out_json` must be writable; free it with `fiber_string_free`.
 #[no_mangle]
 pub unsafe extern "C" fn fiber_submit_signed_funding_tx(
     handle: *mut FiberHandle,
@@ -2326,6 +2131,12 @@ pub unsafe extern "C" fn fiber_submit_signed_funding_tx(
     })
 }
 
+/// Abandons a channel.
+///
+/// # Safety
+///
+/// `handle` must be live. `channel_id` must be a valid, NUL-terminated C
+/// string for the duration of this call.
 #[no_mangle]
 pub unsafe extern "C" fn fiber_abandon_channel(
     handle: *mut FiberHandle,
@@ -2342,6 +2153,12 @@ pub unsafe extern "C" fn fiber_abandon_channel(
     })
 }
 
+/// Returns channels matching the supplied filters as JSON.
+///
+/// # Safety
+///
+/// `handle` must be live. `options` and its strings must remain valid for this
+/// call. `out_json` must be writable; free it with `fiber_string_free`.
 #[no_mangle]
 pub unsafe extern "C" fn fiber_list_channels(
     handle: *mut FiberHandle,
@@ -2362,6 +2179,12 @@ pub unsafe extern "C" fn fiber_list_channels(
     })
 }
 
+/// Shuts down a channel.
+///
+/// # Safety
+///
+/// `handle` must be live. `options` and its strings must remain valid for
+/// the duration of this call.
 #[no_mangle]
 pub unsafe extern "C" fn fiber_shutdown_channel(
     handle: *mut FiberHandle,
@@ -2378,6 +2201,12 @@ pub unsafe extern "C" fn fiber_shutdown_channel(
     })
 }
 
+/// Updates channel settings.
+///
+/// # Safety
+///
+/// `handle` must be live. `options` and its strings must remain valid for
+/// the duration of this call.
 #[no_mangle]
 pub unsafe extern "C" fn fiber_update_channel(
     handle: *mut FiberHandle,
@@ -2394,6 +2223,12 @@ pub unsafe extern "C" fn fiber_update_channel(
     })
 }
 
+/// Sends a payment and returns its state as JSON.
+///
+/// # Safety
+///
+/// `handle` must be live. `options` and its strings must remain valid for this
+/// call. `out_json` must be writable; free it with `fiber_string_free`.
 #[no_mangle]
 pub unsafe extern "C" fn fiber_send_payment(
     handle: *mut FiberHandle,
@@ -2414,6 +2249,12 @@ pub unsafe extern "C" fn fiber_send_payment(
     })
 }
 
+/// Builds a payment route and returns it as JSON.
+///
+/// # Safety
+///
+/// `handle` must be live. `options` and its strings must remain valid for this
+/// call. `out_json` must be writable; free it with `fiber_string_free`.
 #[no_mangle]
 pub unsafe extern "C" fn fiber_build_router(
     handle: *mut FiberHandle,
@@ -2434,6 +2275,12 @@ pub unsafe extern "C" fn fiber_build_router(
     })
 }
 
+/// Sends a payment through a caller-provided route.
+///
+/// # Safety
+///
+/// `handle` must be live. `options` and its strings must remain valid for this
+/// call. `out_json` must be writable; free it with `fiber_string_free`.
 #[no_mangle]
 pub unsafe extern "C" fn fiber_send_payment_with_router(
     handle: *mut FiberHandle,
@@ -2454,6 +2301,12 @@ pub unsafe extern "C" fn fiber_send_payment_with_router(
     })
 }
 
+/// Returns a payment by hash as JSON.
+///
+/// # Safety
+///
+/// `handle` must be live and `payment_hash` must be a valid C string.
+/// `out_json` must be writable; free it with `fiber_string_free`.
 #[no_mangle]
 pub unsafe extern "C" fn fiber_get_payment(
     handle: *mut FiberHandle,
@@ -2474,6 +2327,12 @@ pub unsafe extern "C" fn fiber_get_payment(
     })
 }
 
+/// Returns payments matching the supplied filters as JSON.
+///
+/// # Safety
+///
+/// `handle` must be live. `options` and its strings must remain valid for this
+/// call. `out_json` must be writable; free it with `fiber_string_free`.
 #[no_mangle]
 pub unsafe extern "C" fn fiber_list_payments(
     handle: *mut FiberHandle,
@@ -2494,6 +2353,12 @@ pub unsafe extern "C" fn fiber_list_payments(
     })
 }
 
+/// Creates an invoice and returns its encoded address.
+///
+/// # Safety
+///
+/// `handle` must be live. `options` and its strings must remain valid for this
+/// call. The output must be writable; free it with `fiber_string_free`.
 #[no_mangle]
 pub unsafe extern "C" fn fiber_new_invoice(
     handle: *mut FiberHandle,
@@ -2514,6 +2379,12 @@ pub unsafe extern "C" fn fiber_new_invoice(
     })
 }
 
+/// Parses an encoded invoice and returns it as JSON.
+///
+/// # Safety
+///
+/// `handle` must be live and `invoice` must be a valid C string. `out_json`
+/// must be writable; free it with `fiber_string_free`.
 #[no_mangle]
 pub unsafe extern "C" fn fiber_parse_invoice(
     handle: *mut FiberHandle,
@@ -2535,6 +2406,12 @@ pub unsafe extern "C" fn fiber_parse_invoice(
     })
 }
 
+/// Returns an invoice by payment hash as JSON.
+///
+/// # Safety
+///
+/// `handle` must be live and `payment_hash` must be a valid C string.
+/// `out_json` must be writable; free it with `fiber_string_free`.
 #[no_mangle]
 pub unsafe extern "C" fn fiber_get_invoice(
     handle: *mut FiberHandle,
@@ -2555,6 +2432,12 @@ pub unsafe extern "C" fn fiber_get_invoice(
     })
 }
 
+/// Cancels an invoice and returns its updated state as JSON.
+///
+/// # Safety
+///
+/// `handle` must be live and `payment_hash` must be a valid C string.
+/// `out_json` must be writable; free it with `fiber_string_free`.
 #[no_mangle]
 pub unsafe extern "C" fn fiber_cancel_invoice(
     handle: *mut FiberHandle,
@@ -2575,6 +2458,12 @@ pub unsafe extern "C" fn fiber_cancel_invoice(
     })
 }
 
+/// Settles an invoice.
+///
+/// # Safety
+///
+/// `handle` must be live. `payment_hash` and `payment_preimage` must be
+/// valid, NUL-terminated C strings for the duration of this call.
 #[no_mangle]
 pub unsafe extern "C" fn fiber_settle_invoice(
     handle: *mut FiberHandle,
@@ -2601,6 +2490,12 @@ pub unsafe extern "C" fn fiber_settle_invoice(
     })
 }
 
+/// Releases a C string returned by this library.
+///
+/// # Safety
+///
+/// `string` must be null or returned by a Fiber FFI function. A non-null
+/// pointer must be released exactly once and not used afterward.
 #[no_mangle]
 pub unsafe extern "C" fn fiber_string_free(string: *mut c_char) {
     if !string.is_null() {
@@ -2608,6 +2503,12 @@ pub unsafe extern "C" fn fiber_string_free(string: *mut c_char) {
     }
 }
 
+/// Copies the calling thread's last FFI error message into `buffer`.
+///
+/// # Safety
+///
+/// When non-null and `buffer_len` is non-zero, `buffer` must be valid for
+/// writes of `buffer_len` bytes. A null buffer queries the required byte count.
 #[no_mangle]
 pub unsafe extern "C" fn fiber_last_error_message(buffer: *mut c_char, buffer_len: usize) -> usize {
     LAST_ERROR.with(|last_error| {
@@ -3821,816 +3722,6 @@ fn optional_string(ptr: *const c_char) -> FfiCallResult<Option<String>> {
             .map(str::to_owned)
             .map(Some)
             .map_err(|err| ffi_error(FiberFfiStatus::InvalidArgument, err.to_string()))
-    }
-}
-
-fn open_channel_params_from_options(
-    options: &FiberOpenChannelOptions,
-) -> FfiCallResult<fnn::rpc::channel::OpenChannelParams> {
-    validate_options_struct::<FiberOpenChannelOptions>(
-        options.struct_size,
-        options.flags,
-        "FiberOpenChannelOptions",
-    )?;
-    let mut value = serde_json::Map::new();
-    value.insert(
-        "pubkey".to_string(),
-        string_field("pubkey", options.pubkey)?,
-    );
-    value.insert(
-        "funding_amount".to_string(),
-        u128_hex_field(options.funding_amount),
-    );
-    insert_optional_bool(&mut value, "public", options.has_public, options.public_);
-    insert_optional_bool(&mut value, "one_way", options.has_one_way, options.one_way);
-    insert_optional_json(
-        &mut value,
-        "funding_udt_type_script",
-        options.funding_udt_type_script_json,
-    )?;
-    insert_optional_json(&mut value, "shutdown_script", options.shutdown_script_json)?;
-    insert_optional_u64_number(
-        &mut value,
-        "commitment_delay_epoch",
-        options.has_commitment_delay_epoch,
-        options.commitment_delay_epoch,
-    );
-    insert_optional_u64_hex(
-        &mut value,
-        "commitment_fee_rate",
-        options.has_commitment_fee_rate,
-        options.commitment_fee_rate,
-    );
-    insert_optional_u64_hex(
-        &mut value,
-        "funding_fee_rate",
-        options.has_funding_fee_rate,
-        options.funding_fee_rate,
-    );
-    insert_optional_u64_hex(
-        &mut value,
-        "tlc_expiry_delta",
-        options.has_tlc_expiry_delta,
-        options.tlc_expiry_delta,
-    );
-    insert_optional_u128_hex(
-        &mut value,
-        "tlc_min_value",
-        options.has_tlc_min_value,
-        options.tlc_min_value,
-    );
-    insert_optional_u128_hex(
-        &mut value,
-        "tlc_fee_proportional_millionths",
-        options.has_tlc_fee_proportional_millionths,
-        options.tlc_fee_proportional_millionths,
-    );
-    insert_optional_u128_hex(
-        &mut value,
-        "max_tlc_value_in_flight",
-        options.has_max_tlc_value_in_flight,
-        options.max_tlc_value_in_flight,
-    );
-    insert_optional_u64_hex(
-        &mut value,
-        "max_tlc_number_in_flight",
-        options.has_max_tlc_number_in_flight,
-        options.max_tlc_number_in_flight,
-    );
-    deserialize_object(value)
-}
-
-fn accept_channel_params_from_options(
-    options: &FiberAcceptChannelOptions,
-) -> FfiCallResult<fnn::rpc::channel::AcceptChannelParams> {
-    validate_options_struct::<FiberAcceptChannelOptions>(
-        options.struct_size,
-        options.flags,
-        "FiberAcceptChannelOptions",
-    )?;
-    let mut value = serde_json::Map::new();
-    value.insert(
-        "temporary_channel_id".to_string(),
-        string_field("temporary_channel_id", options.temporary_channel_id)?,
-    );
-    value.insert(
-        "funding_amount".to_string(),
-        u128_hex_field(options.funding_amount),
-    );
-    insert_optional_json(&mut value, "shutdown_script", options.shutdown_script_json)?;
-    insert_optional_u128_hex(
-        &mut value,
-        "max_tlc_value_in_flight",
-        options.has_max_tlc_value_in_flight,
-        options.max_tlc_value_in_flight,
-    );
-    insert_optional_u64_hex(
-        &mut value,
-        "max_tlc_number_in_flight",
-        options.has_max_tlc_number_in_flight,
-        options.max_tlc_number_in_flight,
-    );
-    insert_optional_u128_hex(
-        &mut value,
-        "tlc_min_value",
-        options.has_tlc_min_value,
-        options.tlc_min_value,
-    );
-    insert_optional_u128_hex(
-        &mut value,
-        "tlc_fee_proportional_millionths",
-        options.has_tlc_fee_proportional_millionths,
-        options.tlc_fee_proportional_millionths,
-    );
-    insert_optional_u64_hex(
-        &mut value,
-        "tlc_expiry_delta",
-        options.has_tlc_expiry_delta,
-        options.tlc_expiry_delta,
-    );
-    deserialize_object(value)
-}
-
-fn open_channel_with_external_funding_params_from_options(
-    options: &FiberOpenChannelWithExternalFundingOptions,
-) -> FfiCallResult<fnn::rpc::channel::OpenChannelWithExternalFundingParams> {
-    validate_options_struct::<FiberOpenChannelWithExternalFundingOptions>(
-        options.struct_size,
-        options.flags,
-        "FiberOpenChannelWithExternalFundingOptions",
-    )?;
-    let mut value = serde_json::Map::new();
-    value.insert(
-        "pubkey".to_string(),
-        string_field("pubkey", options.pubkey)?,
-    );
-    value.insert(
-        "funding_amount".to_string(),
-        u128_hex_field(options.funding_amount),
-    );
-    insert_optional_bool(&mut value, "public", options.has_public, options.public_);
-    insert_optional_json(
-        &mut value,
-        "funding_udt_type_script",
-        options.funding_udt_type_script_json,
-    )?;
-    value.insert(
-        "shutdown_script".to_string(),
-        json_field("shutdown_script_json", options.shutdown_script_json)?,
-    );
-    value.insert(
-        "funding_lock_script".to_string(),
-        json_field("funding_lock_script_json", options.funding_lock_script_json)?,
-    );
-    insert_optional_json(
-        &mut value,
-        "funding_lock_script_cell_deps",
-        options.funding_lock_script_cell_deps_json,
-    )?;
-    insert_optional_u64_number(
-        &mut value,
-        "commitment_delay_epoch",
-        options.has_commitment_delay_epoch,
-        options.commitment_delay_epoch,
-    );
-    insert_optional_u64_hex(
-        &mut value,
-        "commitment_fee_rate",
-        options.has_commitment_fee_rate,
-        options.commitment_fee_rate,
-    );
-    insert_optional_u64_hex(
-        &mut value,
-        "funding_fee_rate",
-        options.has_funding_fee_rate,
-        options.funding_fee_rate,
-    );
-    insert_optional_u64_hex(
-        &mut value,
-        "tlc_expiry_delta",
-        options.has_tlc_expiry_delta,
-        options.tlc_expiry_delta,
-    );
-    insert_optional_u128_hex(
-        &mut value,
-        "tlc_min_value",
-        options.has_tlc_min_value,
-        options.tlc_min_value,
-    );
-    insert_optional_u128_hex(
-        &mut value,
-        "tlc_fee_proportional_millionths",
-        options.has_tlc_fee_proportional_millionths,
-        options.tlc_fee_proportional_millionths,
-    );
-    insert_optional_u128_hex(
-        &mut value,
-        "max_tlc_value_in_flight",
-        options.has_max_tlc_value_in_flight,
-        options.max_tlc_value_in_flight,
-    );
-    insert_optional_u64_hex(
-        &mut value,
-        "max_tlc_number_in_flight",
-        options.has_max_tlc_number_in_flight,
-        options.max_tlc_number_in_flight,
-    );
-    deserialize_object(value)
-}
-
-fn submit_signed_funding_tx_params_from_options(
-    options: &FiberSubmitSignedFundingTxOptions,
-) -> FfiCallResult<fnn::rpc::channel::SubmitSignedFundingTxParams> {
-    validate_options_struct::<FiberSubmitSignedFundingTxOptions>(
-        options.struct_size,
-        options.flags,
-        "FiberSubmitSignedFundingTxOptions",
-    )?;
-    let mut value = serde_json::Map::new();
-    value.insert(
-        "channel_id".to_string(),
-        string_field("channel_id", options.channel_id)?,
-    );
-    value.insert(
-        "signed_funding_tx".to_string(),
-        json_field("signed_funding_tx_json", options.signed_funding_tx_json)?,
-    );
-    deserialize_object(value)
-}
-
-fn list_channels_params_from_options(
-    options: &FiberListChannelsOptions,
-) -> FfiCallResult<fnn::rpc::channel::ListChannelsParams> {
-    validate_options_struct::<FiberListChannelsOptions>(
-        options.struct_size,
-        options.flags,
-        "FiberListChannelsOptions",
-    )?;
-    let mut value = serde_json::Map::new();
-    insert_optional_string(&mut value, "pubkey", options.pubkey)?;
-    insert_optional_bool(
-        &mut value,
-        "include_closed",
-        options.has_include_closed,
-        options.include_closed,
-    );
-    insert_optional_bool(
-        &mut value,
-        "only_pending",
-        options.has_only_pending,
-        options.only_pending,
-    );
-    deserialize_object(value)
-}
-
-fn shutdown_channel_params_from_options(
-    options: &FiberShutdownChannelOptions,
-) -> FfiCallResult<fnn::rpc::channel::ShutdownChannelParams> {
-    validate_options_struct::<FiberShutdownChannelOptions>(
-        options.struct_size,
-        options.flags,
-        "FiberShutdownChannelOptions",
-    )?;
-    let mut value = serde_json::Map::new();
-    value.insert(
-        "channel_id".to_string(),
-        string_field("channel_id", options.channel_id)?,
-    );
-    insert_optional_json(&mut value, "close_script", options.close_script_json)?;
-    insert_optional_u64_hex(
-        &mut value,
-        "fee_rate",
-        options.has_fee_rate,
-        options.fee_rate,
-    );
-    insert_optional_bool(&mut value, "force", options.has_force, options.force);
-    deserialize_object(value)
-}
-
-fn update_channel_params_from_options(
-    options: &FiberUpdateChannelOptions,
-) -> FfiCallResult<fnn::rpc::channel::UpdateChannelParams> {
-    validate_options_struct::<FiberUpdateChannelOptions>(
-        options.struct_size,
-        options.flags,
-        "FiberUpdateChannelOptions",
-    )?;
-    let mut value = serde_json::Map::new();
-    value.insert(
-        "channel_id".to_string(),
-        string_field("channel_id", options.channel_id)?,
-    );
-    insert_optional_bool(&mut value, "enabled", options.has_enabled, options.enabled);
-    insert_optional_u64_hex(
-        &mut value,
-        "tlc_expiry_delta",
-        options.has_tlc_expiry_delta,
-        options.tlc_expiry_delta,
-    );
-    insert_optional_u128_hex(
-        &mut value,
-        "tlc_minimum_value",
-        options.has_tlc_minimum_value,
-        options.tlc_minimum_value,
-    );
-    insert_optional_u128_hex(
-        &mut value,
-        "tlc_fee_proportional_millionths",
-        options.has_tlc_fee_proportional_millionths,
-        options.tlc_fee_proportional_millionths,
-    );
-    deserialize_object(value)
-}
-
-fn send_payment_params_from_options(
-    options: &FiberSendPaymentOptions,
-) -> FfiCallResult<fnn::rpc::payment::SendPaymentCommandParams> {
-    validate_options_struct::<FiberSendPaymentOptions>(
-        options.struct_size,
-        options.flags,
-        "FiberSendPaymentOptions",
-    )?;
-    let mut value = serde_json::Map::new();
-    insert_optional_string(&mut value, "target_pubkey", options.target_pubkey)?;
-    insert_optional_u128_hex(&mut value, "amount", options.has_amount, options.amount);
-    insert_optional_string(&mut value, "payment_hash", options.payment_hash)?;
-    insert_optional_u64_hex(
-        &mut value,
-        "final_tlc_expiry_delta",
-        options.has_final_tlc_expiry_delta,
-        options.final_tlc_expiry_delta,
-    );
-    insert_optional_u64_hex(
-        &mut value,
-        "tlc_expiry_limit",
-        options.has_tlc_expiry_limit,
-        options.tlc_expiry_limit,
-    );
-    insert_optional_string(&mut value, "invoice", options.invoice)?;
-    insert_optional_u64_hex(&mut value, "timeout", options.has_timeout, options.timeout);
-    insert_optional_u128_hex(
-        &mut value,
-        "max_fee_amount",
-        options.has_max_fee_amount,
-        options.max_fee_amount,
-    );
-    insert_optional_u64_hex(
-        &mut value,
-        "max_fee_rate",
-        options.has_max_fee_rate,
-        options.max_fee_rate,
-    );
-    insert_optional_u64_hex(
-        &mut value,
-        "max_parts",
-        options.has_max_parts,
-        options.max_parts,
-    );
-    insert_optional_json(&mut value, "trampoline_hops", options.trampoline_hops_json)?;
-    insert_optional_bool(&mut value, "keysend", options.has_keysend, options.keysend);
-    insert_optional_json(&mut value, "udt_type_script", options.udt_type_script_json)?;
-    insert_optional_bool(
-        &mut value,
-        "allow_self_payment",
-        options.has_allow_self_payment,
-        options.allow_self_payment,
-    );
-    insert_optional_json(&mut value, "custom_records", options.custom_records_json)?;
-    insert_optional_json(&mut value, "hop_hints", options.hop_hints_json)?;
-    insert_optional_bool(&mut value, "dry_run", options.has_dry_run, options.dry_run);
-    deserialize_object(value)
-}
-
-fn build_router_params_from_options(
-    options: &FiberBuildRouterOptions,
-) -> FfiCallResult<fnn::rpc::payment::BuildRouterParams> {
-    validate_options_struct::<FiberBuildRouterOptions>(
-        options.struct_size,
-        options.flags,
-        "FiberBuildRouterOptions",
-    )?;
-    let mut value = serde_json::Map::new();
-    insert_optional_u128_hex(&mut value, "amount", options.has_amount, options.amount);
-    insert_optional_json(&mut value, "udt_type_script", options.udt_type_script_json)?;
-    value.insert(
-        "hops_info".to_string(),
-        json_field("hops_info_json", options.hops_info_json)?,
-    );
-    insert_optional_u64_hex(
-        &mut value,
-        "final_tlc_expiry_delta",
-        options.has_final_tlc_expiry_delta,
-        options.final_tlc_expiry_delta,
-    );
-    deserialize_object(value)
-}
-
-fn send_payment_with_router_params_from_options(
-    options: &FiberSendPaymentWithRouterOptions,
-) -> FfiCallResult<fnn::rpc::payment::SendPaymentWithRouterParams> {
-    validate_options_struct::<FiberSendPaymentWithRouterOptions>(
-        options.struct_size,
-        options.flags,
-        "FiberSendPaymentWithRouterOptions",
-    )?;
-    let mut value = serde_json::Map::new();
-    insert_optional_string(&mut value, "payment_hash", options.payment_hash)?;
-    value.insert(
-        "router".to_string(),
-        json_field("router_json", options.router_json)?,
-    );
-    insert_optional_string(&mut value, "invoice", options.invoice)?;
-    insert_optional_json(&mut value, "custom_records", options.custom_records_json)?;
-    insert_optional_bool(&mut value, "keysend", options.has_keysend, options.keysend);
-    insert_optional_json(&mut value, "udt_type_script", options.udt_type_script_json)?;
-    insert_optional_bool(&mut value, "dry_run", options.has_dry_run, options.dry_run);
-    deserialize_object(value)
-}
-
-fn list_payments_params_from_options(
-    options: &FiberListPaymentsOptions,
-) -> FfiCallResult<fnn::rpc::payment::ListPaymentsParams> {
-    validate_options_struct::<FiberListPaymentsOptions>(
-        options.struct_size,
-        options.flags,
-        "FiberListPaymentsOptions",
-    )?;
-    let mut value = serde_json::Map::new();
-    match options.status {
-        FIBER_PAYMENT_STATUS_FILTER_ALL => {}
-        FIBER_PAYMENT_STATUS_FILTER_CREATED => {
-            value.insert(
-                "status".to_string(),
-                serde_json::Value::String("Created".to_string()),
-            );
-        }
-        FIBER_PAYMENT_STATUS_FILTER_INFLIGHT => {
-            value.insert(
-                "status".to_string(),
-                serde_json::Value::String("Inflight".to_string()),
-            );
-        }
-        FIBER_PAYMENT_STATUS_FILTER_SUCCESS => {
-            value.insert(
-                "status".to_string(),
-                serde_json::Value::String("Success".to_string()),
-            );
-        }
-        FIBER_PAYMENT_STATUS_FILTER_FAILED => {
-            value.insert(
-                "status".to_string(),
-                serde_json::Value::String("Failed".to_string()),
-            );
-        }
-        _ => {
-            return Err(ffi_error(
-                FiberFfiStatus::InvalidArgument,
-                "status must be one of FIBER_PAYMENT_STATUS_FILTER_*",
-            ));
-        }
-    };
-    insert_optional_u64_hex(&mut value, "limit", options.has_limit, options.limit);
-    insert_optional_string(&mut value, "after", options.after)?;
-    deserialize_object(value)
-}
-
-fn new_invoice_params_from_options(
-    options: &FiberNewInvoiceOptions,
-) -> FfiCallResult<fnn::rpc::invoice::NewInvoiceParams> {
-    validate_options_struct::<FiberNewInvoiceOptions>(
-        options.struct_size,
-        options.flags,
-        "FiberNewInvoiceOptions",
-    )?;
-    let mut value = serde_json::Map::new();
-    value.insert("amount".to_string(), u128_hex_field(options.amount));
-    insert_optional_string(&mut value, "description", options.description)?;
-    let currency = match options.currency {
-        FIBER_INVOICE_CURRENCY_DEFAULT => "Fibd",
-        FIBER_INVOICE_CURRENCY_FIBB => "Fibb",
-        FIBER_INVOICE_CURRENCY_FIBT => "Fibt",
-        FIBER_INVOICE_CURRENCY_FIBD => "Fibd",
-        _ => {
-            return Err(ffi_error(
-                FiberFfiStatus::InvalidArgument,
-                "currency must be one of FIBER_INVOICE_CURRENCY_*",
-            ));
-        }
-    };
-    value.insert(
-        "currency".to_string(),
-        serde_json::Value::String(currency.to_string()),
-    );
-    insert_optional_string(&mut value, "payment_preimage", options.payment_preimage)?;
-    insert_optional_string(&mut value, "payment_hash", options.payment_hash)?;
-    insert_optional_u64_hex(&mut value, "expiry", options.has_expiry, options.expiry);
-    insert_optional_string(&mut value, "fallback_address", options.fallback_address)?;
-    insert_optional_u64_hex(
-        &mut value,
-        "final_expiry_delta",
-        options.has_final_expiry_delta,
-        options.final_expiry_delta,
-    );
-    insert_optional_json(&mut value, "udt_type_script", options.udt_type_script_json)?;
-    match options.hash_algorithm {
-        FIBER_HASH_ALGORITHM_DEFAULT => {}
-        FIBER_HASH_ALGORITHM_CKB_HASH => {
-            value.insert(
-                "hash_algorithm".to_string(),
-                serde_json::Value::String("ckb_hash".to_string()),
-            );
-        }
-        FIBER_HASH_ALGORITHM_SHA256 => {
-            value.insert(
-                "hash_algorithm".to_string(),
-                serde_json::Value::String("sha256".to_string()),
-            );
-        }
-        _ => {
-            return Err(ffi_error(
-                FiberFfiStatus::InvalidArgument,
-                "hash_algorithm must be one of FIBER_HASH_ALGORITHM_*",
-            ));
-        }
-    }
-    insert_optional_bool(
-        &mut value,
-        "allow_mpp",
-        options.has_allow_mpp,
-        options.allow_mpp,
-    );
-    insert_optional_bool(
-        &mut value,
-        "allow_trampoline_routing",
-        options.has_allow_trampoline_routing,
-        options.allow_trampoline_routing,
-    );
-    deserialize_object(value)
-}
-
-fn required_hash_param(name: &str, ptr: *const c_char) -> FfiCallResult<serde_json::Value> {
-    let mut value = serde_json::Map::new();
-    value.insert(name.to_string(), string_field(name, ptr)?);
-    Ok(serde_json::Value::Object(value))
-}
-
-fn string_field(name: &str, ptr: *const c_char) -> FfiCallResult<serde_json::Value> {
-    Ok(serde_json::Value::String(required_string(ptr, name)?))
-}
-
-fn json_field(name: &str, ptr: *const c_char) -> FfiCallResult<serde_json::Value> {
-    let json = required_string(ptr, name)?;
-    serde_json::from_str(&json).map_err(|err| {
-        ffi_error(
-            FiberFfiStatus::InvalidArgument,
-            format!("invalid {name}: {err}"),
-        )
-    })
-}
-
-fn insert_optional_string(
-    value: &mut serde_json::Map<String, serde_json::Value>,
-    name: &str,
-    ptr: *const c_char,
-) -> FfiCallResult<()> {
-    let Some(field) = optional_string(ptr)? else {
-        return Ok(());
-    };
-    if field.is_empty() {
-        return Ok(());
-    }
-    value.insert(name.to_string(), serde_json::Value::String(field));
-    Ok(())
-}
-
-fn insert_optional_json(
-    value: &mut serde_json::Map<String, serde_json::Value>,
-    name: &str,
-    ptr: *const c_char,
-) -> FfiCallResult<()> {
-    let Some(field) = optional_string(ptr)? else {
-        return Ok(());
-    };
-    if field.is_empty() {
-        return Ok(());
-    }
-    let json = serde_json::from_str(&field).map_err(|err| {
-        ffi_error(
-            FiberFfiStatus::InvalidArgument,
-            format!("invalid {name}_json: {err}"),
-        )
-    })?;
-    value.insert(name.to_string(), json);
-    Ok(())
-}
-
-fn insert_optional_bool(
-    value: &mut serde_json::Map<String, serde_json::Value>,
-    name: &str,
-    has_value: i32,
-    field: i32,
-) {
-    if has_value != 0 {
-        value.insert(name.to_string(), serde_json::Value::Bool(field != 0));
-    }
-}
-
-fn insert_optional_u64_number(
-    value: &mut serde_json::Map<String, serde_json::Value>,
-    name: &str,
-    has_value: i32,
-    field: u64,
-) {
-    if has_value != 0 {
-        value.insert(
-            name.to_string(),
-            serde_json::Value::Number(serde_json::Number::from(field)),
-        );
-    }
-}
-
-fn insert_optional_u64_hex(
-    value: &mut serde_json::Map<String, serde_json::Value>,
-    name: &str,
-    has_value: i32,
-    field: u64,
-) {
-    if has_value != 0 {
-        value.insert(name.to_string(), u64_hex_field(field));
-    }
-}
-
-fn insert_optional_u128_hex(
-    value: &mut serde_json::Map<String, serde_json::Value>,
-    name: &str,
-    has_value: i32,
-    field: FiberU128,
-) {
-    if has_value != 0 {
-        value.insert(name.to_string(), u128_hex_field(field));
-    }
-}
-
-fn u64_hex_field(value: u64) -> serde_json::Value {
-    serde_json::Value::String(format!("0x{value:x}"))
-}
-
-fn u128_hex_field(value: FiberU128) -> serde_json::Value {
-    serde_json::Value::String(format!("0x{:x}", fiber_u128_to_u128(value)))
-}
-
-fn fiber_u128_to_u128(value: FiberU128) -> u128 {
-    ((value.high as u128) << 64) | value.low as u128
-}
-
-fn deserialize_object<T: DeserializeOwned>(
-    value: serde_json::Map<String, serde_json::Value>,
-) -> FfiCallResult<T> {
-    deserialize_value(serde_json::Value::Object(value))
-}
-
-fn deserialize_value<T: DeserializeOwned>(value: serde_json::Value) -> FfiCallResult<T> {
-    serde_json::from_value(value).map_err(|err| {
-        ffi_error(
-            FiberFfiStatus::InvalidArgument,
-            format!("invalid native options: {err}"),
-        )
-    })
-}
-
-fn validate_options_struct<T>(struct_size: u32, flags: u32, name: &str) -> FfiCallResult<()> {
-    let expected_size = std::mem::size_of::<T>();
-    if struct_size == 0 {
-        return Err(ffi_error(
-            FiberFfiStatus::InvalidArgument,
-            format!("{name}.struct_size must be set to sizeof({name})"),
-        ));
-    }
-    if (struct_size as usize) < expected_size {
-        return Err(ffi_error(
-            FiberFfiStatus::InvalidArgument,
-            format!(
-                "{name}.struct_size is too small: got {struct_size}, expected at least {expected_size}"
-            ),
-        ));
-    }
-    if flags != 0 {
-        return Err(ffi_error(
-            FiberFfiStatus::InvalidArgument,
-            format!("{name}.flags must be 0"),
-        ));
-    }
-    Ok(())
-}
-
-fn funding_lock_from_discovery_options(
-    options: &FiberCkbDiscoverHistoryStartBlockOptions,
-) -> FfiCallResult<ckb_types::packed::Script> {
-    let lock_args = optional_string(options.lock_args)?.filter(|value| !value.trim().is_empty());
-    let pubkey = optional_string(options.pubkey)?.filter(|value| !value.trim().is_empty());
-    let address = optional_string(options.address)?.filter(|value| !value.trim().is_empty());
-    let supplied = usize::from(lock_args.is_some())
-        + usize::from(pubkey.is_some())
-        + usize::from(address.is_some());
-    if supplied != 1 {
-        return Err(ffi_error(
-            FiberFfiStatus::InvalidArgument,
-            "exactly one of lock_args, pubkey, and address must be supplied",
-        ));
-    }
-
-    let payload = if let Some(lock_args) = lock_args {
-        let value = lock_args.strip_prefix("0x").unwrap_or(&lock_args);
-        let bytes = hex::decode(value).map_err(|err| {
-            ffi_error(
-                FiberFfiStatus::InvalidArgument,
-                format!("invalid lock_args hex: {err}"),
-            )
-        })?;
-        let hash = ckb_types::H160::from_slice(&bytes).map_err(|err| {
-            ffi_error(
-                FiberFfiStatus::InvalidArgument,
-                format!("lock_args must be exactly 20 bytes: {err}"),
-            )
-        })?;
-        CkbAddressPayload::from_pubkey_hash(hash)
-    } else if let Some(pubkey) = pubkey {
-        let value = pubkey.strip_prefix("0x").unwrap_or(&pubkey);
-        let bytes = hex::decode(value).map_err(|err| {
-            ffi_error(
-                FiberFfiStatus::InvalidArgument,
-                format!("invalid CKB pubkey hex: {err}"),
-            )
-        })?;
-        let pubkey = secp256k1::PublicKey::from_slice(&bytes).map_err(|err| {
-            ffi_error(
-                FiberFfiStatus::InvalidArgument,
-                format!("invalid CKB secp256k1 pubkey: {err}"),
-            )
-        })?;
-        CkbAddressPayload::from_pubkey(&pubkey)
-    } else {
-        let address = address.expect("one identity was validated above");
-        let address = address.parse::<CkbAddress>().map_err(|err| {
-            ffi_error(
-                FiberFfiStatus::InvalidArgument,
-                format!("invalid CKB address: {err}"),
-            )
-        })?;
-        address.payload().clone()
-    };
-    Ok((&payload).into())
-}
-
-fn optional_u64(has_value: i32, value: u64, field: &str) -> FfiCallResult<Option<u64>> {
-    match has_value {
-        0 => Ok(None),
-        1 => Ok(Some(value)),
-        _ => Err(ffi_error(
-            FiberFfiStatus::InvalidArgument,
-            format!("{field} must be 0 or 1"),
-        )),
-    }
-}
-
-fn parse_pubkey(value: &str) -> FfiCallResult<fnn::fiber_types::Pubkey> {
-    let value = value.strip_prefix("0x").unwrap_or(value);
-    let bytes = hex::decode(value).map_err(|err| {
-        ffi_error(
-            FiberFfiStatus::InvalidArgument,
-            format!("invalid pubkey hex: {err}"),
-        )
-    })?;
-    if bytes.len() != fnn::fiber_types::Pubkey::serialization_len() {
-        return Err(ffi_error(
-            FiberFfiStatus::InvalidArgument,
-            format!(
-                "pubkey must be {} bytes compressed secp256k1 key",
-                fnn::fiber_types::Pubkey::serialization_len()
-            ),
-        ));
-    }
-    fnn::fiber_types::Pubkey::from_slice(&bytes).map_err(|err| {
-        ffi_error(
-            FiberFfiStatus::InvalidArgument,
-            format!("invalid pubkey: {err}"),
-        )
-    })
-}
-
-fn parse_addr_type(value: Option<&str>) -> FfiCallResult<Option<TransportType>> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    match value.to_ascii_lowercase().as_str() {
-        "" => Ok(None),
-        "tcp" => Ok(Some(TransportType::Tcp)),
-        "ws" => Ok(Some(TransportType::Ws)),
-        "wss" => Ok(Some(TransportType::Wss)),
-        _ => Err(ffi_error(
-            FiberFfiStatus::InvalidArgument,
-            "addr_type must be tcp, ws, or wss",
-        )),
     }
 }
 

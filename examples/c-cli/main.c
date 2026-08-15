@@ -983,7 +983,7 @@ static void print_help(const char *program) {
          "  --config PATH     Path to the Fiber YAML configuration\n"
          "  --data PATH       Fiber/CKB Light Client data directory\n"
          "  --log-level TEXT  fiber-ffi log filter\n"
-         "  --log-file PATH   Log file [default: ./fiber-ffi.log]\n"
+         "  --log-file PATH   Log file [default: <data>/fiber-ffi.log]\n"
          "  --ckb-discovery-rpc URL\n"
          "                    CKB RPC/Indexer used for initial wallet history discovery\n"
          "  -h, --help        Show this help\n",
@@ -997,7 +997,7 @@ static int parse_args(int argc, char **argv, CliArgs *args) {
   args->config = "examples/c-cli/config.testnet.yml";
   args->data = "examples/c-cli/data";
   args->log_level = "info,fiber_ffi=debug";
-  args->log_file = "fiber-ffi.log";
+  args->log_file = NULL;
   args->ckb_discovery_rpc = DEFAULT_CKB_DISCOVERY_RPC_URL;
   for (index = 1; index < argc; ++index) {
     const char *argument = argv[index];
@@ -1035,6 +1035,7 @@ int main(int argc, char **argv) {
   FiberStartOptions options = {0};
   FiberHandle *node = NULL;
   FiberFfiStatus status;
+  char *default_log_file = NULL;
   char *output = NULL;
   FILE *log_file;
   int has_history_start_block = 0;
@@ -1044,18 +1045,29 @@ int main(int argc, char **argv) {
   if (argument_result <= 0) {
     return argument_result == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
+  if (args.log_file == NULL) {
+    default_log_file = join_path(args.data, "fiber-ffi.log");
+    if (default_log_file == NULL) {
+      fprintf(stderr, "Unable to construct the default log file path\n");
+      return EXIT_FAILURE;
+    }
+    args.log_file = default_log_file;
+  }
   if (!validate_startup(&args)) {
+    free(default_log_file);
     return EXIT_FAILURE;
   }
   log_file = fopen(args.log_file, "a");
   if (log_file == NULL) {
     fprintf(stderr, "Unable to open log file %s: %s\n", args.log_file,
             strerror(errno));
+    free(default_log_file);
     return EXIT_FAILURE;
   }
   if (setenv("FIBER_FFI_LOG_FILE", args.log_file, 1) != 0) {
     fprintf(stderr, "Unable to set FIBER_FFI_LOG_FILE: %s\n", strerror(errno));
     fclose(log_file);
+    free(default_log_file);
     return EXIT_FAILURE;
   }
 
@@ -1076,12 +1088,14 @@ int main(int argc, char **argv) {
   if (!discover_initial_history_start_block(
           &args, &options, &has_history_start_block, &history_start_block)) {
     fclose(log_file);
+    free(default_log_file);
     return EXIT_FAILURE;
   }
   printf("[startup/1] Synchronizing the built-in CKB Light Client...\n");
   if (!prepare_ckb(&options, has_history_start_block,
                    history_start_block)) {
     fclose(log_file);
+    free(default_log_file);
     return EXIT_FAILURE;
   }
 
@@ -1092,11 +1106,13 @@ int main(int argc, char **argv) {
   if (status != FIBER_FFI_STATUS_OK) {
     print_last_error("fiber_start", status);
     fclose(log_file);
+    free(default_log_file);
     return EXIT_FAILURE;
   }
   if (node == NULL) {
     fprintf(stderr, "fiber_start succeeded with a null handle\n");
     fclose(log_file);
+    free(default_log_file);
     return EXIT_FAILURE;
   }
 
@@ -1120,9 +1136,12 @@ int main(int argc, char **argv) {
   status = fiber_stop(node);
   if (status != FIBER_FFI_STATUS_OK) {
     print_last_error("fiber_stop", status);
+    fclose(log_file);
+    free(default_log_file);
     return EXIT_FAILURE;
   }
   fclose(log_file);
+  free(default_log_file);
   printf("[shutdown] Fiber stopped\n");
   return EXIT_SUCCESS;
 }
