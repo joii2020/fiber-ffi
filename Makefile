@@ -14,13 +14,10 @@ ANDROID_TOOLCHAIN_DIR ?= $(ANDROID_NDK_HOME)/toolchains/llvm/prebuilt/$(ANDROID_
 
 FIBER_SOURCE_DIR ?= ../fiber
 
-.PHONY: build-ios build-ios-sim build-android e2e-light-client e2e-light-client-check
+.PHONY: build-ios build-ios-sim build-android test-e2e
 
-e2e-light-client:
-	FIBER_SOURCE_DIR="$(abspath $(FIBER_SOURCE_DIR))" CARGO="$(CARGO)" tests/e2e/light-client/run.sh
-
-e2e-light-client-check:
-	FIBER_SOURCE_DIR="$(abspath $(FIBER_SOURCE_DIR))" CARGO="$(CARGO)" tests/e2e/light-client/run.sh --check
+test-e2e:
+	$(MAKE) -C tests/e2e FIBER_SOURCE_DIR="$(abspath $(FIBER_SOURCE_DIR))" CARGO="$(CARGO)" test
 
 build-ios:
 	@set -e; \

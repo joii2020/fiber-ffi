@@ -34,19 +34,25 @@ host's AVX2/BMI instruction set.
 Check the prerequisites without starting anything:
 
 ```sh
-make e2e-light-client-check
+make -C tests/e2e light-client-check
 ```
 
-Run the smoke test:
+Run all E2E tests through the repository-level entry point:
 
 ```sh
-make e2e-light-client
+make test-e2e
+```
+
+Run only the Light Client smoke test through the detailed E2E Makefile:
+
+```sh
+make -C tests/e2e light-client
 ```
 
 Use a different Fiber checkout or keep logs and generated state:
 
 ```sh
-FIBER_SOURCE_DIR=/path/to/fiber KEEP_E2E_WORKDIR=1 make e2e-light-client
+FIBER_SOURCE_DIR=/path/to/fiber KEEP_E2E_WORKDIR=1 make test-e2e
 ```
 
 ## Current boundary
