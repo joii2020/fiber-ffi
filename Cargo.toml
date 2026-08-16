@@ -40,7 +40,7 @@ ckb-async-runtime = { version = "=1.1.1", optional = true }
 ckb-chain-spec = "1"
 ckb-hash = { version = "=1.1.1", optional = true }
 ckb-jsonrpc-types = { version = "=1.2.0", optional = true }
-ckb-light-client-lib = { path = "vendor/ckb-light-client-lib", default-features = false, optional = true }
+ckb-light-client-lib = { git = "https://github.com/nervosnetwork/ckb-light-client.git", rev = "12e29522ab7e078ada704d4ac04cbc0498009b7b", default-features = false, optional = true }
 ckb-network = { version = "=1.2.3", optional = true }
 ckb-resource = "1"
 ckb-rocksdb = { version = "=0.21.1", default-features = false, features = ["portable"], optional = true }

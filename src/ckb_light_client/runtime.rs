@@ -13,8 +13,8 @@ use ckb_chain_spec::{consensus::Consensus, ChainSpec};
 use ckb_jsonrpc_types::{BlockNumber, Script};
 use ckb_light_client_lib::{
     protocols::{
-        FilterPeerSelectionConfig, FilterProtocol, LightClientProtocol, Peers, PendingTxs,
-        RelayProtocol, SyncProtocol, BAD_MESSAGE_ALLOWED_EACH_HOUR, CHECK_POINT_INTERVAL,
+        FilterProtocol, LightClientProtocol, Peers, PendingTxs, RelayProtocol, SyncProtocol,
+        BAD_MESSAGE_ALLOWED_EACH_HOUR, CHECK_POINT_INTERVAL,
     },
     service::{ScriptStatus, ScriptType},
     storage::{LightClientStorage, Storage, StorageWithChainData},
@@ -186,12 +186,6 @@ impl LocalCkbNodeHandle {
         storage.cleanup_invalid_matched_blocks();
 
         let pending_txs = Arc::new(RwLock::new(PendingTxs::default()));
-        let filter_peer_selection = FilterPeerSelectionConfig {
-            preferred_peer_chance_percent: config.filter_preferred_peer_chance_percent,
-            request_timeout: Duration::from_secs(config.filter_request_timeout_seconds),
-            consecutive_failures_before_cooldown: config.filter_peer_failure_threshold,
-            failure_cooldown: Duration::from_secs(config.filter_peer_cooldown_seconds),
-        };
         let peers = Arc::new(Peers::new(
             config.network_config()?.max_outbound_peers,
             CHECK_POINT_INTERVAL,
@@ -216,7 +210,6 @@ impl LocalCkbNodeHandle {
             Arc::clone(&peers),
             Arc::clone(&pending_txs),
             Arc::clone(&consensus),
-            filter_peer_selection,
         );
         let required_protocol_ids = vec![
             SupportProtocols::Sync.protocol_id(),
@@ -519,7 +512,6 @@ fn build_protocols(
     peers: Arc<Peers>,
     pending_txs: Arc<RwLock<PendingTxs>>,
     consensus: Arc<Consensus>,
-    filter_peer_selection: FilterPeerSelectionConfig,
 ) -> Vec<CKBProtocol> {
     let sync = SyncProtocol::new(storage.clone(), Arc::clone(&peers));
     let relay = RelayProtocol::new(pending_txs, Arc::clone(&peers), storage.clone());
@@ -528,7 +520,7 @@ fn build_protocols(
         Arc::clone(&peers),
         (*consensus).clone(),
     ));
-    let filter = FilterProtocol::new_with_peer_selection(storage, peers, filter_peer_selection);
+    let filter = FilterProtocol::new(storage, peers);
 
     vec![
         CKBProtocol::new_with_support_protocol(

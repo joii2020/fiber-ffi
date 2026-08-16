@@ -16,10 +16,6 @@ pub(crate) const MAX_OUTBOUND_PEERS: u32 = 8;
 pub(crate) const DEFAULT_REQUIRED_READY_PEERS: usize = 4;
 pub(crate) const HEADER_READY_TIMEOUT: Duration = Duration::from_secs(120);
 pub(crate) const REMOTE_DATA_TIMEOUT: Duration = Duration::from_secs(8);
-pub(crate) const DEFAULT_FILTER_PREFERRED_PEER_CHANCE_PERCENT: u8 = 90;
-pub(crate) const DEFAULT_FILTER_REQUEST_TIMEOUT_SECONDS: u64 = 6;
-pub(crate) const DEFAULT_FILTER_PEER_FAILURE_THRESHOLD: u32 = 2;
-pub(crate) const DEFAULT_FILTER_PEER_COOLDOWN_SECONDS: u64 = 60;
 pub(crate) const WALLET_BIRTHDAY_FILE: &str = "wallet-birthday.json";
 pub(crate) const LEGACY_HISTORY_START_BLOCK_FILE: &str = "history_start_block";
 
@@ -85,10 +81,6 @@ pub(crate) struct LocalLightClientConfig {
     pub(crate) operational_lag_tolerance: u64,
     pub(crate) bootnodes: Vec<String>,
     pub(crate) preferred_peers: Vec<String>,
-    pub(crate) filter_preferred_peer_chance_percent: u8,
-    pub(crate) filter_request_timeout_seconds: u64,
-    pub(crate) filter_peer_failure_threshold: u32,
-    pub(crate) filter_peer_cooldown_seconds: u64,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -102,10 +94,6 @@ pub(crate) struct SerializedLightClientConfig {
     operational_lag_tolerance: Option<u64>,
     bootnodes: Option<Vec<String>>,
     preferred_peers: Option<Vec<String>>,
-    filter_preferred_peer_chance_percent: Option<u8>,
-    filter_request_timeout_seconds: Option<u64>,
-    filter_peer_failure_threshold: Option<u32>,
-    filter_peer_cooldown_seconds: Option<u64>,
 }
 
 impl LocalLightClientConfig {
@@ -177,42 +165,6 @@ impl LocalLightClientConfig {
                 "ckb_light_client.preferred_peers cannot contain more than {MAX_OUTBOUND_PEERS} addresses"
             ));
         }
-        let filter_preferred_peer_chance_percent = serialized
-            .filter_preferred_peer_chance_percent
-            .unwrap_or(DEFAULT_FILTER_PREFERRED_PEER_CHANCE_PERCENT);
-        if filter_preferred_peer_chance_percent > 100 {
-            return Err(
-                "ckb_light_client.filter_preferred_peer_chance_percent must be between 0 and 100"
-                    .to_string(),
-            );
-        }
-        let filter_request_timeout_seconds = serialized
-            .filter_request_timeout_seconds
-            .unwrap_or(DEFAULT_FILTER_REQUEST_TIMEOUT_SECONDS);
-        if !(1..=60).contains(&filter_request_timeout_seconds) {
-            return Err(
-                "ckb_light_client.filter_request_timeout_seconds must be between 1 and 60"
-                    .to_string(),
-            );
-        }
-        let filter_peer_failure_threshold = serialized
-            .filter_peer_failure_threshold
-            .unwrap_or(DEFAULT_FILTER_PEER_FAILURE_THRESHOLD);
-        if !(1..=10).contains(&filter_peer_failure_threshold) {
-            return Err(
-                "ckb_light_client.filter_peer_failure_threshold must be between 1 and 10"
-                    .to_string(),
-            );
-        }
-        let filter_peer_cooldown_seconds = serialized
-            .filter_peer_cooldown_seconds
-            .unwrap_or(DEFAULT_FILTER_PEER_COOLDOWN_SECONDS);
-        if !(1..=3_600).contains(&filter_peer_cooldown_seconds) {
-            return Err(
-                "ckb_light_client.filter_peer_cooldown_seconds must be between 1 and 3600"
-                    .to_string(),
-            );
-        }
         Ok(Self {
             chain,
             store_path: light_client_dir.join("store"),
@@ -230,10 +182,6 @@ impl LocalLightClientConfig {
             operational_lag_tolerance: serialized.operational_lag_tolerance.unwrap_or_default(),
             bootnodes,
             preferred_peers,
-            filter_preferred_peer_chance_percent,
-            filter_request_timeout_seconds,
-            filter_peer_failure_threshold,
-            filter_peer_cooldown_seconds,
         })
     }
 
@@ -263,10 +211,6 @@ impl LocalLightClientConfig {
             operational_lag_tolerance = self.operational_lag_tolerance,
             bootnodes = self.bootnodes.len(),
             preferred_peers = self.preferred_peers.len(),
-            filter_preferred_peer_chance_percent = self.filter_preferred_peer_chance_percent,
-            filter_request_timeout_seconds = self.filter_request_timeout_seconds,
-            filter_peer_failure_threshold = self.filter_peer_failure_threshold,
-            filter_peer_cooldown_seconds = self.filter_peer_cooldown_seconds,
             local_rpc_listen_address = %Self::local_rpc_listen_address(),
             max_outbound_peers = MAX_OUTBOUND_PEERS,
             header_ready_timeout_seconds = HEADER_READY_TIMEOUT.as_secs(),
@@ -480,22 +424,6 @@ mod tests {
         assert_eq!(config.bootnodes.len(), MAINNET_BOOTNODES.len());
         assert!(config.preferred_peers.is_empty());
         assert_eq!(
-            config.filter_preferred_peer_chance_percent,
-            DEFAULT_FILTER_PREFERRED_PEER_CHANCE_PERCENT
-        );
-        assert_eq!(
-            config.filter_request_timeout_seconds,
-            DEFAULT_FILTER_REQUEST_TIMEOUT_SECONDS
-        );
-        assert_eq!(
-            config.filter_peer_failure_threshold,
-            DEFAULT_FILTER_PEER_FAILURE_THRESHOLD
-        );
-        assert_eq!(
-            config.filter_peer_cooldown_seconds,
-            DEFAULT_FILTER_PEER_COOLDOWN_SECONDS
-        );
-        assert_eq!(
             LocalLightClientConfig::local_rpc_listen_address().to_string(),
             LOCAL_RPC_LISTEN_ADDRESS
         );
@@ -609,37 +537,6 @@ mod tests {
         .unwrap();
 
         assert_eq!(config.operational_lag_tolerance, 6);
-    }
-
-    #[test]
-    fn filter_peer_selection_is_configurable_and_bounded() {
-        let config = LocalLightClientConfig::build(
-            PathBuf::from("data"),
-            "testnet",
-            deserialize(
-                "filter_preferred_peer_chance_percent: 80\nfilter_request_timeout_seconds: 5\nfilter_peer_failure_threshold: 3\nfilter_peer_cooldown_seconds: 90",
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(config.filter_preferred_peer_chance_percent, 80);
-        assert_eq!(config.filter_request_timeout_seconds, 5);
-        assert_eq!(config.filter_peer_failure_threshold, 3);
-        assert_eq!(config.filter_peer_cooldown_seconds, 90);
-
-        for yaml in [
-            "filter_preferred_peer_chance_percent: 101",
-            "filter_request_timeout_seconds: 0",
-            "filter_peer_failure_threshold: 0",
-            "filter_peer_cooldown_seconds: 3601",
-        ] {
-            assert!(LocalLightClientConfig::build(
-                PathBuf::from("data"),
-                "testnet",
-                deserialize(yaml).unwrap(),
-            )
-            .is_err());
-        }
     }
 
     #[test]

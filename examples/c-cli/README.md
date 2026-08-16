@@ -160,11 +160,8 @@ required-script progress from the original wallet birthday once. Later
 startups can reuse that progress. To prevent a slow testnet bootnode from
 blocking the CLI, startup continues after two usable peers are available. The
 Light Client connects to up to eight ordinary peers in the background and also
-maintains the configured regional preferred peer. Filter batches are selected
-only from candidates that have proved the current tip. By default, 90% prefer
-the regional node and 10% sample public nodes. A node is switched after six
-seconds without a response and cooled down for 60 seconds after two consecutive
-failures. The demo configuration keeps the strict
+maintains the configured regional preferred peers. Filter synchronization uses
+the upstream Light Client peer-selection behavior. The demo configuration keeps the strict
 `startup_script_lag_tolerance: 0`, so the menu appears only after required
 scripts reach the verified tip observed at startup. During operation it uses
 `operational_lag_tolerance: 6`. The local RPC uses the height to which all

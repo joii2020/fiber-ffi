@@ -135,13 +135,6 @@ it defaults to four and the C CLI test configuration uses two.
 `ckb_light_client.preferred_peers` may list up to eight complete CKB multiaddrs
 (including `/p2p/<peer-id>`). The network actively maintains those connections
 while still using bundled bootnodes and discovery to find independent peers.
-Filter synchronization only selects peers that have proved the current Light
-Client tip. Within that safe candidate set it uses preferred peers for 90% of
-batches by default, ranks peers by measured batch latency, and samples public
-peers for the remainder. `filter_preferred_peer_chance_percent`,
-`filter_request_timeout_seconds`, `filter_peer_failure_threshold`, and
-`filter_peer_cooldown_seconds` tune that policy; their defaults are 90, 6, 2,
-and 60 respectively.
 
 For bidirectionally funded channels, an old Cell supplied by the peer may use a
 script that the local Light Client has never tracked. Set

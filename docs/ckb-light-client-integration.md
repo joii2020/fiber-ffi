@@ -99,7 +99,7 @@ disable-ckb-rpc = [
 ]
 
 [dependencies]
-ckb-light-client-lib = { path = "vendor/ckb-light-client-lib", optional = true }
+ckb-light-client-lib = { git = "https://github.com/nervosnetwork/ckb-light-client.git", rev = "12e29522ab7e078ada704d4ac04cbc0498009b7b", optional = true }
 ckb-async-runtime = { version = "...", optional = true }
 ckb-network = { version = "...", optional = true }
 ckb-stop-handler = { version = "...", optional = true }
@@ -112,7 +112,7 @@ jsonrpc-http-server = { version = "...", optional = true }
 - 不传功能开关：保持现有的外部 CKB 全节点 RPC 模式。
 - `--features disable-ckb-rpc`：编译 Light Client 依赖并启动内置 Light Client。
 
-仓库 vendor 了确定版本的 `ckb-light-client-lib`，上游基线提交记录在 `vendor/ckb-light-client-lib/UPSTREAM.md`。这是因为 filter peer 选择目前没有公开扩展接口；本地副本只维护自适应 peer 调度相关的小范围修改，升级上游时需要重新核对这些差异。
+项目直接使用固定提交的上游 `ckb-light-client-lib`，以保证构建可复现。
 
 ### 3.2 YAML 配置
 
@@ -133,13 +133,6 @@ ckb_light_client:
   # 不会关闭公共节点发现，最多 8 个。
   preferred_peers:
     - "/ip4/10.0.0.2/tcp/8114/p2p/..."
-
-  # 可选。只在已经证明当前 Light Client tip 的候选节点中生效。
-  # 默认 90% 的 filter 批次优先区域节点，10% 探索公共节点。
-  filter_preferred_peer_chance_percent: 90
-  filter_request_timeout_seconds: 6
-  filter_peer_failure_threshold: 2
-  filter_peer_cooldown_seconds: 60
 
   # 仅自定义链需要。主网和测试网使用程序内置的 CKB bootnodes。
   bootnodes:
