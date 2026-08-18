@@ -1,6 +1,5 @@
-# Testnet configuration for the C CLI example.
-# rpc_url is deliberately unreachable: with disable-ckb-rpc Fiber replaces it
-# in memory with the embedded Light Client's loopback RPC gateway.
+# Testnet configuration for the Rust demo CLI. The unreachable rpc_url is
+# replaced in memory by fiber-ffi's embedded CKB Light Client gateway.
 fiber:
   listening_addr: "/ip4/0.0.0.0/tcp/8228"
   bootnode_addrs: []
@@ -11,11 +10,6 @@ fiber:
   announced_addrs: []
   chain: testnet
 
-  # Pinned testnet Fiber deployment. The embedded gateway verifies each
-  # producing transaction, while this trusted release config asserts that the
-  # explicitly listed CellDeps are still live so it need not scan from their
-  # deployment blocks.
-  # https://github.com/nervosnetwork/fiber-scripts/blob/main/deployment/testnet/migrations/2025-02-28-111246.json
   scripts:
     - name: FundingLock
       script:
@@ -70,27 +64,14 @@ ckb:
       auto_accept_amount: 1000000000
 
 ckb_light_client:
-  # A full-node RPC is used only as a semi-trusted live/dead reference for
-  # peer-added funding inputs whose exact scripts are not tracked locally.
-  # Cell contents and the producing transaction remain Light-Client verified.
   peer_funding_liveness_rpc_url: "https://testnet.ckbapp.dev/"
   trust_pinned_cell_deps: true
   startup_min_peers: 2
-  # Prefer regional P2P endpoints over randomly discovered public peers.
-  # These connections are maintained in addition to public discovery.
   preferred_peers:
-    # Hong Kong
     - "/dns4/diadem.ckb.guide/tcp/443/p2p/QmQMjFrNGaphzfHin3mbYybbJcFMDUihKAcknquYvm9J3W"
-    # Japan
     - "/dns4/dagon.ckb.guide/tcp/443/p2p/QmX5D6aJiAQ5Fxn4BfVqSn6zrgyuQM1oXVC9yvmzLuHXnx"
-    # Korea
     - "/dns4/javelin.ckb.guide/tcp/443/p2p/QmPcJY2gZLUm66szYA9QaG1P3rzwseWCMgbj6AyNCyW4G2"
-  # Test-only startup optimization. If the persisted wallet index trails the
-  # verified Light Client tip by at most this many blocks, enter the menu while
-  # background filter synchronization continues.
   startup_script_lag_tolerance: 0
-  # Fiber reads a consistent, fully indexed Light Client snapshot. Allow that
-  # snapshot to trail the newest verified header by at most about one minute.
   operational_lag_tolerance: 6
 
 services:

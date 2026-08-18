@@ -162,6 +162,20 @@ pub const fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
+/// Convert node information to the stable JSON representation used by the C
+/// ABI and JSON-RPC-facing demos.
+pub fn node_info_to_json(response: types::NodeInfoResponse) -> serde_json::Value {
+    super::node_info_to_json(response)
+}
+
+/// Convert a node event to the stable JSON representation used by the C ABI.
+///
+/// This is useful for native embedders that want structured event logs without
+/// depending on Fiber's internal event enum layout.
+pub fn event_to_json(event: &types::NetworkServiceEvent) -> serde_json::Value {
+    super::event_to_json(event)
+}
+
 /// Derive the configured CKB funding address without starting Fiber.
 pub fn ckb_funding_address(config_path: &str, database_prefix: Option<String>) -> Result<String> {
     let (parsed_config, genesis_block) =

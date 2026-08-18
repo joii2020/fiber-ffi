@@ -118,17 +118,16 @@ queries use observed index progress and report `stalled` if it does not move for
 one complete 60-second peer-request window. A catch-up sample is retained so the
 next block does not immediately fall back to low confidence.
 
-The pure C demo in [`examples/c-cli`](examples/c-cli) exposes numbered Peer,
-Channel, and Pay menus on Linux and macOS and links against the generated
-`libfiber_ffi` dynamic library. It sets `FIBER_FFI_LOG_FILE` so library logs do
-not interfere with the interactive menu; other native clients may use the same
-environment variable before the first FFI call. On the first start, the CLI
-calls the independent discovery API with `--ckb-discovery-rpc` to find the
-earliest live base-CKB Cell for the exact funding lock (or the Indexer tip for an
-empty wallet), subtracts a safety window, and passes the returned height into
-the prepare API. Prepare atomically stores a network- and wallet-bound birthday
-under the data directory without using the external RPC. Later starts reuse that
-value and never advance it automatically. The Light Client persists required-script
+The Rust demo in [`tools/fiber-demo-cli`](tools/fiber-demo-cli) exposes numbered
+Peer, Channel, and Pay menus and links `fiber-ffi` as an `rlib`. It calls the
+safe, typed `fiber_ffi::native::FiberNode` API and sets `FIBER_FFI_LOG_FILE` so
+library logs do not interfere with the interactive menu. On the first start,
+the CLI uses `--ckb-discovery-rpc` to find the earliest live base-CKB Cell for
+the exact funding lock (or the Indexer tip for an empty wallet), subtracts a
+safety window, and passes the returned height into `native::prepare_ckb`.
+Prepare atomically stores a network- and wallet-bound birthday under the data
+directory without using the external RPC. Later starts reuse that value and
+never advance it automatically. The Light Client persists required-script
 progress and reuses it when the required scripts and wallet birthday are
 unchanged; the first run after upgrading safely removes transient scripts left
 by older transaction queries. Scripts added while following an already tracked
@@ -146,17 +145,17 @@ committed by the already verified genesis block.
 the persisted required-script index is within that many blocks of the fixed,
 verified startup tip. Synchronization continues in the background and RPC calls
 that require missing index data still return not-ready. It defaults to zero;
-the C CLI test configuration keeps this strict default so funding operations are
-not exposed before the required scripts catch up.
+the `fiber-demo-cli` test configuration keeps this strict default so funding
+operations are not exposed before the required scripts catch up.
 `ckb_light_client.operational_lag_tolerance` controls the maximum distance
 between the newest verified Light Client header and the fully indexed snapshot
 used by Fiber. The embedded RPC gateway exposes that snapshot consistently as
 both its chain and indexer tip, so new headers cannot move the target halfway
 through funding-cell selection or transaction validation. It defaults to zero;
-the C CLI test configuration explicitly uses six blocks.
+the `fiber-demo-cli` test configuration explicitly uses six blocks.
 `ckb_light_client.startup_min_peers` likewise controls the startup connection
 threshold while the Light Client continues toward its normal outbound maximum;
-it defaults to four and the C CLI test configuration uses two.
+it defaults to four and the `fiber-demo-cli` test configuration uses two.
 `ckb_light_client.preferred_peers` may list up to eight complete CKB multiaddrs
 (including `/p2p/<peer-id>`). The network actively maintains those connections
 while still using bundled bootnodes and discovery to find independent peers.

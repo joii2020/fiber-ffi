@@ -312,7 +312,7 @@ struct ParsedFfiConfig {
 }
 ```
 
-`LocalLightClientConfig` 主要由 `fiber-ffi` 根据 `database_prefix`、`fiber.chain` 和固定值生成，并合并 YAML 中可选的 `history_start_block`、启动参数、`preferred_peers`、`peer_funding_liveness_rpc_url` 和自定义链 `bootnodes`。独立发现接口检查 Node/Indexer tip，按 Funding Lock 升序查询第一个基础 CKB Cell；有余额取该最早 Cell、无余额取 Indexer tip，再减去调用方指定或默认的安全窗口。prepare 接收这个纯高度结果，将其与已持久化高度及旧版安全下界取最早值，并原子写入钱包和网络绑定的元数据。`startup_min_peers` 默认 4，必须在 1 到最大出站连接数之间；`startup_script_lag_tolerance` 默认 0，允许已有持久化脚本索引在指定块数范围内先启动、后台继续追平。`operational_lag_tolerance` 默认 0，表示最新已验证区块头与可供 Fiber 使用的完整索引快照之间最多允许相差多少块；C CLI 测试配置显式使用 6。使用内置 Light Client 时，再修改 `ParsedFfiConfig.fiber.ckb.rpc_url`。这项修改只存在于 `fiber-ffi` 内存中，不会改写用户的 YAML 文件。
+`LocalLightClientConfig` 主要由 `fiber-ffi` 根据 `database_prefix`、`fiber.chain` 和固定值生成，并合并 YAML 中可选的 `history_start_block`、启动参数、`preferred_peers`、`peer_funding_liveness_rpc_url` 和自定义链 `bootnodes`。独立发现接口检查 Node/Indexer tip，按 Funding Lock 升序查询第一个基础 CKB Cell；有余额取该最早 Cell、无余额取 Indexer tip，再减去调用方指定或默认的安全窗口。prepare 接收这个纯高度结果，将其与已持久化高度及旧版安全下界取最早值，并原子写入钱包和网络绑定的元数据。`startup_min_peers` 默认 4，必须在 1 到最大出站连接数之间；`startup_script_lag_tolerance` 默认 0，允许已有持久化脚本索引在指定块数范围内先启动、后台继续追平。`operational_lag_tolerance` 默认 0，表示最新已验证区块头与可供 Fiber 使用的完整索引快照之间最多允许相差多少块；`fiber-demo-cli` 测试配置显式使用 6。使用内置 Light Client 时，再修改 `ParsedFfiConfig.fiber.ckb.rpc_url`。这项修改只存在于 `fiber-ffi` 内存中，不会改写用户的 YAML 文件。
 
 内置 RPC 不再把持续增长的 Light Client header tip 和稍慢的脚本 indexer tip 同时暴露给 Fiber。它把所有已注册脚本都完整覆盖到的高度定义为 operational tip，并把这个已验证快照同时用于 `get_tip_header`、`get_tip_block_number`、`get_indexer_tip`、Cell 查询和交易发送前的活性验证。每次交易验证固定使用开始时的 operational tip；之后到达的新区块不会在处理中途移动完成条件。这样 readiness 只负责判断快照离真实 header tip 是否在容差内，而不是等待一个短暂的 `lag=0` 窗口。
 
