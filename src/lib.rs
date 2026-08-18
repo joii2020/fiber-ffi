@@ -7,7 +7,7 @@ use std::{
     panic::{catch_unwind, AssertUnwindSafe},
     path::{Path, PathBuf},
     ptr,
-    sync::{mpsc as std_mpsc, Mutex, Once},
+    sync::{mpsc as std_mpsc, Arc, Mutex, Once},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -54,6 +54,7 @@ use tracing_subscriber::EnvFilter;
 
 mod ffi_params;
 mod ffi_types;
+pub mod native;
 
 use ffi_params::{
     accept_channel_params_from_options, build_router_params_from_options, deserialize_object,
@@ -78,26 +79,31 @@ use fnn::watchtower::{
 pub use ffi_types::*;
 
 #[derive(Copy, Clone)]
-struct EventCallback {
+struct FfiEventCallback {
     callback: FiberEventCallback,
     user_data: usize,
 }
 
 // SAFETY: the wrapper stores only a function pointer and an opaque address. It
 // never dereferences `user_data`; the foreign caller owns its synchronization.
-unsafe impl Send for EventCallback {}
-unsafe impl Sync for EventCallback {}
+unsafe impl Send for FfiEventCallback {}
+unsafe impl Sync for FfiEventCallback {}
+
+type EventCallback = Arc<dyn Fn(&NetworkServiceEvent) + Send + Sync + 'static>;
 
 #[derive(Copy, Clone)]
-struct CkbPrepareCallback {
+struct FfiCkbPrepareCallback {
     callback: FiberCkbPrepareCallback,
     user_data: usize,
 }
 
 // SAFETY: as with `EventCallback`, moving or sharing this value never accesses
 // the pointee behind `user_data`; its lifetime is part of the callback contract.
-unsafe impl Send for CkbPrepareCallback {}
-unsafe impl Sync for CkbPrepareCallback {}
+unsafe impl Send for FfiCkbPrepareCallback {}
+unsafe impl Sync for FfiCkbPrepareCallback {}
+
+#[cfg(feature = "disable-ckb-rpc")]
+type CkbPrepareCallback = native::CkbPreparationHandler;
 
 pub struct FiberHandle {
     stop_tx: Mutex<Option<oneshot::Sender<()>>>,
@@ -146,11 +152,11 @@ const CKB_SYNC_SAMPLE_RESET_THRESHOLD: Duration =
     Duration::from_secs(2 * CKB_PEER_REQUEST_TIMEOUT_SECONDS);
 
 #[derive(Clone, Debug, Serialize)]
-struct CkbWaitEstimate {
-    lower_seconds: u64,
-    upper_seconds: u64,
-    retry_after_seconds: u64,
-    confidence: &'static str,
+pub struct CkbWaitEstimate {
+    pub lower_seconds: u64,
+    pub upper_seconds: u64,
+    pub retry_after_seconds: u64,
+    pub confidence: &'static str,
 }
 
 #[derive(Default)]
@@ -162,20 +168,20 @@ struct CkbSyncEstimator {
 }
 
 #[derive(Clone, Debug, Serialize)]
-struct CkbReadiness {
-    ready: bool,
-    mode: &'static str,
+pub struct CkbReadiness {
+    pub ready: bool,
+    pub mode: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tip_block_number: Option<u64>,
+    pub tip_block_number: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    indexed_block_number: Option<u64>,
+    pub indexed_block_number: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    lag: Option<u64>,
-    max_acceptable_lag: u64,
+    pub lag: Option<u64>,
+    pub max_acceptable_lag: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
-    wait_estimate: Option<CkbWaitEstimate>,
+    pub wait_estimate: Option<CkbWaitEstimate>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    reason: Option<String>,
+    pub reason: Option<String>,
 }
 
 impl CkbReadiness {
@@ -194,21 +200,21 @@ impl CkbReadiness {
 }
 
 #[derive(Clone, Debug, Serialize)]
-struct CkbBalance {
-    ready: bool,
-    mode: &'static str,
-    address: String,
-    lock_args: String,
+pub struct CkbBalance {
+    pub ready: bool,
+    pub mode: &'static str,
+    pub address: String,
+    pub lock_args: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tip_block_number: Option<u64>,
+    pub tip_block_number: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    indexed_block_number: Option<u64>,
+    pub indexed_block_number: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    lag: Option<u64>,
-    cell_count: u64,
-    capacity_shannons: String,
-    capacity_ckb: String,
-    scope: &'static str,
+    pub lag: Option<u64>,
+    pub cell_count: u64,
+    pub capacity_shannons: String,
+    pub capacity_ckb: String,
+    pub scope: &'static str,
 }
 
 #[cfg(feature = "disable-ckb-rpc")]
@@ -439,7 +445,7 @@ fn current_ckb_readiness(handle: &FiberHandle) -> CkbReadiness {
     readiness
 }
 
-fn ensure_ckb_ready(handle: &FiberHandle) -> FfiCallResult<()> {
+fn ensure_ckb_ready(handle: &FiberHandle) -> native::Result<()> {
     let readiness = current_ckb_readiness(handle);
     if readiness.ready {
         return Ok(());
@@ -447,8 +453,8 @@ fn ensure_ckb_ready(handle: &FiberHandle) -> FfiCallResult<()> {
 
     let detail = serde_json::to_string(&readiness)
         .unwrap_or_else(|_| "CKB readiness details are unavailable".to_string());
-    Err(ffi_error(
-        FiberFfiStatus::NotReady,
+    Err(native::Error::new(
+        native::ErrorKind::NotReady,
         format!("CKB backend is not ready: {detail}"),
     ))
 }
@@ -916,29 +922,8 @@ pub unsafe extern "C" fn fiber_ckb_funding_address(
         prepare_out_string(out_address)?;
         let config_path = required_string(options.config_path, "config_path")?;
         let database_prefix = optional_string(options.database_prefix)?;
-        let (parsed_config, genesis_block) =
-            parse_config_with_genesis(&config_path, database_prefix)
-                .map_err(|err| ffi_error(FiberFfiStatus::InvalidArgument, err))?;
-        let fiber_config = parsed_config.fiber.fiber.as_ref().ok_or_else(|| {
-            ffi_error(
-                FiberFfiStatus::InvalidArgument,
-                "fiber service must be enabled in config services",
-            )
-        })?;
-        let ckb_config = parsed_config.fiber.ckb.as_ref().ok_or_else(|| {
-            ffi_error(
-                FiberFfiStatus::InvalidArgument,
-                "service fiber requires service ckb to be enabled",
-            )
-        })?;
-        let funding_lock = funding_lock_from_genesis(ckb_config, &genesis_block)
-            .map_err(|err| ffi_error(FiberFfiStatus::InvalidArgument, err))?;
-        let address = CkbAddress::new(
-            ckb_address_network(&fiber_config.chain),
-            CkbAddressPayload::from(funding_lock),
-            true,
-        )
-        .to_string();
+        let address =
+            native::ckb_funding_address(&config_path, database_prefix).map_err(FfiError::from)?;
         write_string_out(out_address, &address)?;
         Ok(FiberFfiStatus::Ok)
     })
@@ -973,12 +958,6 @@ pub unsafe extern "C" fn fiber_ckb_discover_history_start_block(
             "FiberCkbDiscoverHistoryStartBlockOptions",
         )?;
         let rpc_url = required_string(options.rpc_url, "rpc_url")?;
-        if !rpc_url.starts_with("https://") && !rpc_url.starts_with("http://") {
-            return Err(ffi_error(
-                FiberFfiStatus::InvalidArgument,
-                "rpc_url must use http:// or https://",
-            ));
-        }
         let funding_lock = funding_lock_from_discovery_options(options)?;
         let safety_blocks = optional_u64(
             options.has_safety_blocks,
@@ -1001,14 +980,16 @@ pub unsafe extern "C" fn fiber_ckb_discover_history_start_block(
                     format!("failed to create wallet discovery runtime: {err}"),
                 )
             })?;
-        let discovery = runtime
-            .block_on(discover_wallet_history(
-                &rpc_url,
-                funding_lock,
-                max_indexer_lag,
+        *out_height = runtime
+            .block_on(native::discover_ckb_history_start_block(
+                native::CkbHistoryDiscoveryOptions {
+                    rpc_url,
+                    funding_lock,
+                    safety_blocks,
+                    max_indexer_lag,
+                },
             ))
-            .map_err(|err| ffi_error(FiberFfiStatus::StartupFailed, err))?;
-        *out_height = select_wallet_history_start_block(&discovery, safety_blocks);
+            .map_err(FfiError::from)?;
         Ok(FiberFfiStatus::Ok)
     })
 }
@@ -1075,44 +1056,23 @@ unsafe fn fiber_prepare_ckb_inner(
         let config_path = required_string(options.config_path, "config_path")?;
         let database_prefix = optional_string(options.database_prefix)?;
         let log_level = optional_string(options.log_level)?.unwrap_or_else(|| "info".to_string());
-        let callback = CkbPrepareCallback {
+        let callback = FfiCkbPrepareCallback {
             callback: completion_callback,
             user_data: completion_callback_user_data as usize,
         };
-
-        init_logging(&log_level);
-
-        #[cfg(not(feature = "disable-ckb-rpc"))]
-        let _ = (
-            &config_path,
-            &database_prefix,
+        let handler = Arc::new(move |result| emit_ffi_ckb_prepare(callback, result))
+            as native::CkbPreparationHandler;
+        native::prepare_ckb(
+            &native::StartOptions {
+                config_path,
+                database_prefix,
+                log_level,
+                event_handler: None,
+            },
             discovered_history_start_block,
-        );
-
-        #[cfg(feature = "disable-ckb-rpc")]
-        schedule_embedded_ckb_preparation(
-            config_path,
-            database_prefix,
-            discovered_history_start_block,
-            callback,
-        )?;
-
-        #[cfg(not(feature = "disable-ckb-rpc"))]
-        thread::Builder::new()
-            .name("fiber-ffi-prepare-ckb".to_string())
-            .spawn(move || {
-                emit_ckb_prepare_completion(
-                    callback,
-                    FiberFfiStatus::Ok,
-                    json!({
-                        "ready": true,
-                        "mode": "external_rpc",
-                        "skipped": true,
-                        "status": "ready",
-                    }),
-                );
-            })
-            .map_err(|err| ffi_error(FiberFfiStatus::StartupFailed, err.to_string()))?;
+            handler,
+        )
+        .map_err(FfiError::from)?;
 
         Ok(FiberFfiStatus::Ok)
     })
@@ -1143,94 +1103,23 @@ pub unsafe extern "C" fn fiber_start(
         let config_path = required_string(options.config_path, "config_path")?;
         let database_prefix = optional_string(options.database_prefix)?;
         let log_level = optional_string(options.log_level)?.unwrap_or_else(|| "info".to_string());
-        let callback = options.event_callback.map(|callback| EventCallback {
-            callback,
-            user_data: options.event_callback_user_data as usize,
+        let event_handler = options.event_callback.map(|callback| {
+            let callback = FfiEventCallback {
+                callback,
+                user_data: options.event_callback_user_data as usize,
+            };
+            Arc::new(move |event: &NetworkServiceEvent| emit_ffi_event(callback, event))
+                as native::EventHandler
         });
-
-        init_logging(&log_level);
-
-        let (startup_tx, startup_rx) = std_mpsc::channel();
-        let (stop_tx, stop_rx) = oneshot::channel();
-        #[cfg(feature = "disable-ckb-rpc")]
-        let thread = match take_prepared_ckb_worker(ckb_preparation_key(
-            config_path.clone(),
-            database_prefix.clone(),
-        )?)? {
-            Some(mut worker) => {
-                let worker_key = worker.key.clone();
-                if worker
-                    .start_tx
-                    .send(PreparedCkbStartCommand {
-                        callback,
-                        startup_tx: startup_tx.clone(),
-                        stop_rx,
-                    })
-                    .is_err()
-                {
-                    clear_ckb_in_use(&worker_key);
-                    return Err(ffi_error(
-                        FiberFfiStatus::StartupFailed,
-                        "prepared CKB runtime exited before Fiber could start",
-                    ));
-                }
-                match worker.thread.take() {
-                    Some(thread) => thread,
-                    None => {
-                        clear_ckb_in_use(&worker_key);
-                        return Err(ffi_error(
-                            FiberFfiStatus::Panic,
-                            "prepared CKB runtime thread is missing",
-                        ));
-                    }
-                }
-            }
-            None => {
-                spawn_fiber_runtime(config_path, database_prefix, callback, startup_tx, stop_rx)?
-            }
-        };
-
-        #[cfg(not(feature = "disable-ckb-rpc"))]
-        let thread =
-            spawn_fiber_runtime(config_path, database_prefix, callback, startup_tx, stop_rx)?;
-
-        match startup_rx.recv() {
-            Ok(StartupMessage::Started {
-                runtime_handle,
-                network_actor,
-                store,
-                fiber_config,
-                ckb_config,
-                #[cfg(feature = "disable-ckb-rpc")]
-                ckb_monitor,
-            }) => {
-                let handle = Box::new(FiberHandle {
-                    stop_tx: Mutex::new(Some(stop_tx)),
-                    thread: Mutex::new(Some(thread)),
-                    runtime_handle,
-                    network_actor,
-                    store,
-                    fiber_config: *fiber_config,
-                    ckb_config: *ckb_config,
-                    #[cfg(feature = "disable-ckb-rpc")]
-                    ckb_monitor,
-                    ckb_sync_estimator: Mutex::new(CkbSyncEstimator::default()),
-                });
-                *out_handle = Box::into_raw(handle);
-                Ok(FiberFfiStatus::Ok)
-            }
-            Ok(StartupMessage::Failed(err)) => {
-                let _ = thread.join();
-                Err(ffi_error(FiberFfiStatus::StartupFailed, err))
-            }
-            Err(err) => {
-                let _ = thread.join();
-                Err(ffi_error(
-                    FiberFfiStatus::StartupFailed,
-                    format!("runtime thread exited before reporting startup status: {err}"),
-                ))
-            }
-        }
+        let handle = FiberHandle::start(native::StartOptions {
+            config_path,
+            database_prefix,
+            log_level,
+            event_handler,
+        })
+        .map_err(FfiError::from)?;
+        *out_handle = Box::into_raw(Box::new(handle));
+        Ok(FiberFfiStatus::Ok)
     })
 }
 
@@ -1240,7 +1129,7 @@ fn spawn_fiber_runtime(
     callback: Option<EventCallback>,
     startup_tx: std_mpsc::Sender<StartupMessage>,
     stop_rx: oneshot::Receiver<()>,
-) -> FfiCallResult<JoinHandle<()>> {
+) -> native::Result<JoinHandle<()>> {
     thread::Builder::new()
         .name("fiber-ffi-runtime".to_string())
         .spawn(move || {
@@ -1277,7 +1166,7 @@ fn spawn_fiber_runtime(
                 )));
             }
         })
-        .map_err(|err| ffi_error(FiberFfiStatus::StartupFailed, err.to_string()))
+        .map_err(|err| native::Error::new(native::ErrorKind::StartupFailed, err.to_string()))
 }
 
 async fn run_fiber_node(
@@ -1333,15 +1222,15 @@ fn schedule_embedded_ckb_preparation(
     database_prefix: Option<String>,
     discovered_history_start_block: Option<u64>,
     callback: CkbPrepareCallback,
-) -> FfiCallResult<()> {
+) -> native::Result<()> {
     let key = ckb_preparation_key_with_history_floor(
         config_path.clone(),
         database_prefix.clone(),
         discovered_history_start_block,
     )?;
-    let mut state = CKB_PREPARATION_STATE
-        .lock()
-        .map_err(|_| ffi_error(FiberFfiStatus::Panic, "CKB preparation mutex poisoned"))?;
+    let mut state = CKB_PREPARATION_STATE.lock().map_err(|_| {
+        native::Error::new(native::ErrorKind::Panic, "CKB preparation mutex poisoned")
+    })?;
 
     match &*state {
         CkbPreparationState::Preparing(worker) => {
@@ -1350,17 +1239,20 @@ fn schedule_embedded_ckb_preparation(
             } else {
                 "CKB preparation is already in progress for a different configuration"
             };
-            return Err(ffi_error(FiberFfiStatus::InvalidArgument, detail));
+            return Err(native::Error::new(
+                native::ErrorKind::InvalidArgument,
+                detail,
+            ));
         }
         CkbPreparationState::Ready(worker) => {
             if worker.key != key {
-                return Err(ffi_error(
-                    FiberFfiStatus::InvalidArgument,
+                return Err(native::Error::new(
+                    native::ErrorKind::InvalidArgument,
                     "CKB is already prepared for a different configuration",
                 ));
             }
             spawn_embedded_ckb_ready(callback)
-                .map_err(|err| ffi_error(FiberFfiStatus::StartupFailed, err))?;
+                .map_err(|err| native::Error::new(native::ErrorKind::StartupFailed, err))?;
             return Ok(());
         }
         CkbPreparationState::InUse(active_key) => {
@@ -1369,7 +1261,10 @@ fn schedule_embedded_ckb_preparation(
             } else {
                 "CKB is already in use by Fiber with a different configuration"
             };
-            return Err(ffi_error(FiberFfiStatus::InvalidArgument, detail));
+            return Err(native::Error::new(
+                native::ErrorKind::InvalidArgument,
+                detail,
+            ));
         }
         CkbPreparationState::Idle => {}
     }
@@ -1392,7 +1287,7 @@ fn schedule_embedded_ckb_preparation(
                 start_rx,
             );
         })
-        .map_err(|err| ffi_error(FiberFfiStatus::StartupFailed, err.to_string()))?;
+        .map_err(|err| native::Error::new(native::ErrorKind::StartupFailed, err.to_string()))?;
 
     *state = CkbPreparationState::Preparing(PreparedCkbWorker {
         id,
@@ -1402,8 +1297,8 @@ fn schedule_embedded_ckb_preparation(
     });
     drop(state);
     begin_tx.send(()).map_err(|_| {
-        ffi_error(
-            FiberFfiStatus::StartupFailed,
+        native::Error::new(
+            native::ErrorKind::StartupFailed,
             "failed to start CKB preparation runtime",
         )
     })?;
@@ -1433,9 +1328,11 @@ fn run_embedded_ckb_preparation(
         }
     };
     let runtime_handle = runtime.handle().clone();
+    let callback_in_runtime = callback.clone();
     let result = catch_unwind(AssertUnwindSafe(|| {
         runtime.block_on(async move {
-            let report_status = |status| emit_embedded_ckb_progress(callback, status);
+            let report_status =
+                |status| emit_embedded_ckb_progress(callback_in_runtime.clone(), status);
             match prepare_local_ckb(
                 &config_path,
                 database_prefix.clone(),
@@ -1452,7 +1349,10 @@ fn run_embedded_ckb_preparation(
                                 clear_ckb_preparation(id);
                                 local_ckb.shutdown().await;
                                 completion_sent_in_runtime.store(true, Ordering::Release);
-                                emit_ckb_prepare_failure(callback, err.message);
+                                emit_ckb_prepare_failure(
+                                    callback_in_runtime.clone(),
+                                    err.message(),
+                                );
                                 return;
                             }
                         };
@@ -1461,11 +1361,11 @@ fn run_embedded_ckb_preparation(
                         return;
                     }
                     completion_sent_in_runtime.store(true, Ordering::Release);
-                    if let Err(err) = spawn_embedded_ckb_ready(callback) {
+                    if let Err(err) = spawn_embedded_ckb_ready(callback_in_runtime.clone()) {
                         clear_ckb_preparation(id);
                         local_ckb.shutdown().await;
                         emit_ckb_prepare_failure(
-                            callback,
+                            callback_in_runtime.clone(),
                             format!("failed to dispatch CKB preparation callback: {err}"),
                         );
                         return;
@@ -1496,7 +1396,7 @@ fn run_embedded_ckb_preparation(
                 Err(err) => {
                     clear_ckb_preparation(id);
                     completion_sent_in_runtime.store(true, Ordering::Release);
-                    emit_ckb_prepare_failure(callback, err);
+                    emit_ckb_prepare_failure(callback_in_runtime.clone(), err);
                 }
             }
         });
@@ -1558,17 +1458,17 @@ fn clear_ckb_in_use(key: &CkbPreparationKey) {
 }
 
 #[cfg(feature = "disable-ckb-rpc")]
-fn take_prepared_ckb_worker(key: CkbPreparationKey) -> FfiCallResult<Option<PreparedCkbWorker>> {
-    let mut state = CKB_PREPARATION_STATE
-        .lock()
-        .map_err(|_| ffi_error(FiberFfiStatus::Panic, "CKB preparation mutex poisoned"))?;
+fn take_prepared_ckb_worker(key: CkbPreparationKey) -> native::Result<Option<PreparedCkbWorker>> {
+    let mut state = CKB_PREPARATION_STATE.lock().map_err(|_| {
+        native::Error::new(native::ErrorKind::Panic, "CKB preparation mutex poisoned")
+    })?;
     let current = std::mem::replace(&mut *state, CkbPreparationState::Idle);
     match current {
         CkbPreparationState::Idle => Ok(None),
         CkbPreparationState::Preparing(worker) => {
             *state = CkbPreparationState::Preparing(worker);
-            Err(ffi_error(
-                FiberFfiStatus::StartupFailed,
+            Err(native::Error::new(
+                native::ErrorKind::StartupFailed,
                 "CKB is still preparing; wait for the preparation callback before starting Fiber",
             ))
         }
@@ -1578,15 +1478,15 @@ fn take_prepared_ckb_worker(key: CkbPreparationKey) -> FfiCallResult<Option<Prep
         }
         CkbPreparationState::Ready(worker) => {
             *state = CkbPreparationState::Ready(worker);
-            Err(ffi_error(
-                FiberFfiStatus::StartupFailed,
+            Err(native::Error::new(
+                native::ErrorKind::StartupFailed,
                 "CKB was prepared with a different configuration, config_path, database_prefix, or funding key",
             ))
         }
         CkbPreparationState::InUse(active_key) => {
             *state = CkbPreparationState::InUse(active_key);
-            Err(ffi_error(
-                FiberFfiStatus::StartupFailed,
+            Err(native::Error::new(
+                native::ErrorKind::StartupFailed,
                 "prepared CKB is already in use by Fiber",
             ))
         }
@@ -1597,7 +1497,7 @@ fn take_prepared_ckb_worker(key: CkbPreparationKey) -> FfiCallResult<Option<Prep
 fn ckb_preparation_key(
     config_path: String,
     database_prefix: Option<String>,
-) -> FfiCallResult<CkbPreparationKey> {
+) -> native::Result<CkbPreparationKey> {
     ckb_preparation_key_with_history_floor(config_path, database_prefix, None)
 }
 
@@ -1606,24 +1506,24 @@ fn ckb_preparation_key_with_history_floor(
     config_path: String,
     database_prefix: Option<String>,
     history_start_block_floor: Option<u64>,
-) -> FfiCallResult<CkbPreparationKey> {
+) -> native::Result<CkbPreparationKey> {
     let config_contents = std::fs::read(&config_path).map_err(|err| {
-        ffi_error(
-            FiberFfiStatus::InvalidArgument,
+        native::Error::new(
+            native::ErrorKind::InvalidArgument,
             format!("failed to read config file {config_path}: {err}"),
         )
     })?;
     let parsed_config = parse_config_from_path(&config_path, database_prefix.clone())
-        .map_err(|err| ffi_error(FiberFfiStatus::InvalidArgument, err))?;
+        .map_err(|err| native::Error::new(native::ErrorKind::InvalidArgument, err))?;
     let ckb_config = parsed_config.fiber.ckb.as_ref().ok_or_else(|| {
-        ffi_error(
-            FiberFfiStatus::InvalidArgument,
+        native::Error::new(
+            native::ErrorKind::InvalidArgument,
             "service fiber requires service ckb to be enabled",
         )
     })?;
     let secret_key = ckb_config.read_secret_key().map_err(|err| {
-        ffi_error(
-            FiberFfiStatus::InvalidArgument,
+        native::Error::new(
+            native::ErrorKind::InvalidArgument,
             format!("failed to read the CKB funding key: {err}"),
         )
     })?;
@@ -1636,12 +1536,12 @@ fn ckb_preparation_key_with_history_floor(
         .then_some(parsed_config.light_client.history_start_block);
     let persisted_height =
         read_wallet_birthday_metadata(&parsed_config.light_client.wallet_birthday_path)
-            .map_err(|err| ffi_error(FiberFfiStatus::InvalidArgument, err))?
+            .map_err(|err| native::Error::new(native::ErrorKind::InvalidArgument, err))?
             .map(|metadata| metadata.history_start_block);
     let legacy_height = read_legacy_history_start_block(
         &parsed_config.light_client.legacy_history_start_block_path,
     )
-    .map_err(|err| ffi_error(FiberFfiStatus::InvalidArgument, err))?;
+    .map_err(|err| native::Error::new(native::ErrorKind::InvalidArgument, err))?;
     let history_start_block = select_earliest_history_start_block(
         configured_height,
         persisted_height,
@@ -1662,13 +1562,12 @@ fn ckb_preparation_key_with_history_floor(
 fn emit_embedded_ckb_ready(callback: CkbPrepareCallback) {
     emit_ckb_prepare_completion(
         callback,
-        FiberFfiStatus::Ok,
-        json!({
+        Ok(json!({
             "ready": true,
             "mode": "light_client",
             "skipped": false,
             "status": "ready",
-        }),
+        })),
     );
 }
 
@@ -1686,13 +1585,7 @@ fn emit_ckb_prepare_failure(callback: CkbPrepareCallback, error: impl Into<Strin
     let error = sanitize_error_message(error.into());
     emit_ckb_prepare_completion(
         callback,
-        FiberFfiStatus::StartupFailed,
-        json!({
-            "ready": false,
-            "mode": "light_client",
-            "status": "failed",
-            "error": error,
-        }),
+        Err(native::Error::new(native::ErrorKind::StartupFailed, error)),
     );
 }
 
@@ -1702,7 +1595,7 @@ fn emit_embedded_ckb_progress(
     status: ckb_light_client::CkbPrepareStatus,
 ) {
     let result = embedded_ckb_progress_result(status);
-    emit_ckb_prepare_completion(callback, FiberFfiStatus::Ok, result);
+    emit_ckb_prepare_completion(callback, Ok(result));
 }
 
 #[cfg(feature = "disable-ckb-rpc")]
@@ -1770,11 +1663,30 @@ fn embedded_ckb_progress_result(status: ckb_light_client::CkbPrepareStatus) -> s
     }
 }
 
-fn emit_ckb_prepare_completion(
-    callback: CkbPrepareCallback,
-    status: FiberFfiStatus,
-    result: serde_json::Value,
-) {
+#[cfg(feature = "disable-ckb-rpc")]
+fn emit_ckb_prepare_completion(callback: CkbPrepareCallback, result: native::CkbPreparationResult) {
+    callback(result);
+}
+
+fn emit_ffi_ckb_prepare(callback: FfiCkbPrepareCallback, result: native::CkbPreparationResult) {
+    let (status, result) = match result {
+        Ok(result) => (FiberFfiStatus::Ok, result),
+        Err(error) => (
+            match error.kind() {
+                native::ErrorKind::InvalidArgument => FiberFfiStatus::InvalidArgument,
+                native::ErrorKind::StartupFailed => FiberFfiStatus::StartupFailed,
+                native::ErrorKind::AlreadyStopped => FiberFfiStatus::AlreadyStopped,
+                native::ErrorKind::Panic => FiberFfiStatus::Panic,
+                native::ErrorKind::NotReady => FiberFfiStatus::NotReady,
+            },
+            json!({
+                "ready": false,
+                "mode": "light_client",
+                "status": "failed",
+                "error": error.message(),
+            }),
+        ),
+    };
     let result = serde_json::to_string(&result).unwrap_or_else(|_| {
         "{\"ready\":false,\"status\":\"failed\",\"error\":\"serialization failed\"}".to_string()
     });
@@ -1802,31 +1714,7 @@ pub unsafe extern "C" fn fiber_stop(handle: *mut FiberHandle) -> FiberFfiStatus 
         }
 
         let handle = Box::from_raw(handle);
-        let stop_tx = handle
-            .stop_tx
-            .lock()
-            .map_err(|_| ffi_error(FiberFfiStatus::Panic, "stop mutex poisoned"))?
-            .take();
-        let thread = handle
-            .thread
-            .lock()
-            .map_err(|_| ffi_error(FiberFfiStatus::Panic, "thread mutex poisoned"))?
-            .take();
-
-        let Some(stop_tx) = stop_tx else {
-            return Err(ffi_error(
-                FiberFfiStatus::AlreadyStopped,
-                "fiber node is already stopped",
-            ));
-        };
-        let _ = stop_tx.send(());
-
-        if let Some(thread) = thread {
-            thread
-                .join()
-                .map_err(|_| ffi_error(FiberFfiStatus::Panic, "runtime thread panicked"))?;
-        }
-
+        handle.stop().map_err(FfiError::from)?;
         Ok(FiberFfiStatus::Ok)
     })
 }
@@ -1848,8 +1736,8 @@ pub unsafe extern "C" fn fiber_node_info(
 
         let response = handle
             .runtime_handle
-            .block_on(call_node_info(handle.network_actor.clone()))
-            .map_err(|err| ffi_error(FiberFfiStatus::InvalidArgument, err))?;
+            .block_on(handle.node_info())
+            .map_err(FfiError::from)?;
         write_json_out(out_json, node_info_to_json(response))?;
 
         Ok(FiberFfiStatus::Ok)
@@ -1871,7 +1759,7 @@ pub unsafe extern "C" fn fiber_ckb_readiness(
         let handle = checked_handle(handle)?;
         prepare_out_string(out_json)?;
 
-        let readiness = current_ckb_readiness(handle);
+        let readiness = handle.ckb_readiness();
         write_serializable_out(out_json, &readiness)?;
 
         Ok(FiberFfiStatus::Ok)
@@ -1895,15 +1783,10 @@ pub unsafe extern "C" fn fiber_ckb_balance(
         let handle = checked_handle(handle)?;
         prepare_out_string(out_json)?;
 
-        let readiness = current_ckb_readiness(handle);
         let balance = handle
             .runtime_handle
-            .block_on(query_ckb_balance(
-                &handle.ckb_config,
-                &handle.fiber_config.chain,
-                readiness,
-            ))
-            .map_err(|err| ffi_error(FiberFfiStatus::InvalidArgument, err))?;
+            .block_on(handle.ckb_balance())
+            .map_err(FfiError::from)?;
         write_serializable_out(out_json, &balance)?;
 
         Ok(FiberFfiStatus::Ok)
@@ -1927,8 +1810,8 @@ pub unsafe extern "C" fn fiber_list_peers(
 
         let response = handle
             .runtime_handle
-            .block_on(call_list_peers(handle.network_actor.clone()))
-            .map_err(|err| ffi_error(FiberFfiStatus::InvalidArgument, err))?;
+            .block_on(handle.list_peers())
+            .map_err(FfiError::from)?;
         write_json_out(out_json, peers_to_json(response))?;
 
         Ok(FiberFfiStatus::Ok)
@@ -1978,25 +1861,25 @@ pub unsafe extern "C" fn fiber_connect_peer(
             ));
         }
 
-        let command = if let Some(address) = address {
+        let options = if let Some(address) = address {
             let address = address
                 .parse::<fnn::fiber_types::Multiaddr>()
                 .map_err(|err| ffi_error(FiberFfiStatus::InvalidArgument, err.to_string()))?;
-            ConnectPeerCommand::Address {
+            native::ConnectPeerOptions::Address {
                 address,
                 save: options.save != 0,
             }
         } else {
-            ConnectPeerCommand::Pubkey {
+            native::ConnectPeerOptions::Pubkey {
                 pubkey: parse_pubkey(pubkey.as_deref().expect("checked above"))?,
-                addr_type: parse_addr_type(addr_type.as_deref())?,
+                address_type: parse_addr_type(addr_type.as_deref())?,
             }
         };
 
         handle
             .runtime_handle
-            .block_on(call_connect_peer(handle.network_actor.clone(), command))
-            .map_err(|err| ffi_error(FiberFfiStatus::InvalidArgument, err))?;
+            .block_on(handle.connect_peer(options))
+            .map_err(FfiError::from)?;
 
         Ok(FiberFfiStatus::Ok)
     })
@@ -2019,8 +1902,8 @@ pub unsafe extern "C" fn fiber_disconnect_peer(
 
         handle
             .runtime_handle
-            .block_on(call_disconnect_peer(handle.network_actor.clone(), pubkey))
-            .map_err(|err| ffi_error(FiberFfiStatus::InvalidArgument, err))?;
+            .block_on(handle.disconnect_peer(pubkey))
+            .map_err(FfiError::from)?;
 
         Ok(FiberFfiStatus::Ok)
     })
@@ -2044,10 +1927,10 @@ pub unsafe extern "C" fn fiber_open_channel(
         prepare_out_string(out_temporary_channel_id)?;
 
         let params = open_channel_params_from_options(options)?;
-        ensure_ckb_ready(handle)?;
         let response = handle
             .runtime_handle
-            .block_on(call_open_channel(handle, params))?;
+            .block_on(handle.open_channel(params))
+            .map_err(FfiError::from)?;
         write_serializable_field_out(out_temporary_channel_id, &response, "temporary_channel_id")?;
         Ok(FiberFfiStatus::Ok)
     })
@@ -2073,7 +1956,8 @@ pub unsafe extern "C" fn fiber_accept_channel(
         let params = accept_channel_params_from_options(options)?;
         let response = handle
             .runtime_handle
-            .block_on(call_accept_channel(handle, params))?;
+            .block_on(handle.accept_channel(params))
+            .map_err(FfiError::from)?;
         write_serializable_field_out(out_channel_id, &response, "channel_id")?;
         Ok(FiberFfiStatus::Ok)
     })
@@ -2099,7 +1983,8 @@ pub unsafe extern "C" fn fiber_open_channel_with_external_funding(
         let params = open_channel_with_external_funding_params_from_options(options)?;
         let response = handle
             .runtime_handle
-            .block_on(call_open_channel_with_external_funding(handle, params))?;
+            .block_on(handle.open_channel_with_external_funding(params))
+            .map_err(FfiError::from)?;
         write_serializable_out(out_json, &response)?;
         Ok(FiberFfiStatus::Ok)
     })
@@ -2125,7 +2010,8 @@ pub unsafe extern "C" fn fiber_submit_signed_funding_tx(
         let params = submit_signed_funding_tx_params_from_options(options)?;
         let response = handle
             .runtime_handle
-            .block_on(call_submit_signed_funding_tx(handle, params))?;
+            .block_on(handle.submit_signed_funding_tx(params))
+            .map_err(FfiError::from)?;
         write_serializable_out(out_json, &response)?;
         Ok(FiberFfiStatus::Ok)
     })
@@ -2148,7 +2034,8 @@ pub unsafe extern "C" fn fiber_abandon_channel(
         let params = deserialize_value::<fnn::rpc::channel::AbandonChannelParams>(params)?;
         handle
             .runtime_handle
-            .block_on(call_abandon_channel(handle, params))?;
+            .block_on(handle.abandon_channel(params))
+            .map_err(FfiError::from)?;
         Ok(FiberFfiStatus::Ok)
     })
 }
@@ -2173,7 +2060,8 @@ pub unsafe extern "C" fn fiber_list_channels(
         let params = list_channels_params_from_options(options)?;
         let response = handle
             .runtime_handle
-            .block_on(call_list_channels(handle, params))?;
+            .block_on(handle.list_channels(params))
+            .map_err(FfiError::from)?;
         write_serializable_out(out_json, &response)?;
         Ok(FiberFfiStatus::Ok)
     })
@@ -2196,7 +2084,8 @@ pub unsafe extern "C" fn fiber_shutdown_channel(
         let params = shutdown_channel_params_from_options(options)?;
         handle
             .runtime_handle
-            .block_on(call_shutdown_channel(handle, params))?;
+            .block_on(handle.shutdown_channel(params))
+            .map_err(FfiError::from)?;
         Ok(FiberFfiStatus::Ok)
     })
 }
@@ -2218,7 +2107,8 @@ pub unsafe extern "C" fn fiber_update_channel(
         let params = update_channel_params_from_options(options)?;
         handle
             .runtime_handle
-            .block_on(call_update_channel(handle, params))?;
+            .block_on(handle.update_channel(params))
+            .map_err(FfiError::from)?;
         Ok(FiberFfiStatus::Ok)
     })
 }
@@ -2243,7 +2133,8 @@ pub unsafe extern "C" fn fiber_send_payment(
         let params = send_payment_params_from_options(options)?;
         let response = handle
             .runtime_handle
-            .block_on(call_send_payment(handle, params))?;
+            .block_on(handle.send_payment(params))
+            .map_err(FfiError::from)?;
         write_serializable_out(out_json, &response)?;
         Ok(FiberFfiStatus::Ok)
     })
@@ -2269,7 +2160,8 @@ pub unsafe extern "C" fn fiber_build_router(
         let params = build_router_params_from_options(options)?;
         let response = handle
             .runtime_handle
-            .block_on(call_build_router(handle, params))?;
+            .block_on(handle.build_router(params))
+            .map_err(FfiError::from)?;
         write_serializable_out(out_json, &response)?;
         Ok(FiberFfiStatus::Ok)
     })
@@ -2295,7 +2187,8 @@ pub unsafe extern "C" fn fiber_send_payment_with_router(
         let params = send_payment_with_router_params_from_options(options)?;
         let response = handle
             .runtime_handle
-            .block_on(call_send_payment_with_router(handle, params))?;
+            .block_on(handle.send_payment_with_router(params))
+            .map_err(FfiError::from)?;
         write_serializable_out(out_json, &response)?;
         Ok(FiberFfiStatus::Ok)
     })
@@ -2321,7 +2214,8 @@ pub unsafe extern "C" fn fiber_get_payment(
         let params = deserialize_value::<fnn::rpc::payment::GetPaymentCommandParams>(params)?;
         let response = handle
             .runtime_handle
-            .block_on(call_get_payment(handle, params))?;
+            .block_on(handle.get_payment(params))
+            .map_err(FfiError::from)?;
         write_serializable_out(out_json, &response)?;
         Ok(FiberFfiStatus::Ok)
     })
@@ -2347,7 +2241,8 @@ pub unsafe extern "C" fn fiber_list_payments(
         let params = list_payments_params_from_options(options)?;
         let response = handle
             .runtime_handle
-            .block_on(call_list_payments(handle, params))?;
+            .block_on(handle.list_payments(params))
+            .map_err(FfiError::from)?;
         write_serializable_out(out_json, &response)?;
         Ok(FiberFfiStatus::Ok)
     })
@@ -2373,7 +2268,8 @@ pub unsafe extern "C" fn fiber_new_invoice(
         let params = new_invoice_params_from_options(options)?;
         let response = handle
             .runtime_handle
-            .block_on(call_new_invoice(handle, params))?;
+            .block_on(handle.new_invoice(params))
+            .map_err(FfiError::from)?;
         write_serializable_field_out(out_invoice_address, &response, "invoice_address")?;
         Ok(FiberFfiStatus::Ok)
     })
@@ -2400,7 +2296,8 @@ pub unsafe extern "C" fn fiber_parse_invoice(
         let params = deserialize_object::<fnn::rpc::invoice::ParseInvoiceParams>(value)?;
         let response = handle
             .runtime_handle
-            .block_on(call_parse_invoice(handle, params))?;
+            .block_on(handle.parse_invoice(params))
+            .map_err(FfiError::from)?;
         write_serializable_out(out_json, &response)?;
         Ok(FiberFfiStatus::Ok)
     })
@@ -2426,7 +2323,8 @@ pub unsafe extern "C" fn fiber_get_invoice(
         let params = deserialize_value::<fnn::rpc::invoice::InvoiceParams>(params)?;
         let response = handle
             .runtime_handle
-            .block_on(call_get_invoice(handle, params))?;
+            .block_on(handle.get_invoice(params))
+            .map_err(FfiError::from)?;
         write_serializable_out(out_json, &response)?;
         Ok(FiberFfiStatus::Ok)
     })
@@ -2452,7 +2350,8 @@ pub unsafe extern "C" fn fiber_cancel_invoice(
         let params = deserialize_value::<fnn::rpc::invoice::InvoiceParams>(params)?;
         let response = handle
             .runtime_handle
-            .block_on(call_cancel_invoice(handle, params))?;
+            .block_on(handle.cancel_invoice(params))
+            .map_err(FfiError::from)?;
         write_serializable_out(out_json, &response)?;
         Ok(FiberFfiStatus::Ok)
     })
@@ -2485,7 +2384,8 @@ pub unsafe extern "C" fn fiber_settle_invoice(
         let params = deserialize_object::<fnn::rpc::invoice::SettleInvoiceParams>(value)?;
         handle
             .runtime_handle
-            .block_on(call_settle_invoice(handle, params))?;
+            .block_on(handle.settle_invoice(params))
+            .map_err(FfiError::from)?;
         Ok(FiberFfiStatus::Ok)
     })
 }
@@ -3052,7 +2952,7 @@ async fn start_node(
 
     root_tracker.spawn(async move {
         while let Some(event) = event_receiver.recv().await {
-            emit_event(callback, &event);
+            emit_event(callback.as_ref(), &event);
             #[cfg(feature = "watchtower")]
             if let Some(watchtower_actor) = watchtower_actor.as_ref() {
                 forward_event_to_actor(event, watchtower_actor);
@@ -3259,181 +3159,181 @@ async fn call_disconnect_peer(
 async fn call_open_channel(
     handle: &FiberHandle,
     params: fnn::rpc::channel::OpenChannelParams,
-) -> FfiCallResult<fnn::rpc::channel::OpenChannelResult> {
+) -> native::Result<fnn::rpc::channel::OpenChannelResult> {
     channel_rpc(handle)
         .open_channel(params)
         .await
-        .map_err(rpc_ffi_error)
+        .map_err(rpc_native_error)
 }
 
 async fn call_accept_channel(
     handle: &FiberHandle,
     params: fnn::rpc::channel::AcceptChannelParams,
-) -> FfiCallResult<fnn::rpc::channel::AcceptChannelResult> {
+) -> native::Result<fnn::rpc::channel::AcceptChannelResult> {
     channel_rpc(handle)
         .accept_channel(params)
         .await
-        .map_err(rpc_ffi_error)
+        .map_err(rpc_native_error)
 }
 
 async fn call_abandon_channel(
     handle: &FiberHandle,
     params: fnn::rpc::channel::AbandonChannelParams,
-) -> FfiCallResult<()> {
+) -> native::Result<()> {
     channel_rpc(handle)
         .abandon_channel(params)
         .await
-        .map_err(rpc_ffi_error)
+        .map_err(rpc_native_error)
 }
 
 async fn call_list_channels(
     handle: &FiberHandle,
     params: fnn::rpc::channel::ListChannelsParams,
-) -> FfiCallResult<fnn::rpc::channel::ListChannelsResult> {
+) -> native::Result<fnn::rpc::channel::ListChannelsResult> {
     channel_rpc(handle)
         .list_channels(params)
         .await
-        .map_err(rpc_ffi_error)
+        .map_err(rpc_native_error)
 }
 
 async fn call_shutdown_channel(
     handle: &FiberHandle,
     params: fnn::rpc::channel::ShutdownChannelParams,
-) -> FfiCallResult<()> {
+) -> native::Result<()> {
     channel_rpc(handle)
         .shutdown_channel(params)
         .await
-        .map_err(rpc_ffi_error)
+        .map_err(rpc_native_error)
 }
 
 async fn call_update_channel(
     handle: &FiberHandle,
     params: fnn::rpc::channel::UpdateChannelParams,
-) -> FfiCallResult<()> {
+) -> native::Result<()> {
     channel_rpc(handle)
         .update_channel(params)
         .await
-        .map_err(rpc_ffi_error)
+        .map_err(rpc_native_error)
 }
 
 async fn call_open_channel_with_external_funding(
     handle: &FiberHandle,
     params: fnn::rpc::channel::OpenChannelWithExternalFundingParams,
-) -> FfiCallResult<fnn::rpc::channel::OpenChannelWithExternalFundingResult> {
+) -> native::Result<fnn::rpc::channel::OpenChannelWithExternalFundingResult> {
     channel_rpc(handle)
         .open_channel_with_external_funding(params)
         .await
-        .map_err(rpc_ffi_error)
+        .map_err(rpc_native_error)
 }
 
 async fn call_submit_signed_funding_tx(
     handle: &FiberHandle,
     params: fnn::rpc::channel::SubmitSignedFundingTxParams,
-) -> FfiCallResult<fnn::rpc::channel::SubmitSignedFundingTxResult> {
+) -> native::Result<fnn::rpc::channel::SubmitSignedFundingTxResult> {
     channel_rpc(handle)
         .submit_signed_funding_tx(params)
         .await
-        .map_err(rpc_ffi_error)
+        .map_err(rpc_native_error)
 }
 
 async fn call_send_payment(
     handle: &FiberHandle,
     params: fnn::rpc::payment::SendPaymentCommandParams,
-) -> FfiCallResult<fnn::rpc::payment::GetPaymentCommandResult> {
+) -> native::Result<fnn::rpc::payment::GetPaymentCommandResult> {
     payment_rpc(handle)
         .send_payment(params)
         .await
-        .map_err(rpc_ffi_error)
+        .map_err(rpc_native_error)
 }
 
 async fn call_get_payment(
     handle: &FiberHandle,
     params: fnn::rpc::payment::GetPaymentCommandParams,
-) -> FfiCallResult<fnn::rpc::payment::GetPaymentCommandResult> {
+) -> native::Result<fnn::rpc::payment::GetPaymentCommandResult> {
     payment_rpc(handle)
         .get_payment(params)
         .await
-        .map_err(rpc_ffi_error)
+        .map_err(rpc_native_error)
 }
 
 async fn call_list_payments(
     handle: &FiberHandle,
     params: fnn::rpc::payment::ListPaymentsParams,
-) -> FfiCallResult<fnn::rpc::payment::ListPaymentsResult> {
+) -> native::Result<fnn::rpc::payment::ListPaymentsResult> {
     payment_rpc(handle)
         .list_payments(params)
         .await
-        .map_err(rpc_ffi_error)
+        .map_err(rpc_native_error)
 }
 
 async fn call_build_router(
     handle: &FiberHandle,
     params: fnn::rpc::payment::BuildRouterParams,
-) -> FfiCallResult<fnn::rpc::payment::BuildPaymentRouterResult> {
+) -> native::Result<fnn::rpc::payment::BuildPaymentRouterResult> {
     payment_rpc(handle)
         .build_router(params)
         .await
-        .map_err(rpc_ffi_error)
+        .map_err(rpc_native_error)
 }
 
 async fn call_send_payment_with_router(
     handle: &FiberHandle,
     params: fnn::rpc::payment::SendPaymentWithRouterParams,
-) -> FfiCallResult<fnn::rpc::payment::GetPaymentCommandResult> {
+) -> native::Result<fnn::rpc::payment::GetPaymentCommandResult> {
     payment_rpc(handle)
         .send_payment_with_router(params)
         .await
-        .map_err(rpc_ffi_error)
+        .map_err(rpc_native_error)
 }
 
 async fn call_new_invoice(
     handle: &FiberHandle,
     params: fnn::rpc::invoice::NewInvoiceParams,
-) -> FfiCallResult<fnn::rpc::invoice::InvoiceResult> {
+) -> native::Result<fnn::rpc::invoice::InvoiceResult> {
     invoice_rpc(handle)
         .new_invoice(params)
         .await
-        .map_err(rpc_ffi_error)
+        .map_err(rpc_native_error)
 }
 
 async fn call_parse_invoice(
     handle: &FiberHandle,
     params: fnn::rpc::invoice::ParseInvoiceParams,
-) -> FfiCallResult<fnn::rpc::invoice::ParseInvoiceResult> {
+) -> native::Result<fnn::rpc::invoice::ParseInvoiceResult> {
     invoice_rpc(handle)
         .parse_invoice(params)
         .await
-        .map_err(rpc_ffi_error)
+        .map_err(rpc_native_error)
 }
 
 async fn call_get_invoice(
     handle: &FiberHandle,
     params: fnn::rpc::invoice::InvoiceParams,
-) -> FfiCallResult<fnn::rpc::invoice::GetInvoiceResult> {
+) -> native::Result<fnn::rpc::invoice::GetInvoiceResult> {
     invoice_rpc(handle)
         .get_invoice(params)
         .await
-        .map_err(rpc_ffi_error)
+        .map_err(rpc_native_error)
 }
 
 async fn call_cancel_invoice(
     handle: &FiberHandle,
     params: fnn::rpc::invoice::InvoiceParams,
-) -> FfiCallResult<fnn::rpc::invoice::GetInvoiceResult> {
+) -> native::Result<fnn::rpc::invoice::GetInvoiceResult> {
     invoice_rpc(handle)
         .cancel_invoice(params)
         .await
-        .map_err(rpc_ffi_error)
+        .map_err(rpc_native_error)
 }
 
 async fn call_settle_invoice(
     handle: &FiberHandle,
     params: fnn::rpc::invoice::SettleInvoiceParams,
-) -> FfiCallResult<fnn::rpc::invoice::SettleInvoiceResult> {
+) -> native::Result<fnn::rpc::invoice::SettleInvoiceResult> {
     invoice_rpc(handle)
         .settle_invoice(params)
         .await
-        .map_err(rpc_ffi_error)
+        .map_err(rpc_native_error)
 }
 
 fn channel_rpc(handle: &FiberHandle) -> fnn::rpc::channel::ChannelRpcServerImpl<fnn::store::Store> {
@@ -3452,8 +3352,8 @@ fn invoice_rpc(handle: &FiberHandle) -> fnn::rpc::invoice::InvoiceRpcServerImpl<
     )
 }
 
-fn rpc_ffi_error(err: impl std::fmt::Display) -> FfiError {
-    ffi_error(FiberFfiStatus::InvalidArgument, err.to_string())
+fn rpc_native_error(err: impl std::fmt::Display) -> native::Error {
+    native::Error::new(native::ErrorKind::InvalidArgument, err.to_string())
 }
 
 fn node_info_to_json(response: fnn::fiber::network::NodeInfoResponse) -> serde_json::Value {
@@ -3503,10 +3403,14 @@ fn ffi_progress(progress: fnn::store::MigrationProgress) {
     );
 }
 
-fn emit_event(callback: Option<EventCallback>, event: &NetworkServiceEvent) {
+fn emit_event(callback: Option<&EventCallback>, event: &NetworkServiceEvent) {
     let Some(callback) = callback else {
         return;
     };
+    callback(event);
+}
+
+fn emit_ffi_event(callback: FfiEventCallback, event: &NetworkServiceEvent) {
     let Ok(event_json) = CString::new(event_to_json(event).to_string()) else {
         tracing::warn!("failed to convert event json to C string");
         return;
@@ -3866,6 +3770,19 @@ struct FfiError {
     message: String,
 }
 
+impl From<native::Error> for FfiError {
+    fn from(error: native::Error) -> Self {
+        let status = match error.kind() {
+            native::ErrorKind::InvalidArgument => FiberFfiStatus::InvalidArgument,
+            native::ErrorKind::StartupFailed => FiberFfiStatus::StartupFailed,
+            native::ErrorKind::AlreadyStopped => FiberFfiStatus::AlreadyStopped,
+            native::ErrorKind::Panic => FiberFfiStatus::Panic,
+            native::ErrorKind::NotReady => FiberFfiStatus::NotReady,
+        };
+        ffi_error(status, error.message())
+    }
+}
+
 type FfiCallResult<T> = Result<T, FfiError>;
 
 fn ffi_boundary(f: impl FnOnce() -> FfiCallResult<FiberFfiStatus>) -> FiberFfiStatus {
@@ -4159,13 +4076,14 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    type PrepareCallbackMessage = (FiberFfiStatus, String, thread::ThreadId);
+
     unsafe extern "C" fn prepare_callback(
         status: FiberFfiStatus,
         result_json: *const c_char,
         user_data: *mut c_void,
     ) {
-        let sender =
-            &*(user_data as *const std_mpsc::Sender<(FiberFfiStatus, String, thread::ThreadId)>);
+        let sender = &*(user_data as *const std_mpsc::Sender<PrepareCallbackMessage>);
         let result_json = CStr::from_ptr(result_json).to_string_lossy().into_owned();
         sender
             .send((status, result_json, thread::current().id()))
@@ -4184,8 +4102,8 @@ mod tests {
         };
         let caller_thread = thread::current().id();
         let (sender, receiver): (
-            std_mpsc::Sender<(FiberFfiStatus, String, thread::ThreadId)>,
-            std_mpsc::Receiver<(FiberFfiStatus, String, thread::ThreadId)>,
+            std_mpsc::Sender<PrepareCallbackMessage>,
+            std_mpsc::Receiver<PrepareCallbackMessage>,
         ) = std_mpsc::channel();
         let sender_ptr = (&sender as *const std_mpsc::Sender<_>) as *mut c_void;
 

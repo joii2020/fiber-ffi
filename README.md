@@ -1,6 +1,7 @@
 # fiber-ffi
 
-Standalone FFI wrapper for `fiber`, intended for Android and iOS integration.
+Standalone native Rust and C FFI wrapper for `fiber`, intended for Rust,
+Android, and iOS integration.
 
 This repository was migrated from:
 
@@ -8,11 +9,35 @@ This repository was migrated from:
 
 ## Layout
 
-- `src/lib.rs`: Rust FFI implementation.
+- `src/native.rs`: safe, typed Rust API used by native callers and the C adapter.
+- `src/lib.rs`: C ABI adapter plus the internal node runtime.
 - `include/fiber_ffi.h`: C ABI header for mobile clients.
 - `Cargo.toml`: standalone crate manifest.
 
-## API shape
+## Rust native API
+
+Rust callers depend on this package as a normal Cargo dependency and use
+`fiber_ffi::native`. `FiberNode` owns a dedicated runtime thread, while its RPC
+methods are async and use Fiber's typed request and response values directly:
+
+```rust,no_run
+use fiber_ffi::native::{FiberNode, StartOptions};
+
+# async fn run() -> Result<(), Box<dyn std::error::Error>> {
+let node = FiberNode::start(StartOptions::new("config.yml"))?;
+let info = node.node_info().await?;
+println!("node: {:?}", info.node_id);
+node.stop()?;
+# Ok(())
+# }
+```
+
+`native::types` re-exports the channel, payment, invoice, peer, hash, and event
+types used by the API. CKB funding-address derivation, wallet-history discovery,
+preparation progress, readiness, and balance are available without crossing a
+C ABI boundary.
+
+## C API shape
 
 The public entry points use C structs for common channel, payment, and invoice
 operations, for example `fiber_open_channel`,
@@ -173,8 +198,10 @@ If the FFI implementation needs APIs that only exist in a fork or local branch, 
 
 ## Build
 
-The crate emits a `cdylib`. Mobile builds disable default features to avoid the
-RocksDB/libclang toolchain requirement.
+The crate emits both a `cdylib` and an `rlib` from the same source. The dynamic
+library keeps the existing C ABI for mobile clients; the `rlib` is the artifact
+Cargo uses when another Rust crate depends on `fiber-ffi`. Mobile builds disable
+default features to avoid the RocksDB/libclang toolchain requirement.
 
 ### iOS
 
