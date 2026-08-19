@@ -37,6 +37,11 @@ types used by the API. CKB funding-address derivation, wallet-history discovery,
 preparation progress, readiness, and balance are available without crossing a
 C ABI boundary.
 
+The small C example in [`examples/c-demo`](examples/c-demo) demonstrates the
+same startup lifecycle through the public C ABI. It keeps the node alive and
+starts the configured Fiber JSON-RPC service, so `fnn-cli` can manage peers,
+channels, invoices, and payments through `http://127.0.0.1:8227`.
+
 ## C API shape
 
 The public entry points use C structs for common channel, payment, and invoice

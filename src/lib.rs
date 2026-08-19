@@ -38,6 +38,7 @@ use fnn::{
     },
     fiber::{graph::NetworkGraph, network::init_chain_hash},
     fiber::{NetworkActorCommand, NetworkActorMessage},
+    rpc::server::{start_rpc, RpcConfig},
     start_network,
     store::actor::{StoreActor, StoreActorInitializationParameter},
     Config, FiberConfig, NetworkServiceEvent,
@@ -2440,6 +2441,7 @@ struct RunningNode {
     store: fnn::store::Store,
     fiber_config: FiberConfig,
     ckb_config: CkbConfig,
+    rpc_stop_tx: Option<oneshot::Sender<()>>,
     #[cfg(feature = "disable-ckb-rpc")]
     local_ckb: Option<ckb_light_client::LocalCkbNodeHandle>,
 }
@@ -2467,6 +2469,7 @@ struct FfiSerializedConfig {
     services: Option<Vec<FfiService>>,
     fiber: Option<<FiberConfig as ClapSerde>::Opt>,
     ckb: Option<<CkbConfig as ClapSerde>::Opt>,
+    rpc: Option<<RpcConfig as ClapSerde>::Opt>,
     #[cfg(feature = "disable-ckb-rpc")]
     ckb_light_client: Option<ckb_light_client::config::SerializedLightClientConfig>,
 }
@@ -2528,12 +2531,17 @@ fn parse_config_from_path(
     } else {
         None
     };
+    let rpc = if services.contains(&FfiService::Rpc) {
+        Some(RpcConfig::from(config_from_file.rpc.unwrap_or_default()))
+    } else {
+        None
+    };
 
     let fiber = Config {
         fiber,
         disabled_fiber,
         cch: None,
-        rpc: None,
+        rpc,
         ckb,
         base_dir,
         check_validate: false,
@@ -2792,6 +2800,7 @@ async fn start_node(
     #[cfg(feature = "disable-ckb-rpc")]
     let light_client_config = parsed_config.light_client.clone();
     let config = parsed_config.fiber;
+    let rpc_config = config.rpc.clone();
     let fiber_config = config
         .fiber
         .clone()
@@ -2897,6 +2906,8 @@ async fn start_node(
     .await
     .map_err(|err| format!("failed to start ckb actor: {err}"))?
     .0;
+    #[cfg(debug_assertions)]
+    let ckb_chain_actor_for_rpc = ckb_chain_actor.clone();
 
     const CHANNEL_SIZE: usize = 4000;
     let (event_sender, mut event_receiver) = mpsc::channel(CHANNEL_SIZE);
@@ -2906,11 +2917,13 @@ async fn start_node(
         fnn::fiber::types::pubkey_from_tentacle(node_public_key),
         fiber_config.announce_private_addr(),
     )));
+    let network_graph_for_rpc = Arc::clone(&network_graph);
     let default_shutdown_script = ckb_config
         .get_default_funding_lock_script()
         .map_err(|err| format!("failed to get default funding lock script: {err}"))?;
 
     let chain_client = CkbRpcClient::new(&ckb_config);
+    let store_actor_for_rpc = store_actor.clone();
     let network_actor = start_network(
         fiber_config.clone(),
         chain_client,
@@ -2950,6 +2963,48 @@ async fn start_node(
         Some(actor)
     };
 
+    #[cfg(debug_assertions)]
+    let rpc_dev_module_commitment_txs = rpc_config.as_ref().and_then(|rpc_config| {
+        rpc_config
+            .is_module_enabled("dev")
+            .then(|| Arc::new(RwLock::new(std::collections::HashMap::new())))
+    });
+    let rpc_stop_tx = match rpc_config {
+        Some(rpc_config) => {
+            let (rpc_server, rpc_addr) = start_rpc(
+                rpc_config,
+                Some(ckb_config_for_handle.clone()),
+                Some(fiber_config.clone()),
+                Some(network_actor.clone()),
+                None,
+                store.clone(),
+                Some(store_actor_for_rpc),
+                Some(network_graph_for_rpc),
+                root_actor.get_cell(),
+                None,
+                #[cfg(debug_assertions)]
+                Some(ckb_chain_actor_for_rpc),
+                #[cfg(debug_assertions)]
+                rpc_dev_module_commitment_txs,
+            )
+            .await
+            .map_err(|err| format!("rpc server failed to start: {err}"))?;
+            info!(rpc_addr = %rpc_addr, "Fiber RPC server started");
+
+            let (rpc_stop_tx, rpc_stop_rx) = oneshot::channel();
+            root_tracker.spawn(async move {
+                let _ = rpc_stop_rx.await;
+                if let Err(err) = rpc_server.stop() {
+                    tracing::warn!(error = %err, "failed to stop Fiber RPC server");
+                }
+                rpc_server.stopped().await;
+                debug!("Fiber RPC server stopped");
+            });
+            Some(rpc_stop_tx)
+        }
+        None => None,
+    };
+
     root_tracker.spawn(async move {
         while let Some(event) = event_receiver.recv().await {
             emit_event(callback.as_ref(), &event);
@@ -2969,6 +3024,7 @@ async fn start_node(
         store,
         fiber_config,
         ckb_config: ckb_config_for_handle,
+        rpc_stop_tx,
         #[cfg(feature = "disable-ckb-rpc")]
         local_ckb,
     })
@@ -2976,6 +3032,9 @@ async fn start_node(
 
 async fn stop_node_on_signal(node: RunningNode, stop_rx: oneshot::Receiver<()>) {
     let _ = stop_rx.await;
+    if let Some(rpc_stop_tx) = node.rpc_stop_tx {
+        let _ = rpc_stop_tx.send(());
+    }
     node.root_token.cancel();
     node.root_actor
         .stop(Some("fiber_stop requested".to_string()));
@@ -4068,6 +4127,33 @@ mod ckb_readiness_tests {
 
         assert_eq!(estimate.upper_seconds, 120);
         assert_eq!(estimate.confidence, "stalled");
+    }
+}
+
+#[cfg(test)]
+mod ffi_config_tests {
+    use super::*;
+
+    #[test]
+    fn requested_rpc_service_is_kept_for_runtime_startup() {
+        let config_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/c-demo/config.testnet.yml");
+        let data_dir =
+            std::env::temp_dir().join(format!("fiber-ffi-rpc-config-test-{}", std::process::id()));
+        let parsed = parse_config_from_path(
+            config_path.to_str().expect("demo config path is UTF-8"),
+            Some(data_dir.to_string_lossy().into_owned()),
+        )
+        .expect("C demo config must parse");
+        let rpc = parsed
+            .fiber
+            .rpc
+            .expect("services contains rpc, so the RPC config must be retained");
+
+        assert_eq!(rpc.listening_addr.as_deref(), Some("127.0.0.1:8227"));
+        for module in ["channel", "graph", "payment", "info", "invoice", "peer"] {
+            assert!(rpc.is_module_enabled(module), "missing RPC module {module}");
+        }
     }
 }
 
