@@ -1,7 +1,7 @@
 use std::{
     env,
     error::Error,
-    fs::{self, OpenOptions},
+    fs::OpenOptions,
     io::{self, Write},
     path::{Path, PathBuf},
     sync::{mpsc, Arc, Mutex},
@@ -194,17 +194,10 @@ fn validate_startup(args: &CliArgs) -> AnyResult<()> {
     if !args.config.is_file() {
         return Err(format!("configuration file not found: {}", args.config.display()).into());
     }
-    let ckb_directory = args.data.join("ckb");
-    fs::create_dir_all(&ckb_directory).map_err(|error| {
-        format!(
-            "unable to create data directory {}: {error}",
-            ckb_directory.display()
-        )
-    })?;
-    let key_path = ckb_directory.join("key");
+    let key_path = args.data.join("ckb/key");
     if !key_path.is_file() {
         return Err(format!(
-            "test wallet private key not found at {}; run `make -C tools/fiber-demo-cli setup` first",
+            "CKB wallet private key not found at {}; fiber-demo-cli cannot be used without a funded wallet. Place the private key for a funded CKB testnet wallet at this path and try again",
             key_path.display()
         )
         .into());

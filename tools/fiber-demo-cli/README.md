@@ -23,12 +23,25 @@ make -C tools/fiber-demo-cli
 make -C tools/fiber-demo-cli run
 ```
 
-The first command generates a test-only CKB key at
-`tools/fiber-demo-cli/data/ckb/key` if it is missing and builds:
+The first command only builds the executable:
 
 ```text
 target/release/fiber-demo-cli
 ```
+
+The CLI does not generate a wallet key. Before the first run, place the
+64-character hexadecimal private key for an existing, funded CKB testnet wallet
+at `tools/fiber-demo-cli/data/ckb/key` and restrict access to the file. For
+example:
+
+```bash
+mkdir -p tools/fiber-demo-cli/data/ckb
+install -m 600 /path/to/funded-testnet-key tools/fiber-demo-cli/data/ckb/key
+```
+
+If the key is missing, the CLI exits immediately. A newly generated key would
+have no CKB, so it could neither open a funded channel nor cover change-Cell
+capacity and transaction fees.
 
 The Makefile enables `sqlite,ckb-light-client-portable`, which statically links
 the `fiber-ffi` Rust library and enables the embedded CKB Light Client. Override
@@ -49,4 +62,4 @@ make -C tools/fiber-demo-cli run \
 ```
 
 Use `target/release/fiber-demo-cli --help` for all options. The default config
-is testnet-only; do not use the generated key or fixed password in production.
+is testnet-only; do not use the fixed password in production.
